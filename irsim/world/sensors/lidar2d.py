@@ -9,10 +9,15 @@ from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from shapely import MultiLineString
 
-from irsim.lib.algorithm.ray_casting_2d import cast_rays
+from irsim.lib.algorithm.ray_casting_2d import (
+    SegmentCache,
+    TieredSegmentCache,
+    cast_rays,
+)
 from irsim.util.random import rng
 from irsim.util.util import (
     ClipTo2Pi,
+    WrapToPi,
     geometry_transform,
     transform_point_with_state,
 )
@@ -39,6 +44,32 @@ class Lidar2D:
         offset (list): Offset of the sensor from the object's position.
         alpha (float): Transparency for plotting.
         has_velocity (bool): Whether the sensor measures velocity.
+        motion_skew (bool): When ``True``, each beam is cast from the sensor
+            pose interpolated between the previous and current simulation
+            states at that beam's fire time within the scan, reproducing the
+            rolling-shutter-like distortion a real spinning lidar sees while
+            the robot moves. Default ``False`` (every beam shares one
+            instantaneous pose, as before).
+        cache_max_displacement (float): When > 0, enables a segment gather
+            cache: the expensive obstacle-boundary gather is reused across
+            calls as long as the sensor has moved less than this distance
+            (meters) since the cache was built. Default ``0.0`` (disabled;
+            every call gathers fresh, as before). See
+            :class:`~irsim.lib.algorithm.ray_casting_2d.SegmentCache` for the
+            staleness tradeoff -- this is only safe for static or slowly
+            changing scenes, or paired with a small ``cache_max_age_steps``.
+        cache_max_age_steps (int): Maximum number of calls the segment cache
+            may be reused before a forced re-gather, bounding staleness from
+            obstacles that moved without the sensor moving. Default ``8``.
+            Only relevant when ``cache_max_displacement > 0``.
+        cache_split_static (bool): When ``True`` (and ``cache_max_displacement
+            > 0``), uses a two-tier cache that caches only objects with a
+            truthy ``static`` attribute and always gathers non-static objects
+            fresh -- removing the plain cache's staleness risk for scenes
+            with moving obstacles near the sensor, at the cost of splitting
+            detected objects into two groups every call. See
+            :class:`~irsim.lib.algorithm.ray_casting_2d.TieredSegmentCache`.
+            Default ``False`` (one combined cache, as before).
         **kwargs: Additional arguments.
             color (str): Color of the sensor.
 
@@ -61,7 +92,8 @@ class Lidar2D:
         - alpha (float): Transparency level for plotting the laser beams. Default is 0.3.
         - has_velocity (bool): Whether the sensor measures the velocity of detected points. Default is False.
         - velocity (np.ndarray): Velocity data for each laser beam, formatted as (2, number) array. Effective only if `has_velocity` is True. Initialized to zeros.
-        - time_inc (float): Time increment for each scan, simulating the sensor's time resolution. Default is 5e-4.
+        - motion_skew (bool): Whether beams are cast from per-beam interpolated poses across the sweep. Default is False.
+        - time_inc (float): Time increment between beams, `scan_time / (number - 1)` when `motion_skew` is True, else 0.0 (all beams share one instantaneous pose).
         - range_data (np.ndarray): Array storing range data for each laser beam. Initialized to `range_max` for all beams.
         - angle_list (np.ndarray): Array of angles corresponding to each laser beam, distributed linearly from `angle_min` to `angle_max`.
         - color (str): Color of the sensor's representation in visualizations. Default is "r" (red).
@@ -86,6 +118,10 @@ class Lidar2D:
         offset: list[float] | None = None,
         alpha: float = 0.3,
         has_velocity: bool = False,
+        motion_skew: bool = False,
+        cache_max_displacement: float = 0.0,
+        cache_max_age_steps: int = 8,
+        cache_split_static: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -120,8 +156,18 @@ class Lidar2D:
         self.has_velocity = has_velocity
         self.velocity = np.zeros((2, number))
 
-        # All beams use one instantaneous geometry snapshot.
-        self.time_inc = 0.0
+        self.motion_skew = motion_skew
+        self._skip_skew_once = True
+        if cache_max_displacement > 0:
+            cache_cls = TieredSegmentCache if cache_split_static else SegmentCache
+            self._segment_cache = cache_cls(cache_max_displacement, cache_max_age_steps)
+        else:
+            self._segment_cache = None
+
+        # With motion_skew, beams are spread linearly across the scan; each
+        # beam's fire time is `i * time_inc` into the sweep. Without it, all
+        # beams still share one instantaneous geometry snapshot.
+        self.time_inc = scan_time / max(number - 1, 1) if motion_skew else 0.0
         self.range_data = range_max * np.ones(number)
 
         self.angle_list = np.linspace(self.angle_min, self.angle_max, num=number)
@@ -190,15 +236,26 @@ class Lidar2D:
         Args:
             state (np.ndarray): New state of the sensor.
         """
+        prev_state = self._state
         self._state = state
 
         lidar_geometry = self._world_geometry(state)
         detected_objects = self._get_detected_objects(lidar_geometry)
 
+        beam_origins = beam_directions = None
+        if self.motion_skew and not self._skip_skew_once:
+            beam_origins, beam_directions = self._interpolate_beam_poses(
+                prev_state, state
+            )
+        self._skip_skew_once = False
+
         ranges, hit_object_indices, origin, directions = cast_rays(
             lidar_geometry,
             detected_objects,
             self.range_max,
+            beam_origins=beam_origins,
+            beam_directions=beam_directions,
+            cache=self._segment_cache,
         )
 
         if self.noise:
@@ -210,6 +267,63 @@ class Lidar2D:
 
         if self.has_velocity:
             self._assign_velocities(hit_object_indices, detected_objects)
+
+    def _interpolate_beam_poses(
+        self, prev_state: np.ndarray, new_state: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Per-beam sensor origin/direction across a motion-skewed scan.
+
+        Approximates constant-velocity motion between the previous and
+        current simulation states: beam ``i`` is fired at fraction
+        ``i / (number - 1)`` of the way through the sweep, so it uses the
+        sensor pose interpolated that far between ``prev_state`` and
+        ``new_state`` -- matching how a real spinning lidar's beams are each
+        timestamped across the sweep instead of sharing one instantaneous
+        pose.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: Per-beam origins ``(number, 2)``
+            and unit directions ``(number, 2)``, both in world coordinates.
+        """
+        prev_xy = prev_state[0:2, 0]
+        new_xy = new_state[0:2, 0]
+        prev_theta = float(prev_state[2, 0])
+        new_theta = float(new_state[2, 0])
+        dtheta = WrapToPi(new_theta - prev_theta)
+
+        if self.number > 1:
+            fractions = np.linspace(0.0, 1.0, self.number)
+        else:
+            fractions = np.ones(1)
+
+        theta = prev_theta + fractions * dtheta
+        xy = prev_xy[None, :] + fractions[:, None] * (new_xy - prev_xy)[None, :]
+
+        offset_xy = self.offset[0:2, 0]
+        offset_theta = float(self.offset[2, 0])
+
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        origins = xy + np.column_stack(
+            (
+                cos_t * offset_xy[0] - sin_t * offset_xy[1],
+                sin_t * offset_xy[0] + cos_t * offset_xy[1],
+            )
+        )
+
+        beam_theta = theta + offset_theta + self.angle_list
+        directions = np.column_stack((np.cos(beam_theta), np.sin(beam_theta)))
+        return origins, directions
+
+    def reset(self) -> None:
+        """Clear motion-skew and segment-cache state.
+
+        Called when the parent object's state is reset (e.g. ``env.reset()``)
+        so the next scan doesn't interpolate motion across the reset jump, or
+        reuse segments cached before the reset.
+        """
+        self._skip_skew_once = True
+        if self._segment_cache is not None:
+            self._segment_cache.invalidate()
 
     def _get_detected_objects(self, lidar_geometry) -> list:
         """Select objects that may produce a return for this lidar geometry.

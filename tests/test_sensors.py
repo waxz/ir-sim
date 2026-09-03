@@ -977,13 +977,21 @@ class _MapObject:
 class _Obstacle:
     """Mimics a dynamic obstacle with a polygon geometry."""
 
-    def __init__(self, obj_id, geometry, shape="circle", velocity_xy=(0.0, 0.0)):
+    def __init__(
+        self,
+        obj_id,
+        geometry,
+        shape="circle",
+        velocity_xy=(0.0, 0.0),
+        static: bool = False,
+    ):
         self._id = obj_id
         self._geometry = geometry
         self._geometry_valid = True
         self.shape = shape
         self.unobstructed = False
         self._velocity_xy = np.asarray(velocity_xy, dtype=float).reshape(2, 1)
+        self.static = static
 
     @property
     def geometry(self):
@@ -1059,6 +1067,308 @@ def test_lidar_detects_disjoint_compound_geometry():
     lidar.step(lidar.state)
 
     assert lidar.range_data[0] == pytest.approx(1.75, abs=1e-6)
+
+
+def test_motion_skew_interpolates_beam_poses():
+    """Each beam's origin/direction should sit at its own fraction of the
+    sweep between the previous and current sensor pose, not all share the
+    end-of-step pose."""
+    lidar = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=5,
+        angle_range=np.pi,
+        motion_skew=True,
+    )
+    prev_state = np.array([[0.0], [0.0], [0.0]])
+    new_state = np.array([[2.0], [0.0], [0.0]])
+
+    origins, directions = lidar._interpolate_beam_poses(prev_state, new_state)
+
+    expected_fractions = np.linspace(0.0, 1.0, 5)
+    expected_origins = np.column_stack((2.0 * expected_fractions, np.zeros(5)))
+    expected_angles = np.linspace(-np.pi / 2, np.pi / 2, 5)
+    expected_directions = np.column_stack(
+        (np.cos(expected_angles), np.sin(expected_angles))
+    )
+
+    np.testing.assert_allclose(origins, expected_origins, atol=1e-12)
+    np.testing.assert_allclose(directions, expected_directions, atol=1e-12)
+
+
+def test_motion_skew_disabled_uses_single_shared_pose():
+    """Without motion_skew, ranges must match the pre-existing instantaneous
+    single-origin scan exactly -- this is the default, must-not-regress path."""
+    wall = shapely.LineString([(3.0, -5.0), (3.0, 5.0)])
+    obstacle = _Obstacle(2, wall, shape="linestring")
+    env_param = _EnvParam([obstacle], STRtree([obstacle.geometry]))
+
+    plain = Lidar2D(state=np.array([[0.0], [0.0], [0.0]]), number=9, angle_range=np.pi)
+    plain.parent = _Parent(env_param)
+    plain.step(np.array([[1.0], [0.0], [0.0]]))
+
+    skewed_but_first_step = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=9,
+        angle_range=np.pi,
+        motion_skew=True,
+    )
+    skewed_but_first_step.parent = _Parent(env_param)
+    # The very first step has no previous pose to interpolate from, so it
+    # must also fall back to the single-pose scan regardless of motion_skew.
+    skewed_but_first_step.step(np.array([[1.0], [0.0], [0.0]]))
+
+    np.testing.assert_allclose(
+        plain.range_data, skewed_but_first_step.range_data, atol=1e-9
+    )
+
+
+def test_motion_skew_moving_robot_differs_from_instantaneous_scan():
+    """With real motion between two steps, a skewed scan against a wall
+    should differ from the instantaneous (motion_skew=False) scan, since
+    beams fired earlier in the sweep see the robot's earlier position."""
+    wall = shapely.LineString([(-5.0, 4.0), (5.0, 4.0)])
+    obstacle = _Obstacle(2, wall, shape="linestring")
+    env_param = _EnvParam([obstacle], STRtree([obstacle.geometry]))
+
+    state_a = np.array([[0.0], [0.0], [0.0]])
+    state_b = np.array([[0.0], [2.0], [0.0]])  # moves toward the wall
+
+    plain = Lidar2D(state=state_a, number=11, angle_range=np.pi)
+    plain.parent = _Parent(env_param)
+    plain.step(state_a)
+    plain.step(state_b)
+
+    skewed = Lidar2D(state=state_a, number=11, angle_range=np.pi, motion_skew=True)
+    skewed.parent = _Parent(env_param)
+    skewed.step(state_a)
+    skewed.step(state_b)
+
+    assert not np.allclose(plain.range_data, skewed.range_data)
+    # Beams fired earlier in the sweep (further from the wall, since the
+    # robot started further away) must read a longer range than the same
+    # beam's instantaneous (already-arrived) reading.
+    first_beam_hit = skewed.range_data[0] < plain.range_max - 1e-6
+    if first_beam_hit:
+        assert skewed.range_data[0] >= plain.range_data[0] - 1e-9
+
+
+def test_segment_cache_reduces_gather_calls(monkeypatch):
+    """A stationary sensor with caching enabled should re-gather far less
+    often than a sensor without caching, while still reading the same scan."""
+    circle = _Obstacle(2, shapely.Point(2.0, 0.0).buffer(0.5))
+    env_param = _EnvParam([circle], STRtree([circle.geometry]))
+
+    call_count = {"n": 0}
+    original_gather = ray_casting_2d._gather_obstacle_edges
+
+    def counting_gather(*args, **kwargs):
+        call_count["n"] += 1
+        return original_gather(*args, **kwargs)
+
+    monkeypatch.setattr(ray_casting_2d, "_gather_obstacle_edges", counting_gather)
+
+    state = np.array([[0.0], [0.0], [0.0]])
+    cached = Lidar2D(
+        state=state,
+        number=20,
+        angle_range=np.pi,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=10,
+    )
+    cached.parent = _Parent(env_param)
+
+    n_steps = 10
+    for _ in range(n_steps):
+        cached.step(state)
+
+    assert call_count["n"] < n_steps
+
+    # A fresh, uncached sensor stepped once from the same stationary state
+    # must still read the same scan as the cached one.
+    call_count["n"] = 0
+    fresh = Lidar2D(state=state, number=20, angle_range=np.pi)
+    fresh.parent = _Parent(env_param)
+    fresh.step(state)
+
+    np.testing.assert_allclose(cached.range_data, fresh.range_data, atol=1e-9)
+
+
+def test_segment_cache_refreshes_after_displacement(monkeypatch):
+    """Moving the sensor beyond ``cache_max_displacement`` must force a
+    re-gather so a newly-nearby obstacle is not missed."""
+    circle = _Obstacle(2, shapely.Point(5.0, 0.0).buffer(0.5))
+    env_param = _EnvParam([circle], STRtree([circle.geometry]))
+
+    lidar = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=20,
+        angle_range=np.pi,
+        range_max=3.0,
+        cache_max_displacement=0.1,
+        cache_max_age_steps=1000,
+    )
+    lidar.parent = _Parent(env_param)
+
+    # Far from the obstacle: nothing detected, cache built with no segments.
+    lidar.step(np.array([[0.0], [0.0], [0.0]]))
+    assert lidar.range_data.min() == pytest.approx(lidar.range_max, abs=1e-6)
+
+    # Move well past cache_max_displacement, toward the obstacle: the cache
+    # must refresh and pick up the now-nearby circle.
+    lidar.step(np.array([[4.0], [0.0], [0.0]]))
+    assert lidar.range_data.min() < lidar.range_max - 1e-6
+
+
+def test_tiered_cache_never_misses_a_moving_obstacle():
+    """Unlike the combined cache, the tiered cache must track a dynamic
+    obstacle that moves near a *stationary* sensor on every single step,
+    while still avoiding re-gathering the (unmoving) static wall each time."""
+    wall = shapely.LineString([(-5.0, 5.0), (5.0, 5.0)])
+    static_wall = _Obstacle(2, wall, shape="linestring", static=True)
+    moving = _Obstacle(3, shapely.Point(100.0, 100.0).buffer(0.3), static=False)
+    env_param = _EnvParam(
+        [static_wall, moving], STRtree([static_wall.geometry, moving.geometry])
+    )
+
+    state = np.array([[0.0], [0.0], [0.0]])
+
+    tiered = Lidar2D(
+        state=state,
+        number=40,
+        angle_range=np.pi,
+        range_max=8.0,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=1000,
+        cache_split_static=True,
+    )
+    tiered.parent = _Parent(env_param)
+
+    fresh = Lidar2D(state=state, number=40, angle_range=np.pi, range_max=8.0)
+    fresh.parent = _Parent(env_param)
+
+    # The moving obstacle sweeps close to, then away from, the stationary
+    # sensor across several steps -- the sensor itself never moves.
+    positions = [(100.0, 100.0), (3.0, 0.0), (2.0, 0.0), (100.0, 100.0)]
+    for x, y in positions:
+        moving._geometry = shapely.Point(x, y).buffer(0.3)
+        tiered.step(state)
+        fresh.step(state)
+        np.testing.assert_allclose(
+            tiered.range_data,
+            fresh.range_data,
+            atol=1e-9,
+            err_msg=f"tiered cache diverged from a fresh gather at obstacle position ({x}, {y})",
+        )
+
+    # The static tier was gathered once (the first step) and reused for
+    # every subsequent step -- its age grew by one per reuse, never reset.
+    static_cache = tiered._segment_cache._static_cache
+    assert static_cache._age == len(positions) - 1
+
+
+def test_tiered_cache_beats_combined_cache_correctness_in_dynamic_scene():
+    """The combined SegmentCache can serve stale dynamic-obstacle data when
+    reused; the tiered cache must not, for the same moving-obstacle scene."""
+    moving = _Obstacle(2, shapely.Point(3.0, 0.0).buffer(0.3), static=False)
+    env_param = _EnvParam([moving], STRtree([moving.geometry]))
+    state = np.array([[0.0], [0.0], [0.0]])
+
+    combined = Lidar2D(
+        state=state,
+        number=20,
+        angle_range=np.pi,
+        range_max=8.0,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=10,
+    )
+    combined.parent = _Parent(env_param)
+
+    tiered = Lidar2D(
+        state=state,
+        number=20,
+        angle_range=np.pi,
+        range_max=8.0,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=10,
+        cache_split_static=True,
+    )
+    tiered.parent = _Parent(env_param)
+
+    combined.step(state)
+    tiered.step(state)
+
+    # The obstacle moves out of range; the stationary sensor's cache is still
+    # "fresh enough" by displacement/age, so the combined cache serves a
+    # stale (in-range) reading, while the tiered cache -- which never caches
+    # the dynamic tier -- correctly reports no hit.
+    moving._geometry = shapely.Point(100.0, 100.0).buffer(0.3)
+    combined.step(state)
+    tiered.step(state)
+
+    assert combined.range_data.min() < combined.range_max - 1e-6, (
+        "expected the combined cache to (incorrectly) still report the "
+        "obstacle's old position -- if this fails, the combined cache's "
+        "known staleness tradeoff no longer reproduces and this test's "
+        "premise should be revisited"
+    )
+    assert tiered.range_data.min() == pytest.approx(tiered.range_max, abs=1e-6)
+
+
+def test_lidar_reset_clears_skew_and_cache_state():
+    """reset() must clear the skew baseline and force the next segment
+    gather, matching env.reset() jumping the object back to its init state."""
+    lidar = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=5,
+        motion_skew=True,
+        cache_max_displacement=1.0,
+    )
+    circle = _Obstacle(2, shapely.Point(2.0, 0.0).buffer(0.5))
+    env_param = _EnvParam([circle], STRtree([circle.geometry]))
+    lidar.parent = _Parent(env_param)
+
+    lidar.step(np.array([[0.0], [0.0], [0.0]]))
+    lidar.step(np.array([[1.0], [0.0], [0.0]]))
+    assert lidar._skip_skew_once is False
+    assert lidar._segment_cache._segments is not None
+
+    lidar.reset()
+
+    assert lidar._skip_skew_once is True
+    assert lidar._segment_cache._segments is None
+
+
+def test_object_reset_resets_attached_sensors():
+    """ObjectBase.reset() must reset sensors that define reset(), so a
+    motion-skewed / cached lidar doesn't carry pre-reset state across a
+    parent object reset."""
+    from irsim.world.object_base import ObjectBase
+
+    robot = ObjectBase(
+        role="robot",
+        kinematics={"name": "diff"},
+        shape={"name": "circle", "radius": 0.2},
+        sensors=[
+            {
+                "name": "lidar2d",
+                "number": 5,
+                "motion_skew": True,
+                "cache_max_displacement": 1.0,
+            }
+        ],
+    )
+    lidar = robot.sensors[0]
+    lidar._skip_skew_once = False
+    lidar._segment_cache._segments = (
+        np.zeros((0, 2)),
+        np.zeros((0, 2)),
+        np.zeros(0, dtype=int),
+    )
+
+    robot.reset()
+
+    assert lidar._skip_skew_once is True
+    assert lidar._segment_cache._segments is None
 
 
 def test_lidar_single_beam_tof():
