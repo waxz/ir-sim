@@ -1061,6 +1061,213 @@ def test_lidar_detects_disjoint_compound_geometry():
     assert lidar.range_data[0] == pytest.approx(1.75, abs=1e-6)
 
 
+def test_motion_skew_interpolates_beam_poses():
+    """Each beam's origin/direction should sit at its own fraction of the
+    sweep between the previous and current sensor pose, not all share the
+    end-of-step pose."""
+    lidar = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=5,
+        angle_range=np.pi,
+        motion_skew=True,
+    )
+    prev_state = np.array([[0.0], [0.0], [0.0]])
+    new_state = np.array([[2.0], [0.0], [0.0]])
+
+    origins, directions = lidar._interpolate_beam_poses(prev_state, new_state)
+
+    expected_fractions = np.linspace(0.0, 1.0, 5)
+    expected_origins = np.column_stack((2.0 * expected_fractions, np.zeros(5)))
+    expected_angles = np.linspace(-np.pi / 2, np.pi / 2, 5)
+    expected_directions = np.column_stack(
+        (np.cos(expected_angles), np.sin(expected_angles))
+    )
+
+    np.testing.assert_allclose(origins, expected_origins, atol=1e-12)
+    np.testing.assert_allclose(directions, expected_directions, atol=1e-12)
+
+
+def test_motion_skew_disabled_uses_single_shared_pose():
+    """Without motion_skew, ranges must match the pre-existing instantaneous
+    single-origin scan exactly -- this is the default, must-not-regress path."""
+    wall = shapely.LineString([(3.0, -5.0), (3.0, 5.0)])
+    obstacle = _Obstacle(2, wall, shape="linestring")
+    env_param = _EnvParam([obstacle], STRtree([obstacle.geometry]))
+
+    plain = Lidar2D(state=np.array([[0.0], [0.0], [0.0]]), number=9, angle_range=np.pi)
+    plain.parent = _Parent(env_param)
+    plain.step(np.array([[1.0], [0.0], [0.0]]))
+
+    skewed_but_first_step = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=9,
+        angle_range=np.pi,
+        motion_skew=True,
+    )
+    skewed_but_first_step.parent = _Parent(env_param)
+    # The very first step has no previous pose to interpolate from, so it
+    # must also fall back to the single-pose scan regardless of motion_skew.
+    skewed_but_first_step.step(np.array([[1.0], [0.0], [0.0]]))
+
+    np.testing.assert_allclose(
+        plain.range_data, skewed_but_first_step.range_data, atol=1e-9
+    )
+
+
+def test_motion_skew_moving_robot_differs_from_instantaneous_scan():
+    """With real motion between two steps, a skewed scan against a wall
+    should differ from the instantaneous (motion_skew=False) scan, since
+    beams fired earlier in the sweep see the robot's earlier position."""
+    wall = shapely.LineString([(-5.0, 4.0), (5.0, 4.0)])
+    obstacle = _Obstacle(2, wall, shape="linestring")
+    env_param = _EnvParam([obstacle], STRtree([obstacle.geometry]))
+
+    state_a = np.array([[0.0], [0.0], [0.0]])
+    state_b = np.array([[0.0], [2.0], [0.0]])  # moves toward the wall
+
+    plain = Lidar2D(state=state_a, number=11, angle_range=np.pi)
+    plain.parent = _Parent(env_param)
+    plain.step(state_a)
+    plain.step(state_b)
+
+    skewed = Lidar2D(state=state_a, number=11, angle_range=np.pi, motion_skew=True)
+    skewed.parent = _Parent(env_param)
+    skewed.step(state_a)
+    skewed.step(state_b)
+
+    assert not np.allclose(plain.range_data, skewed.range_data)
+    # Beams fired earlier in the sweep (further from the wall, since the
+    # robot started further away) must read a longer range than the same
+    # beam's instantaneous (already-arrived) reading.
+    first_beam_hit = skewed.range_data[0] < plain.range_max - 1e-6
+    if first_beam_hit:
+        assert skewed.range_data[0] >= plain.range_data[0] - 1e-9
+
+
+def test_segment_cache_reduces_gather_calls(monkeypatch):
+    """A stationary sensor with caching enabled should re-gather far less
+    often than a sensor without caching, while still reading the same scan."""
+    circle = _Obstacle(2, shapely.Point(2.0, 0.0).buffer(0.5))
+    env_param = _EnvParam([circle], STRtree([circle.geometry]))
+
+    call_count = {"n": 0}
+    original_gather = ray_casting_2d._gather_obstacle_edges
+
+    def counting_gather(*args, **kwargs):
+        call_count["n"] += 1
+        return original_gather(*args, **kwargs)
+
+    monkeypatch.setattr(ray_casting_2d, "_gather_obstacle_edges", counting_gather)
+
+    state = np.array([[0.0], [0.0], [0.0]])
+    cached = Lidar2D(
+        state=state,
+        number=20,
+        angle_range=np.pi,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=10,
+    )
+    cached.parent = _Parent(env_param)
+
+    n_steps = 10
+    for _ in range(n_steps):
+        cached.step(state)
+
+    assert call_count["n"] < n_steps
+
+    # A fresh, uncached sensor stepped once from the same stationary state
+    # must still read the same scan as the cached one.
+    call_count["n"] = 0
+    fresh = Lidar2D(state=state, number=20, angle_range=np.pi)
+    fresh.parent = _Parent(env_param)
+    fresh.step(state)
+
+    np.testing.assert_allclose(cached.range_data, fresh.range_data, atol=1e-9)
+
+
+def test_segment_cache_refreshes_after_displacement(monkeypatch):
+    """Moving the sensor beyond ``cache_max_displacement`` must force a
+    re-gather so a newly-nearby obstacle is not missed."""
+    circle = _Obstacle(2, shapely.Point(5.0, 0.0).buffer(0.5))
+    env_param = _EnvParam([circle], STRtree([circle.geometry]))
+
+    lidar = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=20,
+        angle_range=np.pi,
+        range_max=3.0,
+        cache_max_displacement=0.1,
+        cache_max_age_steps=1000,
+    )
+    lidar.parent = _Parent(env_param)
+
+    # Far from the obstacle: nothing detected, cache built with no segments.
+    lidar.step(np.array([[0.0], [0.0], [0.0]]))
+    assert lidar.range_data.min() == pytest.approx(lidar.range_max, abs=1e-6)
+
+    # Move well past cache_max_displacement, toward the obstacle: the cache
+    # must refresh and pick up the now-nearby circle.
+    lidar.step(np.array([[4.0], [0.0], [0.0]]))
+    assert lidar.range_data.min() < lidar.range_max - 1e-6
+
+
+def test_lidar_reset_clears_skew_and_cache_state():
+    """reset() must clear the skew baseline and force the next segment
+    gather, matching env.reset() jumping the object back to its init state."""
+    lidar = Lidar2D(
+        state=np.array([[0.0], [0.0], [0.0]]),
+        number=5,
+        motion_skew=True,
+        cache_max_displacement=1.0,
+    )
+    circle = _Obstacle(2, shapely.Point(2.0, 0.0).buffer(0.5))
+    env_param = _EnvParam([circle], STRtree([circle.geometry]))
+    lidar.parent = _Parent(env_param)
+
+    lidar.step(np.array([[0.0], [0.0], [0.0]]))
+    lidar.step(np.array([[1.0], [0.0], [0.0]]))
+    assert lidar._skip_skew_once is False
+    assert lidar._segment_cache._segments is not None
+
+    lidar.reset()
+
+    assert lidar._skip_skew_once is True
+    assert lidar._segment_cache._segments is None
+
+
+def test_object_reset_resets_attached_sensors():
+    """ObjectBase.reset() must reset sensors that define reset(), so a
+    motion-skewed / cached lidar doesn't carry pre-reset state across a
+    parent object reset."""
+    from irsim.world.object_base import ObjectBase
+
+    robot = ObjectBase(
+        role="robot",
+        kinematics={"name": "diff"},
+        shape={"name": "circle", "radius": 0.2},
+        sensors=[
+            {
+                "name": "lidar2d",
+                "number": 5,
+                "motion_skew": True,
+                "cache_max_displacement": 1.0,
+            }
+        ],
+    )
+    lidar = robot.sensors[0]
+    lidar._skip_skew_once = False
+    lidar._segment_cache._segments = (
+        np.zeros((0, 2)),
+        np.zeros((0, 2)),
+        np.zeros(0, dtype=int),
+    )
+
+    robot.reset()
+
+    assert lidar._skip_skew_once is True
+    assert lidar._segment_cache._segments is None
+
+
 def test_lidar_single_beam_tof():
     """A single-beam (1D ToF) lidar produces a valid MultiLineString scan.
 

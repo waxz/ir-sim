@@ -102,6 +102,76 @@ if _HAS_NUMBA:
 
         return hit_distances, denominator, line_cross
 
+    @njit(cache=True, nogil=True)
+    def _ray_segments_per_ray_origin_numba(
+        origins, directions, seg_start, seg_end, max_range, origin_eps
+    ):
+        """Nearest hit per ray when every ray has its own origin (motion skew).
+
+        Unlike the shared-origin kernel, this does not materialize a
+        ``(segments, rays)`` matrix at all: it keeps a running nearest-hit per
+        ray while looping segments, so memory stays O(rays) regardless of
+        segment count. Used when a lidar's beams are each fired from a
+        slightly different interpolated sensor pose.
+        """
+        n_ray = directions.shape[0]
+        n_seg = seg_start.shape[0]
+        ranges = np.full(n_ray, max_range)
+        hit_index = np.full(n_ray, -1)
+
+        for i in range(n_ray):
+            ox0 = origins[i, 0]
+            oy0 = origins[i, 1]
+            dx = directions[i, 0]
+            dy = directions[i, 1]
+            best_range = max_range
+            best_seg = -1
+
+            for j in range(n_seg):
+                sx = seg_start[j, 0]
+                sy = seg_start[j, 1]
+                ex = seg_end[j, 0]
+                ey = seg_end[j, 1]
+                vx = ex - sx
+                vy = ey - sy
+                ox = ox0 - sx
+                oy = oy0 - sy
+                denom = vy * dx - vx * dy
+                line_cross = vx * oy - vy * ox
+
+                if denom != 0.0:
+                    seg_pos = (oy * dx - ox * dy) / denom
+                    if seg_pos < 0.0 or seg_pos > 1.0:
+                        continue
+                    ray_dist = line_cross / denom
+                    if ray_dist <= origin_eps or ray_dist > max_range:
+                        continue
+                else:
+                    if abs(line_cross) > origin_eps:
+                        continue
+                    start_distance = (sx - ox0) * dx + (sy - oy0) * dy
+                    end_distance = (ex - ox0) * dx + (ey - oy0) * dy
+                    overlap_start = min(start_distance, end_distance)
+                    overlap_end = max(start_distance, end_distance)
+                    if overlap_end <= origin_eps or overlap_start > max_range:
+                        continue
+                    ray_dist = (
+                        overlap_start
+                        if overlap_start > origin_eps
+                        else min(overlap_end, max_range)
+                    )
+                    if ray_dist > max_range:
+                        continue
+
+                if ray_dist < best_range:
+                    best_range = ray_dist
+                    best_seg = j
+
+            ranges[i] = best_range
+            hit_index[i] = best_seg
+
+        return ranges, hit_index
+
 
 def _empty_scan(number: int, max_range: float) -> tuple[np.ndarray, np.ndarray]:
     """Return the range and hit-index arrays for a scan with no hits."""
@@ -350,6 +420,64 @@ def _gather_obstacle_edges(
     return np.concatenate(starts), np.concatenate(ends), np.concatenate(owners)
 
 
+class SegmentCache:
+    """Reuses gathered obstacle boundary segments across ``cast_rays`` calls.
+
+    ``_gather_obstacle_edges`` (STRtree query + Shapely boundary flattening)
+    is a fixed per-scan cost, independent of beam count, that dominates lidar
+    step time far more than the numeric ray/segment kernel does. This cache
+    lets repeated ``cast_rays`` calls -- one beam per simulation step to
+    spread a scan over time, or many steps against a mostly-static scene --
+    reuse the last gather instead of repeating it every call.
+
+    Correctness tradeoff: segments are only re-gathered when the query
+    origin has moved beyond ``max_displacement`` since the cache was built,
+    or the cache has been reused ``max_age_steps`` times, whichever comes
+    first. A moving obstacle that passes near the sensor *without the sensor
+    itself moving* is not picked up until the cache next refreshes -- so a
+    stale cache is a real risk in scenes with fast-moving obstacles near the
+    sensor. Keep ``max_age_steps`` small (or don't use the cache) in such
+    scenes; it is safest for static or slowly changing maps.
+    """
+
+    def __init__(self, max_displacement: float, max_age_steps: int = 1) -> None:
+        if max_displacement < 0:
+            raise ValueError("max_displacement must be >= 0")
+        if max_age_steps < 1:
+            raise ValueError("max_age_steps must be >= 1")
+        self.max_displacement = max_displacement
+        self.max_age_steps = max_age_steps
+        self._segments: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._origin_at_gather: np.ndarray | None = None
+        self._age = 0
+
+    def get(
+        self, lidar_geometry, detected_objects, origin: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return cached segments, re-gathering first if the cache is stale."""
+        origin = np.asarray(origin, dtype=float).reshape(2)
+        stale = (
+            self._segments is None
+            or self._origin_at_gather is None
+            or self._age >= self.max_age_steps
+            or float(np.linalg.norm(origin - self._origin_at_gather))
+            > self.max_displacement
+        )
+        if stale:
+            self._segments = _gather_obstacle_edges(lidar_geometry, detected_objects)
+            self._origin_at_gather = origin
+            self._age = 0
+        else:
+            self._age += 1
+        return self._segments
+
+    def invalidate(self) -> None:
+        """Force the next :meth:`get` call to re-gather, discarding state."""
+        self._segments = None
+        self._origin_at_gather = None
+        self._age = 0
+
+
 def _ray_parameters(lidar_geometry, max_range: float) -> tuple[np.ndarray, np.ndarray]:
     """Extract the shared origin and unit directions from max-range beams."""
     coordinates = shapely.get_coordinates(lidar_geometry)
@@ -358,7 +486,7 @@ def _ray_parameters(lidar_geometry, max_range: float) -> tuple[np.ndarray, np.nd
     return origin, directions
 
 
-def cast_ray_segments(
+def _cast_ray_segments_shared_origin(
     origin: np.ndarray,
     directions: np.ndarray,
     seg_start: np.ndarray,
@@ -428,10 +556,88 @@ def cast_ray_segments(
     return ranges, hit_index
 
 
+def _cast_ray_segments_per_ray_origin(
+    origins: np.ndarray,
+    directions: np.ndarray,
+    seg_start: np.ndarray,
+    seg_end: np.ndarray,
+    max_range: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest hit per ray when each ray has its own origin (motion skew).
+
+    With numba available this runs the fused per-ray kernel, which keeps
+    O(rays) memory regardless of segment count. Without numba it falls back
+    to looping rays in Python and reusing the well-tested shared-origin
+    kernel for each single ray -- correct, but O(rays) Python-level calls, so
+    installing ``numba`` (``ir-sim[fast]``) is recommended for per-beam
+    motion skew at scale.
+    """
+    n_ray = len(directions)
+    if len(seg_start) == 0:
+        return _empty_scan(n_ray, max_range)
+
+    if _HAS_NUMBA:
+        return _ray_segments_per_ray_origin_numba(
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(directions, dtype=np.float64),
+            np.ascontiguousarray(seg_start, dtype=np.float64),
+            np.ascontiguousarray(seg_end, dtype=np.float64),
+            float(max_range),
+            ORIGIN_EPS,
+        )
+
+    ranges, hit_index = _empty_scan(n_ray, max_range)
+    for i in range(n_ray):
+        ray_ranges, ray_hit_index = _cast_ray_segments_shared_origin(
+            origins[i], directions[i : i + 1], seg_start, seg_end, max_range
+        )
+        ranges[i] = ray_ranges[0]
+        hit_index[i] = ray_hit_index[0]
+    return ranges, hit_index
+
+
+def cast_ray_segments(
+    origin: np.ndarray,
+    directions: np.ndarray,
+    seg_start: np.ndarray,
+    seg_end: np.ndarray,
+    max_range: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest ray-segment hit distance and segment index per ray.
+
+    Args:
+        origin (np.ndarray): Ray origin(s). Either a single origin shared by
+            every ray, shape ``(2,)`` (the common case: one lidar pose), or
+            one origin per ray, shape ``(N, 2)`` (motion-skew: each beam
+            fired from its own interpolated pose).
+        directions (np.ndarray): Unit ray directions ``(N, 2)``.
+        seg_start (np.ndarray): Segment start points ``(M, 2)``.
+        seg_end (np.ndarray): Segment end points ``(M, 2)``.
+        max_range (float): Maximum ray length; misses return this.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: ``ranges`` ``(N,)`` clamped to
+        ``max_range``, and ``hit_index`` ``(N,)`` giving the index into the
+        segment arrays that each ray hit (``-1`` on a miss).
+    """
+    origin = np.asarray(origin, dtype=float)
+    if origin.ndim == 1:
+        return _cast_ray_segments_shared_origin(
+            origin, directions, seg_start, seg_end, max_range
+        )
+    return _cast_ray_segments_per_ray_origin(
+        origin, directions, seg_start, seg_end, max_range
+    )
+
+
 def cast_rays(
     lidar_geometry,
     detected_objects,
     max_range: float,
+    *,
+    beam_origins: np.ndarray | None = None,
+    beam_directions: np.ndarray | None = None,
+    cache: SegmentCache | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Cast a 2D lidar geometry against already-detected objects.
 
@@ -442,29 +648,57 @@ def cast_rays(
 
     Args:
         lidar_geometry: Max-range beams in world coordinates as a Shapely
-            multiline geometry.
+            multiline geometry. Always used for the broad-phase segment
+            gather (or as the cache key), regardless of ``beam_origins``.
         detected_objects: Objects selected by the sensor's scene query.
         max_range: Maximum ray length; misses return this value.
+        beam_origins: Optional per-ray origins ``(N, 2)`` overriding the
+            single origin ``lidar_geometry`` implies -- for motion-skew
+            scans where each beam fires from its own interpolated pose.
+            When ``None`` (default), the origin/directions are derived from
+            ``lidar_geometry`` exactly as before.
+        beam_directions: Optional per-ray directions ``(N, 2)`` paired with
+            ``beam_origins``. Ignored unless ``beam_origins`` is given; when
+            ``beam_origins`` is given but this is ``None``, the directions
+            derived from ``lidar_geometry`` are reused.
+        cache: Optional :class:`SegmentCache` to reuse gathered segments
+            across calls instead of re-gathering every time. ``None``
+            (default) gathers fresh every call, exactly as before.
 
     Returns:
         tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: Ranges,
-        indices into ``detected_objects``, origin, and directions.
+        indices into ``detected_objects``, the origin(s) actually used
+        (``(2,)`` normally, ``(N, 2)`` when ``beam_origins`` was given), and
+        the directions actually used.
     """
     shapely.prepare(lidar_geometry)
     origin, directions = _ray_parameters(lidar_geometry, max_range)
-    segment_start, segment_end, segment_owner = _gather_obstacle_edges(
-        lidar_geometry,
-        detected_objects,
-    )
+
+    if beam_origins is not None:
+        cast_origin = beam_origins
+        cast_directions = beam_directions if beam_directions is not None else directions
+    else:
+        cast_origin = origin
+        cast_directions = directions
+
+    if cache is not None:
+        segment_start, segment_end, segment_owner = cache.get(
+            lidar_geometry, detected_objects, origin
+        )
+    else:
+        segment_start, segment_end, segment_owner = _gather_obstacle_edges(
+            lidar_geometry,
+            detected_objects,
+        )
     ranges, hit_segments = cast_ray_segments(
-        origin,
-        directions,
+        cast_origin,
+        cast_directions,
         segment_start,
         segment_end,
         max_range,
     )
 
-    hit_object_indices = np.full(len(directions), -1, dtype=int)
+    hit_object_indices = np.full(len(cast_directions), -1, dtype=int)
     has_hit = hit_segments >= 0
     hit_object_indices[has_hit] = segment_owner[hit_segments[has_hit]]
-    return ranges, hit_object_indices, origin, directions
+    return ranges, hit_object_indices, cast_origin, cast_directions

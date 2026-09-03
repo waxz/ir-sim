@@ -191,6 +191,23 @@ obstacle:
 
 Gaussian noise is added to the LiDAR sensor with the `std` and `angle_std` parameters. The `std` parameter is the standard deviation of the range noise, and the `angle_std` parameter is the standard deviation of the angle noise. 
 
+### Motion skew and segment caching
+
+A real spinning LiDAR takes its whole `scan_time` to sweep every beam, so while it scans, the robot keeps moving -- each beam is really measured from a slightly different pose, not one instantaneous snapshot. By default IR-SIM still casts every beam from a single end-of-step pose (`motion_skew: False`). Set `motion_skew: True` to interpolate each beam's pose between the previous and current simulation state instead:
+
+```yaml
+    sensors:
+      - name: 'lidar2d'
+        number: 200
+        motion_skew: True
+        cache_max_displacement: 0.05
+        cache_max_age_steps: 5
+```
+
+- **motion_skew**: When `True`, beam `i` is fired at fraction `i / (number - 1)` of the way through the sweep and uses the sensor pose interpolated that far between the previous and current state (assuming constant velocity across the step). Default `False`.
+- **cache_max_displacement**: The expensive part of a scan is gathering nearby obstacles' boundary segments (a spatial query plus geometry flattening), not the per-beam distance math. When `cache_max_displacement > 0`, that gather is reused across calls as long as the sensor has moved less than this many meters since it was last done -- default `0.0` (disabled; every step gathers fresh, matching pre-existing behavior). This is a real speedup for scenes with many beams and a slow-moving or stationary sensor, but it trades off staleness: an obstacle that moves close to the sensor *without the sensor itself moving* isn't seen until the cache next refreshes. Prefer this for static or slowly changing maps.
+- **cache_max_age_steps**: Caps how many times the cache may be reused before a forced re-gather, bounding staleness from other moving objects even when the sensor stays still. Default `8`. Only relevant when `cache_max_displacement > 0`.
+
 ## FMCW LiDAR Configuration Parameters
 
 IR-SIM also provides a simplified 2D FMCW LiDAR sensor named `fmcw_lidar2d`. It keeps the same beam geometry as the standard 2D LiDAR, but each valid beam additionally reports a scalar `radial_velocity` measurement. This makes it useful for demonstrating how Doppler measurements can help interpret dynamic obstacles.

@@ -5,12 +5,17 @@ rather than a developer machine, so numbers are comparable run to run. Checks:
 
 1. The numba and pure-numpy kernels agree numerically (skipped when numba
    isn't installed).
-2. Per-call speedup of the numba kernel over the numpy kernel.
-3. Multi-threaded speedup: several threads calling the kernel concurrently
+2. Per-ray-origin (motion-skew) casting agrees with looping the shared-origin
+   kernel per ray, with and without numba; a moving robot actually reads
+   different ranges with motion_skew on vs off.
+3. Per-call speedup of the numba kernel over the numpy kernel.
+4. Segment-cache speedup for a stationary sensor, and that cached results
+   match an uncached (always-fresh) gather.
+5. Multi-threaded speedup: several threads calling the kernel concurrently
    (simulating parallel RL environments) must be both faster than running the
    same work sequentially and return results identical to a single-threaded
    call, proving the kernel has no shared mutable state / races.
-4. End-to-end ``env.step()`` timing on a representative multi-robot,
+6. End-to-end ``env.step()`` timing on a representative multi-robot,
    lidar-equipped scenario.
 
 Exits non-zero if a correctness check fails. Timing regressions are reported
@@ -85,6 +90,109 @@ def check_numba_matches_numpy() -> None:
     )
 
 
+def check_per_ray_origin_matches_shared_origin() -> None:
+    """Per-ray (motion-skew) origins must agree with the shared-origin kernel
+    called once per ray, both with and without numba."""
+    rng = np.random.default_rng(20260903)
+    n_rays = 40
+    origins = rng.uniform(-2.0, 2.0, size=(n_rays, 2))
+    angles = rng.uniform(-np.pi, np.pi, n_rays)
+    directions = np.column_stack((np.cos(angles), np.sin(angles)))
+    seg_start = rng.uniform(-5.0, 5.0, size=(300, 2))
+    seg_end = seg_start + rng.uniform(-1.0, 1.0, size=(300, 2))
+    max_range = 8.0
+
+    ref_ranges = np.empty(n_rays)
+    ref_hits = np.empty(n_rays, dtype=int)
+    for i in range(n_rays):
+        r, h = rc._cast_ray_segments_shared_origin(
+            origins[i], directions[i : i + 1], seg_start, seg_end, max_range
+        )
+        ref_ranges[i] = r[0]
+        ref_hits[i] = h[0]
+
+    for use_numba, label in ((rc._HAS_NUMBA, "numba"), (False, "numpy-fallback")):
+        had_numba = rc._HAS_NUMBA
+        rc._HAS_NUMBA = use_numba
+        try:
+            ranges, hits = rc.cast_ray_segments(
+                origins, directions, seg_start, seg_end, max_range
+            )
+        finally:
+            rc._HAS_NUMBA = had_numba
+        ok = np.allclose(ranges, ref_ranges, atol=1e-9) and np.array_equal(
+            hits, ref_hits
+        )
+        _report(
+            f"per-ray origin ({label}) matches per-ray reference",
+            ok,
+            f"{n_rays} rays x {len(seg_start)} segments",
+        )
+
+
+def check_motion_skew_smoke() -> None:
+    """A moving robot must read different ranges with motion_skew on vs off;
+    a robot that hasn't moved yet (first scan) must read the same either way."""
+    from irsim.world.sensors.lidar2d import Lidar2D
+
+    class _EnvParam:
+        def __init__(self, objects, tree):
+            self.objects = objects
+            self.GeometryTree = tree
+
+    class _Env:
+        def __init__(self, env_param):
+            self._env_param = env_param
+
+    class _Parent:
+        def __init__(self, env_param):
+            self._env = _Env(env_param)
+
+    class _Obstacle:
+        def __init__(self, obj_id, geometry):
+            self._id = obj_id
+            self._geometry = geometry
+            self._geometry_valid = True
+            self.shape = "linestring"
+            self.unobstructed = False
+            self._velocity_xy = np.zeros((2, 1))
+
+        @property
+        def geometry(self):
+            return self._geometry
+
+        @property
+        def velocity_xy(self):
+            return self._velocity_xy
+
+    import shapely
+    from shapely import STRtree
+
+    wall = shapely.LineString([(-5.0, 4.0), (5.0, 4.0)])
+    obstacle = _Obstacle(2, wall)
+    env_param = _EnvParam([obstacle], STRtree([obstacle.geometry]))
+
+    state_a = np.array([[0.0], [0.0], [0.0]])
+    state_b = np.array([[0.0], [2.0], [0.0]])
+
+    plain = Lidar2D(state=state_a, number=11, angle_range=np.pi)
+    plain.parent = _Parent(env_param)
+    plain.step(state_a)
+    plain.step(state_b)
+
+    skewed = Lidar2D(state=state_a, number=11, angle_range=np.pi, motion_skew=True)
+    skewed.parent = _Parent(env_param)
+    skewed.step(state_a)
+    skewed.step(state_b)
+
+    differs = not np.allclose(plain.range_data, skewed.range_data)
+    _report(
+        "motion_skew changes readings for a moving robot",
+        differs,
+        "range_data differs between motion_skew=False and motion_skew=True",
+    )
+
+
 def bench_kernel_speed(n_calls: int = 100) -> None:
     if not rc._HAS_NUMBA:
         print("[SKIP] kernel speed comparison: numba not installed")
@@ -113,6 +221,85 @@ def bench_kernel_speed(n_calls: int = 100) -> None:
     print(
         f"[INFO] kernel speed: numba={numba_time * 1000:.3f} ms/call, "
         f"numpy={numpy_time * 1000:.3f} ms/call, speedup={speedup:.2f}x"
+    )
+
+
+def bench_segment_cache_speedup(n_calls: int = 200) -> None:
+    """Compare a stationary scan's cost with and without ``SegmentCache``.
+
+    ``_gather_obstacle_edges`` (STRtree query + boundary flattening) is a
+    fixed per-call cost independent of beam count; caching it across calls
+    for a sensor that hasn't moved should recover most of that cost.
+    """
+    import shapely
+
+    rng = np.random.default_rng(20260903)
+    polygons = [
+        shapely.buffer(shapely.Point(x, y), 0.3, quad_segs=8)
+        for x, y in rng.uniform(-8.0, 8.0, size=(30, 2))
+    ]
+
+    class _Obj:
+        def __init__(self, geometry):
+            self._geometry = geometry
+            self.shape = "circle"
+
+    detected_objects = [_Obj(g) for g in polygons]
+
+    angles = np.linspace(-np.pi, np.pi, 361)
+    max_range = 10.0
+    origin = np.zeros(2)
+    endpoints = origin + max_range * np.column_stack((np.cos(angles), np.sin(angles)))
+    lidar_geometry = shapely.MultiLineString(
+        [shapely.LineString([origin, p]) for p in endpoints]
+    )
+
+    # No cache: every call re-gathers (today's default behavior).
+    for _ in range(3):
+        rc.cast_rays(lidar_geometry, detected_objects, max_range)
+    t0 = time.perf_counter()
+    for _ in range(n_calls):
+        rc.cast_rays(lidar_geometry, detected_objects, max_range)
+    uncached_time = (time.perf_counter() - t0) / n_calls
+
+    # Cached, stationary sensor: gather happens once, then reused.
+    cache = rc.SegmentCache(max_displacement=0.05, max_age_steps=n_calls)
+    for _ in range(3):
+        rc.cast_rays(lidar_geometry, detected_objects, max_range, cache=cache)
+    cache.invalidate()
+    t0 = time.perf_counter()
+    for _ in range(n_calls):
+        rc.cast_rays(lidar_geometry, detected_objects, max_range, cache=cache)
+    cached_time = (time.perf_counter() - t0) / n_calls
+
+    speedup = uncached_time / cached_time if cached_time > 0 else float("inf")
+    print(
+        f"[INFO] segment cache (stationary sensor, 361 beams, 30 obstacles): "
+        f"uncached={uncached_time * 1000:.3f} ms/call, "
+        f"cached={cached_time * 1000:.3f} ms/call, speedup={speedup:.2f}x"
+    )
+    if speedup <= 1.0:
+        print("[WARN] segment cache showed no speedup on this runner")
+
+    # Correctness: cached result for a stationary sensor must match the
+    # uncached (always-fresh) result exactly.
+    cache.invalidate()
+    # Prime the cache (this call's own result is unused; the next call is
+    # the one that actually reuses it).
+    rc.cast_rays(lidar_geometry, detected_objects, max_range, cache=cache)
+    cached_ranges2, cached_hits2, _, _ = rc.cast_rays(
+        lidar_geometry, detected_objects, max_range, cache=cache
+    )
+    fresh_ranges, fresh_hits, _, _ = rc.cast_rays(
+        lidar_geometry, detected_objects, max_range
+    )
+    ok = np.array_equal(cached_ranges2, fresh_ranges) and np.array_equal(
+        cached_hits2, fresh_hits
+    )
+    _report(
+        "segment cache reuse matches fresh gather",
+        ok,
+        "second cached call (reused segments) matches an uncached call",
     )
 
 
@@ -220,7 +407,10 @@ def main() -> int:
     print(f"numba backend active: {rc._HAS_NUMBA}")
 
     check_numba_matches_numpy()
+    check_per_ray_origin_matches_shared_origin()
+    check_motion_skew_smoke()
     bench_kernel_speed()
+    bench_segment_cache_speedup()
     check_thread_safety()
     if not args.skip_env_step:
         bench_env_step()

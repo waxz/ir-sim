@@ -1343,6 +1343,11 @@ class ObjectBase:
         self.trajectory = []
         self._invalidate_reactive_cache()
 
+        for sensor in self.sensors:
+            sensor_reset = getattr(sensor, "reset", None)
+            if sensor_reset is not None:
+                sensor_reset()
+
     def refresh(self, sensor_step: bool = True):
         """
         Refresh state-derived attributes (geometry and sensors) without
