@@ -153,7 +153,8 @@ Type checking uses `ty` with custom rule configurations in `pyproject.toml`.
 **Optional dependencies**:
 - `pynput`: Keyboard control (`pip install ir-sim[keyboard]`)
 - `pyrvo`: ORCA group behavior (`pip install pyrvo`)
-- All extras: `pip install ir-sim[all]` (includes pynput, imageio[ffmpeg], pyrvo)
+- `numba`: JIT-accelerated, GIL-releasing lidar ray-casting kernel (`pip install ir-sim[fast]`); falls back to the pure-numpy kernel when absent
+- All extras: `pip install ir-sim[all]` (includes pynput, imageio[ffmpeg], pyrvo, numba)
 
 ## Testing Notes
 

@@ -30,6 +30,78 @@ ORIGIN_EPS = 1e-9
 # them at once would make every temporary matrix scale with segments * beams.
 SEGMENT_CHUNK_SIZE = 1024
 
+# Optional Numba backend for the per-chunk numeric kernel. Purely additive: it
+# is only used when numba is importable, has no shared mutable state (every
+# input/output is a local array), and is compiled with nogil=True so multiple
+# threads (e.g. several RL environments stepped from a ThreadPoolExecutor) can
+# run it concurrently instead of serializing behind the GIL. When numba is
+# unavailable the module falls back to the pure-numpy kernel below, so numba
+# stays an optional, install-if-you-want-it speedup rather than a hard
+# dependency.
+try:
+    from numba import njit
+
+    _HAS_NUMBA = True
+except ImportError:  # pragma: no cover - exercised in numba-less environments
+    njit = None
+    _HAS_NUMBA = False
+
+
+if _HAS_NUMBA:
+
+    @njit(cache=True, nogil=True)
+    def _nonparallel_hit_distances_numba(
+        directions, segment_vectors, start_to_origin, max_range, origin_eps
+    ):
+        """Elementwise reimplementation of the numpy kernel below, JIT-compiled.
+
+        Fuses the matmuls/masks/``np.where`` of the vectorized version into a
+        single pass per (segment, ray) pair, avoiding the several full-size
+        temporary matrices the numpy path allocates. ``nogil=True`` lets this
+        run truly in parallel across threads, which the numpy version cannot
+        (it stays on the GIL for the Python-level mask/``np.where`` steps in
+        between the C-level matmuls).
+        """
+        n_seg = segment_vectors.shape[0]
+        n_ray = directions.shape[0]
+        hit_distances = np.empty((n_seg, n_ray))
+        denominator = np.empty((n_seg, n_ray))
+        line_cross = np.empty(n_seg)
+
+        for j in range(n_seg):
+            vx = segment_vectors[j, 0]
+            vy = segment_vectors[j, 1]
+            ox = start_to_origin[j, 0]
+            oy = start_to_origin[j, 1]
+            lc = vx * oy - vy * ox
+            line_cross[j] = lc
+
+            for i in range(n_ray):
+                dx = directions[i, 0]
+                dy = directions[i, 1]
+                # perpendicular_directions column i is (-dy, dx)
+                denom = vy * dx - vx * dy
+                denominator[j, i] = denom
+
+                if denom == 0.0:
+                    hit_distances[j, i] = np.inf
+                    continue
+
+                seg_pos = (oy * dx - ox * dy) / denom
+                ray_dist = lc / denom
+
+                if (
+                    seg_pos < 0.0
+                    or seg_pos > 1.0
+                    or ray_dist <= origin_eps
+                    or ray_dist > max_range
+                ):
+                    hit_distances[j, i] = np.inf
+                else:
+                    hit_distances[j, i] = ray_dist
+
+        return hit_distances, denominator, line_cross
+
 
 def _empty_scan(number: int, max_range: float) -> tuple[np.ndarray, np.ndarray]:
     """Return the range and hit-index arrays for a scan with no hits."""
@@ -40,7 +112,7 @@ def _empty_scan(number: int, max_range: float) -> tuple[np.ndarray, np.ndarray]:
     return ranges, hit_index
 
 
-def _nonparallel_hit_distances(
+def _nonparallel_hit_distances_numpy(
     directions: np.ndarray,
     segment_vectors: np.ndarray,
     start_to_origin: np.ndarray,
@@ -82,6 +154,32 @@ def _nonparallel_hit_distances(
         & (ray_distance <= max_range)
     )
     return np.where(valid_hit, ray_distance, np.inf), denominator, line_cross
+
+
+def _nonparallel_hit_distances(
+    directions: np.ndarray,
+    segment_vectors: np.ndarray,
+    start_to_origin: np.ndarray,
+    max_range: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dispatch to the numba kernel when available, else the numpy kernel.
+
+    Both kernels are pure functions of their arguments with no shared mutable
+    state, so this dispatch (and either kernel) is safe to call concurrently
+    from multiple threads or processes, e.g. several RL environments stepped
+    in parallel.
+    """
+    if _HAS_NUMBA:
+        return _nonparallel_hit_distances_numba(
+            np.ascontiguousarray(directions, dtype=np.float64),
+            np.ascontiguousarray(segment_vectors, dtype=np.float64),
+            np.ascontiguousarray(start_to_origin, dtype=np.float64),
+            float(max_range),
+            ORIGIN_EPS,
+        )
+    return _nonparallel_hit_distances_numpy(
+        directions, segment_vectors, start_to_origin, max_range
+    )
 
 
 def _empty_collinear_hits() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
