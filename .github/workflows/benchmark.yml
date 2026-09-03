@@ -1,0 +1,41 @@
+# Runs the ray-casting performance/correctness checks on a GitHub-hosted
+# runner (not a local machine or sandbox) so results are comparable across
+# runs. Fails the job if the numba and numpy kernels disagree, or if
+# concurrent calls from multiple threads produce inconsistent results.
+
+name: Ray casting benchmark
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install the project (with numba)
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run ray-casting benchmark with numba
+        run: xvfb-run -s "-screen 0 1024x768x24" uv run python benchmarks/bench_ray_casting.py
+
+      - name: Reinstall without numba (exercise the numpy fallback)
+        run: uv pip uninstall numba llvmlite
+
+      - name: Run ray-casting benchmark without numba
+        run: xvfb-run -s "-screen 0 1024x768x24" uv run python benchmarks/bench_ray_casting.py --skip-env-step
