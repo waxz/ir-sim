@@ -9,7 +9,11 @@ from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from shapely import MultiLineString
 
-from irsim.lib.algorithm.ray_casting_2d import SegmentCache, cast_rays
+from irsim.lib.algorithm.ray_casting_2d import (
+    SegmentCache,
+    TieredSegmentCache,
+    cast_rays,
+)
 from irsim.util.random import rng
 from irsim.util.util import (
     ClipTo2Pi,
@@ -58,6 +62,14 @@ class Lidar2D:
             may be reused before a forced re-gather, bounding staleness from
             obstacles that moved without the sensor moving. Default ``8``.
             Only relevant when ``cache_max_displacement > 0``.
+        cache_split_static (bool): When ``True`` (and ``cache_max_displacement
+            > 0``), uses a two-tier cache that caches only objects with a
+            truthy ``static`` attribute and always gathers non-static objects
+            fresh -- removing the plain cache's staleness risk for scenes
+            with moving obstacles near the sensor, at the cost of splitting
+            detected objects into two groups every call. See
+            :class:`~irsim.lib.algorithm.ray_casting_2d.TieredSegmentCache`.
+            Default ``False`` (one combined cache, as before).
         **kwargs: Additional arguments.
             color (str): Color of the sensor.
 
@@ -109,6 +121,7 @@ class Lidar2D:
         motion_skew: bool = False,
         cache_max_displacement: float = 0.0,
         cache_max_age_steps: int = 8,
+        cache_split_static: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -145,11 +158,11 @@ class Lidar2D:
 
         self.motion_skew = motion_skew
         self._skip_skew_once = True
-        self._segment_cache = (
-            SegmentCache(cache_max_displacement, cache_max_age_steps)
-            if cache_max_displacement > 0
-            else None
-        )
+        if cache_max_displacement > 0:
+            cache_cls = TieredSegmentCache if cache_split_static else SegmentCache
+            self._segment_cache = cache_cls(cache_max_displacement, cache_max_age_steps)
+        else:
+            self._segment_cache = None
 
         # With motion_skew, beams are spread linearly across the scan; each
         # beam's fire time is `i * time_inc` into the sweep. Without it, all

@@ -1,114 +1,150 @@
-# Evaluation: Multi-Stage Ray Casting (Static Walls First, Then Dynamic Objects)
+# Multi-Stage Ray Casting (Static Walls Cached, Dynamic Objects Gathered Fresh)
 
-**Date:** 2026-09-03
-**Status:** Evaluated and benchmarked; **not yet implemented** in `irsim/`. This
-report documents the idea, a working prototype used to measure it, and a
-recommendation.
+**Date:** 2026-09-03 (evaluated) / 2026-09-04 (implemented)
+**Status:** Implemented as `TieredSegmentCache` in
+`irsim/lib/algorithm/ray_casting_2d.py`, wired into `Lidar2D` via
+`cache_split_static=True`. Opt-in; default behavior is unchanged.
 
 ## The idea
 
-`irsim.lib.algorithm.ray_casting_2d.cast_rays` currently gathers boundary
-segments from *every* detected object in one pass
-(`_gather_obstacle_edges`), then casts all beams against that combined segment
-set. In a typical scene, most objects are static (walls, fixed obstacles, a
-loaded map) and a few are dynamic (other robots, moving obstacles). Static
-geometry never needs re-gathering once built; only the dynamic objects'
-segments need to be fresh every step.
+`cast_rays` gathers boundary segments from *every* detected object in one
+pass (`_gather_obstacle_edges`), then casts all beams against that combined
+segment set. In a typical scene, most objects are static (walls, fixed
+obstacles, a loaded map) and a few are dynamic (other robots, moving
+obstacles). Static geometry never needs re-gathering once built; only the
+dynamic objects' segments need to be fresh every step.
 
-Splitting the gather into two stages -- static segments gathered once and
-reused indefinitely (for a given sensor position), dynamic segments gathered
-fresh every step -- means the per-step gather cost scales with the number of
-*dynamic* objects only, not the whole scene.
+This is a refinement of the `SegmentCache` mechanism from
+`report/ray_casting_performance.md`: that cache treats all detected objects
+as one blob and is keyed only on sensor displacement, so it is only
+correctness-safe for scenes with no obstacles moving near the sensor.
+Splitting by `obj.static` (an existing `ObjectBase` attribute) removes that
+restriction for the common case.
 
-This is a refinement of the `SegmentCache` mechanism added earlier this
-session (see `report/ray_casting_performance.md`): that cache treats all
-detected objects as one blob and is keyed only on sensor displacement, so it
-is only safe for scenes with no nearby moving obstacles. Splitting by
-`obj.static` (an existing `ObjectBase` attribute) removes that restriction for
-the common case.
+## Implementation
 
-## Prototype and benchmark
+`TieredSegmentCache` (`irsim/lib/algorithm/ray_casting_2d.py`) partitions
+`detected_objects` into a static tier (truthy `.static`) and a dynamic tier
+(everything else, including objects with no `.static` attribute at all --
+the conservative default) on every call:
 
-A prototype (not merged) was built directly against the existing internals
-(`_gather_obstacle_edges`, `_ray_parameters`, `cast_ray_segments`), exercising
-exactly the code path `cast_rays` already uses, just split in two:
+- **Static tier**: delegated to an internal `SegmentCache`, keyed on the
+  query origin's displacement exactly like the combined cache. This is
+  *exact*, not an approximation: static geometry never changes, so the only
+  valid reason to re-gather it is the sensor moving far enough for different
+  static objects to enter or leave detection range -- precisely what the
+  displacement check re-triggers on.
+- **Dynamic tier**: gathered unconditionally on every call via
+  `_gather_obstacle_edges`, so moving objects are never stale.
+- Owner indices from each tier are re-mapped back to positions in the
+  original `detected_objects` list before the segments are concatenated, so
+  `cast_rays`'s `hit_object_indices` output is unaffected by the split.
 
-```python
-static_start, static_end, static_owner = _gather_obstacle_edges(lidar_geometry, static_objs)  # once
+Enabled per-sensor via two new `Lidar2D` constructor arguments:
 
-def step():
-    dyn_start, dyn_end, dyn_owner = _gather_obstacle_edges(lidar_geometry, dynamic_objs)  # every step
-    seg_start = np.concatenate([static_start, dyn_start])
-    seg_end = np.concatenate([static_end, dyn_end])
-    origin, directions = _ray_parameters(lidar_geometry, max_range)
-    return cast_ray_segments(origin, directions, seg_start, seg_end, max_range)
+```yaml
+sensors:
+  - name: 'lidar2d'
+    cache_max_displacement: 0.05   # as before: enables caching at all
+    cache_max_age_steps: 8
+    cache_split_static: True       # new: use the tiered cache
 ```
 
-**Correctness:** the prototype's output was checked to match a full, fresh,
-uncached `cast_rays` call over the combined object list exactly
-(`np.testing.assert_allclose` / `assert_array_equal`, tolerance 1e-9) -- the
-split changes nothing about *what* is computed, only *when* the static half is
-re-gathered.
+`cache_split_static=False` (default) keeps today's combined `SegmentCache`
+behavior unchanged.
 
-**Performance** (361-beam scan, stationary sensor, rectangular static
-obstacles + circular dynamic obstacles, mean of 150-300 steps after JIT/cache
-warmup):
+## Performance and correctness: three-way comparison
 
-| Static objects | Dynamic objects | Baseline (fresh gather every step) | Multi-stage (static cached) | Speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| 400 | 10 | 17.5 ms/step | 4.5 ms/step | **3.84x** |
-| 100 | 10 | 4.9 ms/step | 1.8 ms/step | **2.74x** |
-| 1000 | 10 | 37.1 ms/step | 6.5 ms/step | **5.69x** |
-| 400 | 50 | 29.6 ms/step | 15.2 ms/step | **1.95x** |
-| 400 | 100 | 40.8 ms/step | 27.3 ms/step | **1.49x** |
+Benchmarked in `benchmarks/bench_ray_casting.py::bench_multi_stage_comparison`
+(also runs in CI, `.github/workflows/benchmark.yml`) against a scene with 400
+static box obstacles and 10 dynamic circular obstacles that **actually move
+every step** (unlike a purely stationary-scene benchmark, this exercises the
+exact case the combined cache is unsound for), a stationary 361-beam sensor,
+150 steps. Correctness is measured as the maximum per-beam range deviation
+from an always-fresh, uncached gather computed independently at every step
+("ground truth"):
 
-For reference, today's combined `SegmentCache` (`max_age_steps=1`) on the
-400-static/10-dynamic scene measured 10.7 ms/step -- faster than the
-uncached baseline, but **2.38x slower than the multi-stage split, and not
-actually correctness-safe here**: at `max_age_steps=1` it still reuses the
-cache every other call, so it would silently serve one-step-stale dynamic
-obstacle positions half the time. The multi-stage split has no such caveat --
-dynamic segments are gathered fresh on every single step, by construction.
+| Option | Time/step | Speedup vs. baseline | Max deviation from ground truth |
+| --- | ---: | ---: | ---: |
+| **Baseline** (no cache, fresh gather every step) | 14.66 ms | 1.00x | **0.0 m** (exact, by construction) |
+| **Combined `SegmentCache`** (`max_age_steps=10`) | 3.44 ms | **4.26x** | **14.75 m** (wrong -- serves a stale, out-of-date obstacle position) |
+| **`TieredSegmentCache`** (`max_age_steps=10`) | 3.96 ms | **3.70x** | **0.0 m** (exact) |
+
+The combined cache's 14.75 m deviation is not a fluke or a tuning mistake --
+it is the documented, structural tradeoff of caching a mixed static+dynamic
+object list keyed only on sensor displacement: a stationary sensor never
+invalidates the cache no matter how far the dynamic obstacles move, so a
+scene with any moving obstacle near a slow or stationary sensor gets stale
+readings under that cache. `TieredSegmentCache` closes this gap entirely
+(exactly 0.0 m deviation, every step, by construction -- the dynamic tier is
+never cached) while still recovering most of the combined cache's speedup
+(3.70x vs. 4.26x here; the ~13% gap is the cost of partitioning objects into
+two tiers and gathering the dynamic tier as a separate call each step).
+
+A second sweep (single, stationary-obstacle scenes, no per-step obstacle
+motion -- see "Prototype and earlier benchmark" below) additionally shows how
+the tiered cache's advantage over a full re-gather scales with the
+static:dynamic object ratio, from 1.49x (dynamic-heavy scenes) up to 5.69x
+(static-heavy scenes, the common navigation/RL case).
+
+### Test coverage
+
+`tests/test_sensors.py` adds:
+
+- `test_tiered_cache_never_misses_a_moving_obstacle`: a dynamic obstacle
+  sweeps toward and away from a stationary sensor across 4 steps; the tiered
+  cache's `range_data` matches an uncached lidar exactly at every step, and
+  the static tier's internal age confirms it was gathered exactly once.
+- `test_tiered_cache_beats_combined_cache_correctness_in_dynamic_scene`:
+  reproduces the staleness gap above directly through the public `Lidar2D`
+  API -- after an obstacle moves out of range, the combined cache still
+  reports a hit (stale) while the tiered cache correctly reports none.
+
+Both, plus the full existing suite, pass: **967 passed, 45 skipped, 0
+failures** (`pytest tests/`), unchanged from before this feature (it is
+purely additive; `cache_split_static` defaults to `False`).
 
 ## Interpretation
 
-- **Speedup scales with the static:dynamic ratio.** A mostly-static map (a
-  building, a warehouse) with a handful of moving robots -- the common
-  navigation/RL scenario -- sees the largest win (up to ~5.7x at 1000
-  static : 10 dynamic in this sweep). A scene where most objects are dynamic
-  (e.g. dense multi-robot swarms with few walls) sees a much smaller benefit,
-  since the per-step cost is then dominated by the dynamic gather, which this
-  design doesn't speed up.
-- **No correctness compromise**, unlike the existing combined `SegmentCache`:
-  static geometry is genuinely immutable, so caching it forever (for a fixed
-  sensor position) is exact, not an approximation. Dynamic objects are never
-  stale.
+- **Speedup scales with the static:dynamic ratio and with the dynamic tier's
+  gather cost.** A mostly-static map with a handful of moving robots -- the
+  common navigation/RL scenario -- sees the largest win. A scene where most
+  objects are dynamic sees a smaller benefit, since per-step cost is then
+  dominated by the (never-cached-by-design) dynamic gather.
+- **No correctness compromise for the static tier**, unlike the combined
+  cache: static geometry is genuinely immutable, so caching it forever (for
+  a fixed sensor position) is exact. The measured 0.0 m deviation across all
+  150 steps of a moving-obstacle scene confirms this empirically, not just
+  by argument.
 - **Composable with the existing motion-skew and numba work**: the combined
-  segment array (static + fresh dynamic) is just handed to the same
-  `cast_ray_segments`, so it works unchanged with per-ray origins and the
-  numba kernel from `report/ray_casting_performance.md`.
+  segment array (static + fresh dynamic) is handed to the same
+  `cast_ray_segments`/numba kernel unchanged, so it works with per-ray
+  origins from `motion_skew` and gets the same JIT speedup.
 
-## Recommendation
+## Prototype and earlier benchmark (historical)
 
-Worth implementing as a follow-up: extend `SegmentCache` (or add a sibling
-class) to gather `static` and non-`static` detected objects separately, cache
-the static half keyed on sensor displacement (as today, since the sensor
-still needs to re-query when it moves far enough for new static geometry to
-enter range) with no `max_age_steps` staleness concern, and always gather the
-dynamic half fresh. Suggested scope for that change:
+Before implementation, a standalone prototype (not merged) was built
+directly against `_gather_obstacle_edges` / `_ray_parameters` /
+`cast_ray_segments` to validate the idea and measure it across a range of
+static:dynamic ratios on stationary-obstacle scenes:
 
-1. `Lidar2D._get_detected_objects` (or a new helper) partitions
-   `detected_objects` by `obj.static`.
-2. `SegmentCache` (or a new `TieredSegmentCache`) caches the static partition
-   exactly like today, and gathers the dynamic partition unconditionally on
-   every `get()` call, then concatenates.
-3. Default behavior stays unchanged (no cache configured); this is additive,
-   like `motion_skew` and `cache_max_displacement` before it.
-4. Needs the same reset-safety treatment as the current cache
-   (`SegmentCache.invalidate()` on `Lidar2D.reset()`), plus invalidation when
-   an object's `static` flag or the scene's object set changes (object
-   add/remove), which the current sensor-displacement-only cache does not
-   need to handle since it treats the whole scene as one unit.
+| Static objects | Dynamic objects | Baseline | Multi-stage prototype | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 400 | 10 | 17.5 ms/step | 4.5 ms/step | 3.84x |
+| 100 | 10 | 4.9 ms/step | 1.8 ms/step | 2.74x |
+| 1000 | 10 | 37.1 ms/step | 6.5 ms/step | 5.69x |
+| 400 | 50 | 29.6 ms/step | 15.2 ms/step | 1.95x |
+| 400 | 100 | 40.8 ms/step | 27.3 ms/step | 1.49x |
 
-This report intentionally stops at evaluation + prototype-level benchmarking,
-per this session's task scope; implementation is left for a follow-up change.
+These numbers guided the implementation but were produced by hand-rolled
+script code, not the shipped `TieredSegmentCache` class; the three-way
+comparison above supersedes them as the authoritative, moving-obstacle,
+production-code benchmark.
+
+## Reproducing these numbers
+
+```bash
+uv sync --locked --all-extras --dev
+uv run python benchmarks/bench_ray_casting.py --skip-env-step
+uv run pytest tests/test_sensors.py -k tiered
+```

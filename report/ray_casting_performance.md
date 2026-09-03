@@ -84,9 +84,13 @@ reused more than `cache_max_age_steps` times.
 on the *sensor's* displacement, not on whether nearby objects moved. A dynamic
 obstacle that drifts close to a stationary sensor is invisible until the cache
 next refreshes. This makes the cache, as shipped, safe mainly for static or
-slowly changing scenes -- see `report/multi_stage_ray_casting.md` for a design
-that removes this limitation for the common case (a mostly-static map with a
-handful of moving robots/obstacles), which is not yet implemented.
+slowly changing scenes. **Update:** `report/multi_stage_ray_casting.md`
+documents `TieredSegmentCache` (`Lidar2D(cache_split_static=True)`), which
+removes this limitation for the common case (a mostly-static map with a
+handful of moving robots/obstacles) by caching only static geometry and
+always gathering dynamic objects fresh -- measured at exactly 0.0 m deviation
+from a ground-truth fresh gather in a moving-obstacle scene, vs. 14.75 m for
+the combined cache above, at a comparable speedup (3.70x vs. 4.26x).
 
 ## Reproducing these numbers
 

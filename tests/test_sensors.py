@@ -977,13 +977,21 @@ class _MapObject:
 class _Obstacle:
     """Mimics a dynamic obstacle with a polygon geometry."""
 
-    def __init__(self, obj_id, geometry, shape="circle", velocity_xy=(0.0, 0.0)):
+    def __init__(
+        self,
+        obj_id,
+        geometry,
+        shape="circle",
+        velocity_xy=(0.0, 0.0),
+        static: bool = False,
+    ):
         self._id = obj_id
         self._geometry = geometry
         self._geometry_valid = True
         self.shape = shape
         self.unobstructed = False
         self._velocity_xy = np.asarray(velocity_xy, dtype=float).reshape(2, 1)
+        self.static = static
 
     @property
     def geometry(self):
@@ -1209,6 +1217,101 @@ def test_segment_cache_refreshes_after_displacement(monkeypatch):
     # must refresh and pick up the now-nearby circle.
     lidar.step(np.array([[4.0], [0.0], [0.0]]))
     assert lidar.range_data.min() < lidar.range_max - 1e-6
+
+
+def test_tiered_cache_never_misses_a_moving_obstacle():
+    """Unlike the combined cache, the tiered cache must track a dynamic
+    obstacle that moves near a *stationary* sensor on every single step,
+    while still avoiding re-gathering the (unmoving) static wall each time."""
+    wall = shapely.LineString([(-5.0, 5.0), (5.0, 5.0)])
+    static_wall = _Obstacle(2, wall, shape="linestring", static=True)
+    moving = _Obstacle(3, shapely.Point(100.0, 100.0).buffer(0.3), static=False)
+    env_param = _EnvParam(
+        [static_wall, moving], STRtree([static_wall.geometry, moving.geometry])
+    )
+
+    state = np.array([[0.0], [0.0], [0.0]])
+
+    tiered = Lidar2D(
+        state=state,
+        number=40,
+        angle_range=np.pi,
+        range_max=8.0,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=1000,
+        cache_split_static=True,
+    )
+    tiered.parent = _Parent(env_param)
+
+    fresh = Lidar2D(state=state, number=40, angle_range=np.pi, range_max=8.0)
+    fresh.parent = _Parent(env_param)
+
+    # The moving obstacle sweeps close to, then away from, the stationary
+    # sensor across several steps -- the sensor itself never moves.
+    positions = [(100.0, 100.0), (3.0, 0.0), (2.0, 0.0), (100.0, 100.0)]
+    for x, y in positions:
+        moving._geometry = shapely.Point(x, y).buffer(0.3)
+        tiered.step(state)
+        fresh.step(state)
+        np.testing.assert_allclose(
+            tiered.range_data,
+            fresh.range_data,
+            atol=1e-9,
+            err_msg=f"tiered cache diverged from a fresh gather at obstacle position ({x}, {y})",
+        )
+
+    # The static tier was gathered once (the first step) and reused for
+    # every subsequent step -- its age grew by one per reuse, never reset.
+    static_cache = tiered._segment_cache._static_cache
+    assert static_cache._age == len(positions) - 1
+
+
+def test_tiered_cache_beats_combined_cache_correctness_in_dynamic_scene():
+    """The combined SegmentCache can serve stale dynamic-obstacle data when
+    reused; the tiered cache must not, for the same moving-obstacle scene."""
+    moving = _Obstacle(2, shapely.Point(3.0, 0.0).buffer(0.3), static=False)
+    env_param = _EnvParam([moving], STRtree([moving.geometry]))
+    state = np.array([[0.0], [0.0], [0.0]])
+
+    combined = Lidar2D(
+        state=state,
+        number=20,
+        angle_range=np.pi,
+        range_max=8.0,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=10,
+    )
+    combined.parent = _Parent(env_param)
+
+    tiered = Lidar2D(
+        state=state,
+        number=20,
+        angle_range=np.pi,
+        range_max=8.0,
+        cache_max_displacement=1.0,
+        cache_max_age_steps=10,
+        cache_split_static=True,
+    )
+    tiered.parent = _Parent(env_param)
+
+    combined.step(state)
+    tiered.step(state)
+
+    # The obstacle moves out of range; the stationary sensor's cache is still
+    # "fresh enough" by displacement/age, so the combined cache serves a
+    # stale (in-range) reading, while the tiered cache -- which never caches
+    # the dynamic tier -- correctly reports no hit.
+    moving._geometry = shapely.Point(100.0, 100.0).buffer(0.3)
+    combined.step(state)
+    tiered.step(state)
+
+    assert combined.range_data.min() < combined.range_max - 1e-6, (
+        "expected the combined cache to (incorrectly) still report the "
+        "obstacle's old position -- if this fails, the combined cache's "
+        "known staleness tradeoff no longer reproduces and this test's "
+        "premise should be revisited"
+    )
+    assert tiered.range_data.min() == pytest.approx(tiered.range_max, abs=1e-6)
 
 
 def test_lidar_reset_clears_skew_and_cache_state():

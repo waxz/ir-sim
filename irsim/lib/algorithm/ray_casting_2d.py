@@ -478,6 +478,77 @@ class SegmentCache:
         self._age = 0
 
 
+class TieredSegmentCache:
+    """Two-tier segment cache: static geometry cached, dynamic gathered fresh.
+
+    ``SegmentCache`` treats every detected object as one blob, so caching it
+    is only exact for a scene with no obstacles moving near the sensor --
+    otherwise a moving obstacle can go undetected until the cache refreshes.
+    This class removes that tradeoff for the common case (a mostly-static
+    map plus a handful of moving robots/obstacles) by splitting detected
+    objects into two tiers on every call, using each object's ``static``
+    attribute (see :class:`~irsim.world.object_base.ObjectBase`):
+
+    - **Static tier**: cached exactly like :class:`SegmentCache`, keyed on
+      the query origin's displacement. This introduces *no* extra staleness
+      risk versus a fresh gather: static geometry never changes, so the only
+      valid reason to re-gather it is that the sensor moved far enough for
+      different static objects to enter or leave detection range -- which is
+      exactly what the displacement check re-triggers on.
+    - **Dynamic tier**: gathered unconditionally on every call, so moving
+      objects are never stale.
+
+    An object with no ``static`` attribute, or a falsy one, is treated as
+    dynamic (gathered fresh) -- the conservative default when unsure.
+
+    See ``report/multi_stage_ray_casting.md`` for the measured speedup
+    (1.5-5.7x over a full re-gather, scaling with the static:dynamic object
+    ratio) and a from-scratch correctness comparison against a fresh gather.
+    """
+
+    def __init__(self, max_displacement: float, max_age_steps: int = 8) -> None:
+        self._static_cache = SegmentCache(max_displacement, max_age_steps)
+
+    def get(
+        self, lidar_geometry, detected_objects, origin: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return combined (cached static + fresh dynamic) segments."""
+        static_indices = []
+        dynamic_indices = []
+        for index, obj in enumerate(detected_objects):
+            if getattr(obj, "static", False):
+                static_indices.append(index)
+            else:
+                dynamic_indices.append(index)
+
+        static_start, static_end, static_owner_local = self._static_cache.get(
+            lidar_geometry,
+            [detected_objects[i] for i in static_indices],
+            origin,
+        )
+        dynamic_start, dynamic_end, dynamic_owner_local = _gather_obstacle_edges(
+            lidar_geometry,
+            [detected_objects[i] for i in dynamic_indices],
+        )
+
+        static_owner = np.asarray(static_indices, dtype=int)[static_owner_local]
+        dynamic_owner = np.asarray(dynamic_indices, dtype=int)[dynamic_owner_local]
+
+        if len(static_start) and len(dynamic_start):
+            return (
+                np.concatenate([static_start, dynamic_start]),
+                np.concatenate([static_end, dynamic_end]),
+                np.concatenate([static_owner, dynamic_owner]),
+            )
+        if len(static_start):
+            return static_start, static_end, static_owner
+        return dynamic_start, dynamic_end, dynamic_owner
+
+    def invalidate(self) -> None:
+        """Force the next :meth:`get` call to re-gather the static tier."""
+        self._static_cache.invalidate()
+
+
 def _ray_parameters(lidar_geometry, max_range: float) -> tuple[np.ndarray, np.ndarray]:
     """Extract the shared origin and unit directions from max-range beams."""
     coordinates = shapely.get_coordinates(lidar_geometry)

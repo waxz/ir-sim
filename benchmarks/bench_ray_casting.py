@@ -303,6 +303,132 @@ def bench_segment_cache_speedup(n_calls: int = 200) -> None:
     )
 
 
+def bench_multi_stage_comparison(n_steps: int = 150) -> None:
+    """Three-way comparison against a moving-obstacle scene: no cache
+    (baseline), the combined ``SegmentCache``, and the tiered
+    ``TieredSegmentCache`` (static geometry cached, dynamic gathered fresh
+    every step -- see ``report/multi_stage_ray_casting.md``).
+
+    The scene has a stationary sensor, many static wall/box obstacles, and a
+    few dynamic obstacles that actually move every step (unlike the
+    stationary-scene cache benchmark above), so this exercises the case the
+    combined cache is unsound for and the tiered cache is designed to fix.
+    Reports both timing and per-step correctness against an always-fresh
+    gather computed independently at each step.
+    """
+    import shapely
+
+    rng = np.random.default_rng(20260904)
+
+    class _Obj:
+        def __init__(self, geometry, static):
+            self._geometry = geometry
+            self.static = static
+            self.shape = "rectangle" if static else "circle"
+
+    n_static, n_dynamic = 400, 10
+    static_objs = [
+        _Obj(shapely.box(x, y, x + w, y + h), static=True)
+        for (x, y), (w, h) in zip(
+            rng.uniform(-25.0, 25.0, size=(n_static, 2)),
+            rng.uniform(0.3, 1.2, size=(n_static, 2)),
+            strict=True,
+        )
+    ]
+    dynamic_starts = rng.uniform(-10.0, 10.0, size=(n_dynamic, 2))
+    dynamic_velocities = rng.uniform(-0.3, 0.3, size=(n_dynamic, 2))
+
+    def dynamic_objs_at(step: int) -> list:
+        positions = dynamic_starts + step * dynamic_velocities
+        return [
+            _Obj(shapely.buffer(shapely.Point(x, y), 0.25), static=False)
+            for x, y in positions
+        ]
+
+    number = 361
+    max_range = 15.0
+    angles = np.linspace(-np.pi, np.pi, number)
+    origin = np.zeros(2)
+    endpoints = origin + max_range * np.column_stack((np.cos(angles), np.sin(angles)))
+    lidar_geometry = shapely.MultiLineString(
+        [shapely.LineString([origin, p]) for p in endpoints]
+    )
+
+    def all_objs_at(step: int) -> list:
+        return static_objs + dynamic_objs_at(step)
+
+    # Ground truth: an always-fresh gather at every step (no caching at all).
+    ground_truth = [
+        rc.cast_rays(lidar_geometry, all_objs_at(step), max_range)[0]
+        for step in range(n_steps)
+    ]
+
+    def run(cache_factory):
+        cache = cache_factory() if cache_factory is not None else None
+        for _ in range(3):
+            rc.cast_rays(lidar_geometry, all_objs_at(0), max_range, cache=cache)
+        if cache is not None:
+            cache.invalidate()
+        t0 = time.perf_counter()
+        max_deviation = 0.0
+        for step in range(n_steps):
+            ranges, *_ = rc.cast_rays(
+                lidar_geometry, all_objs_at(step), max_range, cache=cache
+            )
+            max_deviation = max(
+                max_deviation, float(np.max(np.abs(ranges - ground_truth[step])))
+            )
+        elapsed = (time.perf_counter() - t0) / n_steps
+        return elapsed, max_deviation
+
+    baseline_time, baseline_dev = run(None)
+    combined_time, combined_dev = run(
+        lambda: rc.SegmentCache(max_displacement=1.0, max_age_steps=10)
+    )
+    tiered_time, tiered_dev = run(
+        lambda: rc.TieredSegmentCache(max_displacement=1.0, max_age_steps=10)
+    )
+
+    print(
+        f"\n[INFO] multi-stage comparison ({n_static} static, {n_dynamic} "
+        f"dynamic-and-moving obstacles, {number} beams, {n_steps} steps):"
+    )
+    print(
+        f"  baseline (no cache):    {baseline_time * 1000:7.3f} ms/step, "
+        f"max deviation from ground truth = {baseline_dev:.3e} m"
+    )
+    print(
+        f"  combined SegmentCache:  {combined_time * 1000:7.3f} ms/step, "
+        f"max deviation from ground truth = {combined_dev:.3e} m, "
+        f"speedup = {baseline_time / combined_time:.2f}x"
+    )
+    print(
+        f"  TieredSegmentCache:     {tiered_time * 1000:7.3f} ms/step, "
+        f"max deviation from ground truth = {tiered_dev:.3e} m, "
+        f"speedup = {baseline_time / tiered_time:.2f}x"
+    )
+
+    _report(
+        "baseline matches ground truth (self-consistency)",
+        baseline_dev == 0.0,
+        f"max deviation = {baseline_dev:.3e} m",
+    )
+    _report(
+        "TieredSegmentCache matches ground truth in a moving-obstacle scene",
+        tiered_dev == 0.0,
+        f"max deviation = {tiered_dev:.3e} m (must be exactly 0: dynamic "
+        "objects are never cached)",
+    )
+    # This is a known, documented tradeoff, not a bug: report it, don't fail
+    # the job on it. It's exactly what motivates TieredSegmentCache.
+    if combined_dev > 0.0:
+        print(
+            f"[INFO] combined SegmentCache shows {combined_dev:.3e} m staleness "
+            "in this moving-obstacle scene, as documented -- this is the gap "
+            "TieredSegmentCache closes, not a regression."
+        )
+
+
 def check_thread_safety(n_threads: int = 4, calls_per_thread: int = 30) -> None:
     origin, directions, seg_start, seg_end, max_range = _make_scene()
 
@@ -411,6 +537,7 @@ def main() -> int:
     check_motion_skew_smoke()
     bench_kernel_speed()
     bench_segment_cache_speedup()
+    bench_multi_stage_comparison()
     check_thread_safety()
     if not args.skip_env_step:
         bench_env_step()
