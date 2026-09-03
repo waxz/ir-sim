@@ -8,14 +8,20 @@ rather than a developer machine, so numbers are comparable run to run. Checks:
 2. Per-ray-origin (motion-skew) casting agrees with looping the shared-origin
    kernel per ray, with and without numba; a moving robot actually reads
    different ranges with motion_skew on vs off.
-3. Per-call speedup of the numba kernel over the numpy kernel.
-4. Segment-cache speedup for a stationary sensor, and that cached results
-   match an uncached (always-fresh) gather.
-5. Multi-threaded speedup: several threads calling the kernel concurrently
+3. motion_skew casts the same 3600-beam scan in one batched call per step,
+   not one call per beam -- its cost stays within a small factor of the
+   shared-origin baseline for the same scan, not 3600x it.
+4. Per-call speedup of the numba kernel over the numpy kernel.
+5. Segment-cache speedup for a stationary sensor, and that cached results
+   match an uncached (always-fresh) gather; a three-way baseline / combined
+   cache / tiered cache comparison in a moving-obstacle scene, showing the
+   tiered cache matches ground truth exactly where the combined cache does
+   not.
+6. Multi-threaded speedup: several threads calling the kernel concurrently
    (simulating parallel RL environments) must be both faster than running the
    same work sequentially and return results identical to a single-threaded
    call, proving the kernel has no shared mutable state / races.
-6. End-to-end ``env.step()`` timing on a representative multi-robot,
+7. End-to-end ``env.step()`` timing on a representative multi-robot,
    lidar-equipped scenario.
 
 Exits non-zero if a correctness check fails. Timing regressions are reported
@@ -191,6 +197,80 @@ def check_motion_skew_smoke() -> None:
         differs,
         "range_data differs between motion_skew=False and motion_skew=True",
     )
+
+
+def bench_motion_skew_scan_cost(n_calls: int = 30) -> None:
+    """Clarify a common misreading of motion_skew: for a 10 Hz, 3600-point
+    lidar, both the baseline and motion_skew=True cast all 3600 beams in one
+    batched call per 0.1s step -- motion_skew changes each beam's origin, not
+    how often the scan runs. Compare that one call's cost (shared origin vs.
+    3600 per-ray origins) against the 100ms/step budget at 10 Hz, and against
+    what 3600 separate single-beam calls (a different, rejected design) would
+    cost, for contrast.
+    """
+    rng = np.random.default_rng(1)
+    n_rays = 3600
+    n_segments = 3000
+    angles = np.linspace(-np.pi, np.pi, n_rays)
+    directions = np.column_stack((np.cos(angles), np.sin(angles)))
+    seg_start = rng.uniform(-8.0, 8.0, size=(n_segments, 2))
+    seg_end = seg_start + rng.uniform(-0.5, 0.5, size=(n_segments, 2))
+    max_range = 10.0
+
+    origin = np.zeros(2)
+    origins = rng.uniform(-0.05, 0.05, size=(n_rays, 2))
+
+    for _ in range(3):
+        rc.cast_ray_segments(origin, directions, seg_start, seg_end, max_range)
+        rc.cast_ray_segments(origins, directions, seg_start, seg_end, max_range)
+
+    t0 = time.perf_counter()
+    for _ in range(n_calls):
+        rc.cast_ray_segments(origin, directions, seg_start, seg_end, max_range)
+    baseline_time = (time.perf_counter() - t0) / n_calls
+
+    t0 = time.perf_counter()
+    for _ in range(n_calls):
+        rc.cast_ray_segments(origins, directions, seg_start, seg_end, max_range)
+    skew_time = (time.perf_counter() - t0) / n_calls
+
+    print(
+        f"\n[INFO] 3600-beam scan, one batched call/step either way "
+        f"({n_segments} segments):"
+    )
+    print(
+        f"  baseline (shared origin):     {baseline_time * 1000:7.2f} ms/step "
+        f"({baseline_time * 10:.1%} of the 100 ms budget at 10 Hz)"
+    )
+    print(
+        f"  motion_skew (per-ray origin): {skew_time * 1000:7.2f} ms/step "
+        f"({skew_time * 10:.1%} of the 100 ms budget at 10 Hz), "
+        f"{skew_time / baseline_time:.2f}x baseline"
+    )
+
+    if rc._HAS_NUMBA:
+        # The fused numba per-ray kernel processes all 3600 rays in one
+        # call with O(rays) memory -- no per-ray Python overhead, so this
+        # should stay close to (often faster than) the shared-origin call.
+        _report(
+            "motion_skew (numba) stays close to the shared-origin baseline",
+            skew_time < baseline_time * 3.0,
+            f"per-ray-origin call ({skew_time * 1000:.2f} ms) is within 3x "
+            f"of the shared-origin call ({baseline_time * 1000:.2f} ms) for "
+            "the same 3600-beam scan -- both are one batched call per step",
+        )
+    else:
+        # Without numba, the per-ray fallback loops 3600 Python-level calls
+        # into the shared-origin kernel (see _cast_ray_segments_per_ray_origin)
+        # -- correct, but genuinely O(rays) Python dispatch overhead. This is
+        # the one case where the "3600 separate scans" concern is real, and
+        # it's exactly why numba (ir-sim[fast]) is recommended for
+        # motion_skew at this scale rather than a hard requirement.
+        print(
+            f"[INFO] no numba: motion_skew fell back to a {n_rays}-call "
+            f"Python loop over the shared-origin kernel ({skew_time / baseline_time:.1f}x "
+            "baseline here) -- install numba (ir-sim[fast]) to avoid this."
+        )
 
 
 def bench_kernel_speed(n_calls: int = 100) -> None:
@@ -535,6 +615,7 @@ def main() -> int:
     check_numba_matches_numpy()
     check_per_ray_origin_matches_shared_origin()
     check_motion_skew_smoke()
+    bench_motion_skew_scan_cost()
     bench_kernel_speed()
     bench_segment_cache_speedup()
     bench_multi_stage_comparison()

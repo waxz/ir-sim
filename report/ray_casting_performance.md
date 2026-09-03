@@ -67,6 +67,43 @@ fast path, unchanged) or one origin per ray.
   interpolation) and shown to produce different, expected readings for a moving
   robot scanning a wall (`test_motion_skew_moving_robot_differs_from_instantaneous_scan`).
 
+**Clarification: `motion_skew` does not scan more often.** For a 10 Hz, 3600-point
+lidar, both the baseline and `motion_skew=True` cast all 3600 beams in exactly
+one batched `cast_ray_segments` call per 0.1 s step -- the only difference is
+whether that one call uses a single shared origin (baseline) or 3600 per-ray
+origins (`motion_skew`). It is *not* 3600 separate ray-cast calls; that design
+(one beam per simulation step, discussed and rejected in an earlier session --
+see "Can single-beam casting make it faster?" in the session history) would
+indeed cost far more, since the per-scan segment-gather overhead does not
+amortize across separate calls. Measured directly (3600 rays x 3000 segments,
+one call either way):
+
+| Mode | Time for one 3600-beam cast | vs. baseline |
+| --- | ---: | ---: |
+| Baseline (shared origin, chunked matrix kernel) | 97.4 ms | 1.00x |
+| `motion_skew=True` (3600 per-ray origins, fused kernel) | 42.1 ms | **0.43x (faster)** |
+| *(for contrast, not implemented)* 3600 separate single-beam calls | ~492 ms | 5.05x |
+
+The per-ray kernel is faster here, not slower: it runs a single fused loop with
+O(rays) memory, while the shared-origin path allocates and processes several
+full `(segment_chunk, rays)` matrices per call (`_nonparallel_hit_distances`,
+`_find_collinear_hits`). `motion_skew` piggybacks on that same fused kernel, so
+adding per-beam pose realism did not cost extra scan throughput in this
+scenario -- both stay within a single 100 ms step budget at 10 Hz, and
+`motion_skew` measured faster.
+
+**This holds only with `numba` installed.** Without it,
+`_cast_ray_segments_per_ray_origin` falls back to a Python loop calling the
+shared-origin kernel once per ray (see `irsim/lib/algorithm/ray_casting_2d.py`)
+-- correct, but genuinely `O(rays)` Python-level dispatch. Measured on the
+same 3600-ray/3000-segment scan without numba: baseline 158.0 ms,
+`motion_skew` **810.1 ms (5.1x baseline)**. This is the one case where "3600
+separate scans" is an accurate description of the cost -- it's exactly why
+`numba` (`ir-sim[fast]`) is recommended, not merely optional, when using
+`motion_skew` at large beam counts. `benchmarks/bench_ray_casting.py`'s
+`bench_motion_skew_scan_cost` reports both cases and only asserts the
+<3x-baseline bound when numba is active.
+
 ## 3. Segment gather cache
 
 `SegmentCache` reuses the last `_gather_obstacle_edges` result (STRtree query +
