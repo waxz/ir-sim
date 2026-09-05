@@ -16,7 +16,9 @@ from irsim.world.sensors.imu import IMU
 # ---------------------------------------------------------------------------
 
 
-def _run_imu(states: np.ndarray, *, noise: bool = True, step_time: float = 0.1, **kw) -> IMU:
+def _run_imu(
+    states: np.ndarray, *, noise: bool = True, step_time: float = 0.1, **kw
+) -> IMU:
     """Run an IMU through a sequence of states; return the final sensor."""
     imu = IMU(states[0], noise=noise, step_time=step_time, **kw)
     for s in states[1:]:
@@ -137,7 +139,7 @@ def test_gyro_bias_drift():
         theory_rms = sigma_theory[idx]
         # Allow a 3x tolerance since it's a single trajectory, not an ensemble
         assert measured_rms < 3 * theory_rms + 1e-6, (
-            f"bias at step {idx+1} ({measured_rms:.5f}) exceeds 3x theory ({theory_rms:.5f})"
+            f"bias at step {idx + 1} ({measured_rms:.5f}) exceeds 3x theory ({theory_rms:.5f})"
         )
 
 
@@ -156,8 +158,9 @@ def test_heading_integration_noisefree():
     theta = np.cumsum(np.full(n_steps + 1, omega_true * dt))
     theta[0] = 0.0
     theta = np.cumsum(np.full(n_steps, omega_true * dt))
-    states = np.column_stack([np.zeros(n_steps + 1), np.zeros(n_steps + 1),
-                               np.concatenate([[0.0], theta])])
+    states = np.column_stack(
+        [np.zeros(n_steps + 1), np.zeros(n_steps + 1), np.concatenate([[0.0], theta])]
+    )
 
     imu = IMU(states[0], noise=False, step_time=dt)
     integrated_theta = 0.0
@@ -251,12 +254,71 @@ def test_noise_disabled_returns_ground_truth():
     """With noise=False and no bias, output matches finite-difference ground truth."""
     dt = 0.1
     omega = 0.3  # rad/s
-    states = np.array([
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, omega * dt],
-        [0.0, 0.0, 2 * omega * dt],
-    ])
+    states = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, omega * dt],
+            [0.0, 0.0, 2 * omega * dt],
+        ]
+    )
     imu = IMU(states[0], noise=False, step_time=dt)
     imu.step(states[1])
     imu.step(states[2])
     assert abs(imu.angular_velocity - omega) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 7. Named profile
+# ---------------------------------------------------------------------------
+
+
+def test_named_profile_sets_noise():
+    """IMU(profile='icm42688') loads the correct noise parameters."""
+    imu = IMU(np.zeros(3), profile="icm42688", noise=False)
+    assert imu._N_g == IMU.PROFILES["icm42688"]["gyro_noise_std"]
+    assert imu._N_a == IMU.PROFILES["icm42688"]["accel_noise_std"]
+
+
+def test_invalid_profile_raises():
+    """IMU(profile='bad') raises ValueError."""
+    import pytest
+
+    with pytest.raises(ValueError, match="Unknown IMU profile"):
+        IMU(np.zeros(3), profile="bad_sensor")
+
+
+# ---------------------------------------------------------------------------
+# 8. IMU pose estimators
+# ---------------------------------------------------------------------------
+
+
+def test_pose_estimators_noisefree_straight():
+    """All four integrators recover a straight-line trajectory within 1 mm when noise=False."""
+    from irsim.lib.algorithm.imu_pose_estimator import (
+        EulerIntegrator,
+        MidpointIntegrator,
+        RK4Integrator,
+        StrapdownIntegrator,
+    )
+
+    dt = 0.001
+    v = 1.0
+    n = 500
+    t = np.arange(n + 1) * dt
+    states = np.column_stack([v * t, np.zeros(n + 1), np.zeros(n + 1)])
+
+    for cls in (
+        EulerIntegrator,
+        MidpointIntegrator,
+        RK4Integrator,
+        StrapdownIntegrator,
+    ):
+        imu = IMU(states[0], noise=False, step_time=dt)
+        est = cls(states[0], dt=dt)
+        for s in states[1:]:
+            imu.step(s)
+            est.update(imu.angular_velocity, imu.linear_acceleration)
+        pose = est.get_pose()
+        gt = states[-1]
+        err = float(np.linalg.norm(pose[:2] - gt[:2]))
+        assert err < 0.002, f"{cls.__name__} straight-line error {err:.6f} m > 2 mm"

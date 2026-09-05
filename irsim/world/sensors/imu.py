@@ -7,7 +7,7 @@ on both gyroscope and accelerometer axes, consistent with the Moussaid-Helbing
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 
@@ -47,22 +47,81 @@ class IMU:
         parent (ObjectBase | None): Owning simulation object; set externally.
     """
 
+    # ── Named IMU profiles (noise spectral densities & bias walk rates) ──────
+    #
+    # All values in SI:  N_g  rad/s/√Hz,  N_a  m/s²/√Hz,
+    #                    K_g  rad/s/√s,   K_a  m/s²/√s
+    #
+    # Sources: product datasheets; µg converted via g=9.80665 m/s²
+    #
+    #  mpu6050     InvenSense MPU-6050  (budget mobile-robot/drone)
+    #              N_g = 0.005 °/s/√Hz  = 8.73e-5 rad/s/√Hz
+    #              N_a = 400 µg/√Hz     = 3.92e-3 m/s²/√Hz
+    #  bmi088      Bosch BMI-088  (Pixhawk, mid-range robots)
+    #              N_g = 0.014 °/s/√Hz  = 2.44e-4 rad/s/√Hz
+    #              N_a = 230 µg/√Hz     = 2.26e-3 m/s²/√Hz
+    #  icm42688    TDK ICM-42688-P  (high-performance mobile robots)
+    #              N_g = 0.0028 °/s/√Hz = 4.89e-5 rad/s/√Hz
+    #              N_a = 70 µg/√Hz      = 6.87e-4 m/s²/√Hz
+    #  adis16448   Analog Devices ADIS-16448  (navigation grade)
+    #              N_g = 0.066 °/s/√Hz  = 1.15e-3 rad/s/√Hz
+    #              N_a = 0.158 mg/√Hz   = 1.55e-3 m/s²/√Hz
+    PROFILES: ClassVar[dict[str, dict[str, float]]] = {
+        "mpu6050": {
+            "gyro_noise_std": 8.73e-5,
+            "accel_noise_std": 3.92e-3,
+            "gyro_bias_walk_std": 1.75e-4,
+            "accel_bias_walk_std": 1.96e-4,
+        },
+        "bmi088": {
+            "gyro_noise_std": 2.44e-4,
+            "accel_noise_std": 2.26e-3,
+            "gyro_bias_walk_std": 3.49e-5,
+            "accel_bias_walk_std": 1.96e-4,
+        },
+        "icm42688": {
+            "gyro_noise_std": 4.89e-5,
+            "accel_noise_std": 6.87e-4,
+            "gyro_bias_walk_std": 8.73e-6,
+            "accel_bias_walk_std": 9.81e-5,
+        },
+        "adis16448": {
+            "gyro_noise_std": 1.15e-3,
+            "accel_noise_std": 1.55e-3,
+            "gyro_bias_walk_std": 2.91e-5,
+            "accel_bias_walk_std": 9.81e-5,
+        },
+    }
+
     def __init__(
         self,
         state: np.ndarray | None = None,
         obj_id: int = 0,
-        gyro_noise_std: float = 0.005,
-        accel_noise_std: float = 0.05,
-        gyro_bias_walk_std: float = 0.0001,
-        accel_bias_walk_std: float = 0.001,
-        step_time: float = 0.1,
+        gyro_noise_std: float = 8.73e-5,
+        accel_noise_std: float = 3.92e-3,
+        gyro_bias_walk_std: float = 1.75e-4,
+        accel_bias_walk_std: float = 1.96e-4,
+        step_time: float = 0.001,
         noise: bool = True,
+        profile: str | None = None,
         **kwargs,
     ) -> None:
         self.sensor_type = "imu"
         self.obj_id = obj_id
         self.noise = noise
         self.step_time = step_time
+
+        # Apply named profile if given (overrides explicit params)
+        if profile is not None:
+            if profile not in self.PROFILES:
+                raise ValueError(
+                    f"Unknown IMU profile '{profile}'. Available: {list(self.PROFILES)}"
+                )
+            p = self.PROFILES[profile]
+            gyro_noise_std = p["gyro_noise_std"]
+            accel_noise_std = p["accel_noise_std"]
+            gyro_bias_walk_std = p["gyro_bias_walk_std"]
+            accel_bias_walk_std = p["accel_bias_walk_std"]
 
         # Noise spectral densities
         self._N_g = gyro_noise_std
@@ -130,8 +189,8 @@ class IMU:
             # --- Add white noise ---
             sigma_g = self._N_g / np.sqrt(dt)
             sigma_a = self._N_a / np.sqrt(dt)
-            omega_meas = omega_true + self.gyro_bias + sigma_g * float(
-                rng.standard_normal()
+            omega_meas = (
+                omega_true + self.gyro_bias + sigma_g * float(rng.standard_normal())
             )
             accel_meas = accel_body + self.accel_bias + sigma_a * rng.standard_normal(2)
         else:
