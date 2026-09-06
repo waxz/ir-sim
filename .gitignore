@@ -175,3 +175,4 @@ docs/locale/zh_CN/LC_MESSAGES/api/
 
 # generated simulation output
 /sim_data.json
+usage/26wheel_fk_correctness/animations/

@@ -10,15 +10,19 @@ encoder tick differences  (omega_est = delta_ticks * 2pi/CPR / dt), then
 propagated through the FK formula and integrated.
 
 Sources of FK error (both present in a real system):
-  1. Encoder quantisation  -- omega_est has ±1-tick uncertainty per step.
+  1. Encoder quantisation  -- omega_est has +-1-tick uncertainty per step.
   2. Hold-constant approximation -- omega is sampled once per dt interval;
      any intra-interval change creates a small prediction error.
-  3. Servo phase lag (swerve models only) -- the actual steer angle lags the
-     commanded angle, so FK reconstructs a different heading than commanded.
+  3. DC motor lag -- tau=100ms motor does not track step changes instantly.
+  4. Servo phase lag (steer models) -- actual steer angle lags commanded angle.
 
 Command tracking error (separate metric): distance between the commanded
 trajectory (GT) and the "true physical" trajectory integrated from omega_actual,
-showing servo lag in isolation for the swerve models.
+showing combined motor + servo lag.
+
+Dual Steer / Quad Steer simplified mode: all wheels receive the same forward
+speed v and steer angle psi (no holonomic swerve), so the robot behaves like
+a single-steering-wheel vehicle. This makes servo lag clearly visible.
 
 Usage::
 
@@ -42,6 +46,7 @@ from irsim.lib.algorithm.kinematics import (
 from irsim.lib.algorithm.wheel_kinematics import diff_fwd_kin, mecanum_fwd_kin
 from irsim.lib.handler.wheel_handler import (
     AckerWheelLayout,
+    DCMotorParams,
     DiffWheelLayout,
     DualSteerWheelLayout,
     ForkiftWheelLayout,
@@ -57,6 +62,10 @@ N_STEPS_STEER = int(T_STEER / DT)
 
 RAD_PER_TICK_1024 = 2.0 * math.pi / 1024  # diff / mecanum
 RAD_PER_TICK_512 = 2.0 * math.pi / 512  # acker / forklift / swerve
+
+# DC motor with tau=100ms -- visible tracking lag at T=10s trajectories.
+# tau = J / (K_motor + K_back) = 0.1 / 1.0 = 0.1 s
+SLOW_MOTOR = DCMotorParams(J=0.1, K_motor=0.5, K_back=0.5, omega_max=30.0)
 
 
 def make_vel(*vals: float) -> np.ndarray:
@@ -89,7 +98,9 @@ def run_diff() -> dict:
     V_MAX, OM_MAX = 0.5, 0.5
     RAD_PER_TICK = RAD_PER_TICK_1024
 
-    layout = DiffWheelLayout(wheel_radius=R, track=TRACK, encoder_cpr=1024)
+    layout = DiffWheelLayout(
+        wheel_radius=R, track=TRACK, motor=SLOW_MOTOR, encoder_cpr=1024
+    )
     gt_state = np.zeros((3, 1))  # commanded trajectory
     fk_state = np.zeros((3, 1))  # FK from quantised encoder
     act_state = np.zeros((3, 1))  # true physical trajectory (from omega_actual)
@@ -174,7 +185,11 @@ def run_mecanum() -> dict:
     RAD_PER_TICK = RAD_PER_TICK_1024
 
     layout = MecanumWheelLayout(
-        wheel_radius=R, half_length=HL, half_width=HW, encoder_cpr=1024
+        wheel_radius=R,
+        half_length=HL,
+        half_width=HW,
+        motor=SLOW_MOTOR,
+        encoder_cpr=1024,
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))
@@ -267,7 +282,7 @@ def run_acker() -> dict:
     RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = AckerWheelLayout(
-        wheel_radius=R, wheelbase=WB, track=TRACK, encoder_cpr=512
+        wheel_radius=R, wheelbase=WB, track=TRACK, motor=SLOW_MOTOR, encoder_cpr=512
     )
     gt_state = np.zeros((4, 1))
     fk_state = np.zeros((4, 1))
@@ -370,7 +385,11 @@ def run_forklift() -> dict:
     RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = ForkiftWheelLayout(
-        wheel_radius=R, half_wheelbase=HWB, track=TRACK, encoder_cpr=512
+        wheel_radius=R,
+        half_wheelbase=HWB,
+        track=TRACK,
+        motor=SLOW_MOTOR,
+        encoder_cpr=512,
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))
@@ -448,12 +467,20 @@ def run_forklift() -> dict:
 
 
 def run_dual_steer() -> dict:
+    """Simplified: both FC and RC wheels share the same delta=psi and omega=v/R.
+
+    Sending [vx=v*cos(psi), vy=v*sin(psi), omz=0] to the layout makes both
+    wheels receive identical commands via swerve IK -- equivalent to a single
+    steering wheel pointing in direction psi.  Servo lag is clearly visible.
+    """
     T, N = T_STEER, N_STEPS_STEER
     R, HWB = 0.10, 0.4
-    VX_CONST, OMZ_MAX = 0.50, 0.45
+    V_MAX, PSI_MAX = 0.50, 0.60
     RAD_PER_TICK = RAD_PER_TICK_512
 
-    layout = DualSteerWheelLayout(wheel_radius=R, half_wheelbase=HWB, encoder_cpr=512)
+    layout = DualSteerWheelLayout(
+        wheel_radius=R, half_wheelbase=HWB, motor=SLOW_MOTOR, encoder_cpr=512
+    )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))
     act_state = np.zeros((3, 1))
@@ -468,55 +495,49 @@ def run_dual_steer() -> dict:
 
     for i in range(N):
         t = i * DT
-        vx = VX_CONST
-        omz = OMZ_MAX * wave(t, T)
-        vel = make_vel(vx, 0.0, omz)
+        v_cmd = V_MAX * bell(t, T)
+        psi_cmd = PSI_MAX * wave(t, T)
 
-        layout.step(vel, DT)
+        # Both wheels: same delta=psi_cmd, same omega=v_cmd/R
+        vx_eff = v_cmd * math.cos(psi_cmd)
+        vy_eff = v_cmd * math.sin(psi_cmd)
+        vel_eff = make_vel(vx_eff, vy_eff, 0.0)
+
+        layout.step(vel_eff, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
-
-        delta_FC_cmd = float(np.arctan2(omz * HWB, vx))
-        delta_RC_cmd = float(np.arctan2(-omz * HWB, vx))
 
         for nm in ["FC", "RC"]:
             wheel_omega[nm].append(ws[nm].omega_actual)
             wheel_enc[nm].append(enc[nm]["theta_enc"])
             wheel_delta[nm].append(ws[nm].delta_actual)
-        wheel_delta_cmd["FC"].append(delta_FC_cmd)
-        wheel_delta_cmd["RC"].append(delta_RC_cmd)
+            wheel_delta_cmd[nm].append(psi_cmd)
         times.append(t)
-        cmds.append([vx, omz])
+        cmds.append([v_cmd, psi_cmd])
 
-        gt_state = omni_angular_kinematics(gt_state, vel, DT)
+        # GT: commanded pointing motion (v in direction psi_cmd)
+        gt_vel = make_vel(vx_eff, vy_eff, 0.0)
+        gt_state = omni_angular_kinematics(gt_state, gt_vel, DT)
         gt_traj.append(gt_state.flatten().tolist())
 
-        # FK from ticks + actual delta (servo position encoder assumed ideal)
-        fc, rc_w = ws["FC"], ws["RC"]
+        # FK: avg omega from ticks, steer angle from delta_actual of FC
         om_fc = omega_from_ticks(enc["FC"]["ticks"], prev_ticks["FC"], RAD_PER_TICK)
         om_rc = omega_from_ticks(enc["RC"]["ticks"], prev_ticks["RC"], RAD_PER_TICK)
-        vwx_FC = om_fc * R * math.cos(fc.delta_actual)
-        vwy_FC = om_fc * R * math.sin(fc.delta_actual)
-        vwx_RC = om_rc * R * math.cos(rc_w.delta_actual)
-        vwy_RC = om_rc * R * math.sin(rc_w.delta_actual)
-        vx_fk = (vwx_FC + vwx_RC) / 2.0
-        vy_fk = (vwy_FC + vwy_RC) / 2.0
-        omz_fk = (vwy_FC - vwy_RC) / (2.0 * HWB)
-        fk_state = omni_angular_kinematics(fk_state, make_vel(vx_fk, vy_fk, omz_fk), DT)
+        v_fk = (om_fc + om_rc) / 2.0 * R
+        psi_fk = ws["FC"].delta_actual
+        fk_state = omni_angular_kinematics(
+            fk_state,
+            make_vel(v_fk * math.cos(psi_fk), v_fk * math.sin(psi_fk), 0.0),
+            DT,
+        )
         fk_traj.append(fk_state.flatten().tolist())
 
-        # True physical trajectory (omega_actual, delta_actual, no quantisation)
-        vwx_FC_a = fc.omega_actual * R * math.cos(fc.delta_actual)
-        vwy_FC_a = fc.omega_actual * R * math.sin(fc.delta_actual)
-        vwx_RC_a = rc_w.omega_actual * R * math.cos(rc_w.delta_actual)
-        vwy_RC_a = rc_w.omega_actual * R * math.sin(rc_w.delta_actual)
+        # Actual: same formula but from omega_actual (no quantisation)
+        v_act = (ws["FC"].omega_actual + ws["RC"].omega_actual) / 2.0 * R
+        psi_act = ws["FC"].delta_actual
         act_state = omni_angular_kinematics(
             act_state,
-            make_vel(
-                (vwx_FC_a + vwx_RC_a) / 2.0,
-                (vwy_FC_a + vwy_RC_a) / 2.0,
-                (vwy_FC_a - vwy_RC_a) / (2.0 * HWB),
-            ),
+            make_vel(v_act * math.cos(psi_act), v_act * math.sin(psi_act), 0.0),
             DT,
         )
 
@@ -536,7 +557,7 @@ def run_dual_steer() -> dict:
         "name": "Dual Steer",
         "times": times,
         "cmds": cmds,
-        "cmd_labels": ["vx (m/s)", "omega_z (rad/s)"],
+        "cmd_labels": ["v (m/s)", "psi (rad)"],
         "gt_traj": gt_traj,
         "enc_traj": fk_traj,
         "fk_error": fk_error,
@@ -554,16 +575,16 @@ def run_dual_steer() -> dict:
 
 
 def run_quad_steer() -> dict:
+    """Simplified: all 4 wheels share the same delta=psi and omega=v/R."""
     T, N = T_STEER, N_STEPS_STEER
     R, HL, HW = 0.05, 0.15, 0.15
-    VX_CONST, VY_MAX, OMZ_MAX = 0.20, 0.10, 0.20
+    V_MAX, PSI_MAX = 0.50, 0.60
     RAD_PER_TICK = RAD_PER_TICK_512
 
-    positions = np.array([[HL, HW], [HL, -HW], [-HL, HW], [-HL, -HW]])
     names = ["FL", "FR", "RL", "RR"]
 
     layout = QuadSteerWheelLayout(
-        wheel_radius=R, half_length=HL, half_width=HW, encoder_cpr=512
+        wheel_radius=R, half_length=HL, half_width=HW, motor=SLOW_MOTOR, encoder_cpr=512
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))
@@ -577,63 +598,50 @@ def run_quad_steer() -> dict:
     wheel_delta_cmd: dict[str, list] = {n: [] for n in names}
     prev_ticks: dict[str, int] = dict.fromkeys(names, 0)
 
-    # Swerve FK matrix A (8x3)
-    A = np.zeros((8, 3))
-    for k, (wx, wy) in enumerate(positions):
-        A[2 * k] = [1.0, 0.0, -wy]
-        A[2 * k + 1] = [0.0, 1.0, wx]
-
     for i in range(N):
         t = i * DT
-        vx = VX_CONST
-        vy = VY_MAX * wave(t, T)
-        omz = OMZ_MAX * wave(t, T)
-        vel = make_vel(vx, vy, omz)
-
-        layout.step(vel, DT)
+        v_cmd = V_MAX * bell(t, T)
+        psi_cmd = PSI_MAX * wave(t, T)
+        # All wheels: same delta=psi_cmd, same omega=v_cmd/R
+        vx_eff = v_cmd * math.cos(psi_cmd)
+        vy_eff = v_cmd * math.sin(psi_cmd)
+        vel_eff = make_vel(vx_eff, vy_eff, 0.0)
+        layout.step(vel_eff, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
 
-        for k, nm in enumerate(names):
-            wx, wy = positions[k]
-            vwx_cmd = vx - omz * wy
-            vwy_cmd = vy + omz * wx
-            delta_cmd = (
-                float(np.arctan2(vwy_cmd, vwx_cmd))
-                if abs(vwx_cmd) + abs(vwy_cmd) > 1e-9
-                else 0.0
-            )
+        for nm in names:
             wheel_omega[nm].append(ws[nm].omega_actual)
             wheel_enc[nm].append(enc[nm]["theta_enc"])
             wheel_delta[nm].append(ws[nm].delta_actual)
-            wheel_delta_cmd[nm].append(delta_cmd)
+            wheel_delta_cmd[nm].append(psi_cmd)
         times.append(t)
-        cmds.append([vx, vy, omz])
+        cmds.append([v_cmd, psi_cmd])
 
-        gt_state = omni_angular_kinematics(gt_state, vel, DT)
+        # GT: commanded pointing motion
+        gt_state = omni_angular_kinematics(gt_state, vel_eff, DT)
         gt_traj.append(gt_state.flatten().tolist())
 
-        # FK from ticks: least-squares swerve reconstruction
-        b = np.empty(8)
-        b_act = np.empty(8)
-        for k, nm in enumerate(names):
-            om_enc = omega_from_ticks(enc[nm]["ticks"], prev_ticks[nm], RAD_PER_TICK)
-            d = ws[nm].delta_actual
-            b[2 * k] = om_enc * R * math.cos(d)
-            b[2 * k + 1] = om_enc * R * math.sin(d)
-            b_act[2 * k] = ws[nm].omega_actual * R * math.cos(d)
-            b_act[2 * k + 1] = ws[nm].omega_actual * R * math.sin(d)
-
-        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        # FK: average omega from ticks across all 4 wheels, steer angle from delta_actual of FL
+        om_sum = sum(
+            omega_from_ticks(enc[nm]["ticks"], prev_ticks[nm], RAD_PER_TICK)
+            for nm in names
+        )
+        v_fk = om_sum / len(names) * R
+        psi_fk = ws["FL"].delta_actual
         fk_state = omni_angular_kinematics(
-            fk_state, make_vel(float(sol[0]), float(sol[1]), float(sol[2])), DT
+            fk_state,
+            make_vel(v_fk * math.cos(psi_fk), v_fk * math.sin(psi_fk), 0.0),
+            DT,
         )
         fk_traj.append(fk_state.flatten().tolist())
 
-        sol_act, _, _, _ = np.linalg.lstsq(A, b_act, rcond=None)
+        # Actual: same formula but from omega_actual (no quantisation)
+        v_act = sum(ws[nm].omega_actual for nm in names) / len(names) * R
+        psi_act = ws["FL"].delta_actual
         act_state = omni_angular_kinematics(
             act_state,
-            make_vel(float(sol_act[0]), float(sol_act[1]), float(sol_act[2])),
+            make_vel(v_act * math.cos(psi_act), v_act * math.sin(psi_act), 0.0),
             DT,
         )
 
@@ -650,10 +658,10 @@ def run_quad_steer() -> dict:
             prev_ticks[nm] = enc[nm]["ticks"]
 
     return {
-        "name": "Quad Steer (Swerve)",
+        "name": "Quad Steer",
         "times": times,
         "cmds": cmds,
-        "cmd_labels": ["vx (m/s)", "vy (m/s)", "omega_z (rad/s)"],
+        "cmd_labels": ["v (m/s)", "psi (rad)"],
         "gt_traj": gt_traj,
         "enc_traj": fk_traj,
         "fk_error": fk_error,
