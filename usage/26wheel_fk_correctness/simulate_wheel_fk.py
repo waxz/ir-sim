@@ -2,18 +2,23 @@
 
 Design
 ------
-Ground Truth (GT) = actual trajectory: integrate body velocity reconstructed by FK
-from the ACTUAL wheel states (omega_actual, delta_actual). FK is the inverse of IK
-applied to what the actuators physically achieve.
+Ground Truth (GT) = commanded trajectory: integrate the body velocity that was
+commanded at each step, representing the ideal reference motion.
 
-FK Reconstructed trajectory is identical to GT when there is no encoder noise,
-so FK error = 0 by construction — this proves the FK formula is algebraically correct.
+FK Reconstructed trajectory: estimated body velocity derived from quantised
+encoder tick differences  (omega_est = delta_ticks * 2pi/CPR / dt), then
+propagated through the FK formula and integrated.
 
-Servo tracking quality is shown separately as "command tracking error":
-distance between the commanded trajectory (integrate commanded vel) and the
-actual trajectory (GT). For drive-only DC-motor wheels this is also ~0
-(motor time constants << DT). For servo-steered wheels the command tracking
-error reflects phase lag during transients.
+Sources of FK error (both present in a real system):
+  1. Encoder quantisation  -- omega_est has ±1-tick uncertainty per step.
+  2. Hold-constant approximation -- omega is sampled once per dt interval;
+     any intra-interval change creates a small prediction error.
+  3. Servo phase lag (swerve models only) -- the actual steer angle lags the
+     commanded angle, so FK reconstructs a different heading than commanded.
+
+Command tracking error (separate metric): distance between the commanded
+trajectory (GT) and the "true physical" trajectory integrated from omega_actual,
+showing servo lag in isolation for the swerve models.
 
 Usage::
 
@@ -50,13 +55,16 @@ T_STEER = 40.0  # period (s) for steered models >> servo settling time (0.4-1.5 
 N_STEPS_DRIVE = int(T_DRIVE / DT)
 N_STEPS_STEER = int(T_STEER / DT)
 
+RAD_PER_TICK_1024 = 2.0 * math.pi / 1024  # diff / mecanum
+RAD_PER_TICK_512 = 2.0 * math.pi / 512  # acker / forklift / swerve
+
 
 def make_vel(*vals: float) -> np.ndarray:
     return np.array(vals, dtype=float).reshape(-1, 1)
 
 
 def bell(t: float, T: float) -> float:
-    """Smooth positive hump: 0 → 1 → 0 over period T (half-sine)."""
+    """Smooth positive hump: 0 to 1 to 0 over period T (half-sine)."""
     return math.sin(math.pi * t / T)
 
 
@@ -65,48 +73,79 @@ def wave(t: float, T: float) -> float:
     return math.sin(2.0 * math.pi * t / T)
 
 
+def omega_from_ticks(ticks_now: int, ticks_prev: int, rad_per_tick: float) -> float:
+    """Estimate omega from integer encoder tick difference over DT."""
+    return (ticks_now - ticks_prev) * rad_per_tick / DT
+
+
+# ---------------------------------------------------------------------------
+# Differential Drive
+# ---------------------------------------------------------------------------
+
+
 def run_diff() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, TRACK = 0.033, 0.16
     V_MAX, OM_MAX = 0.5, 0.5
+    RAD_PER_TICK = RAD_PER_TICK_1024
 
     layout = DiffWheelLayout(wheel_radius=R, track=TRACK, encoder_cpr=1024)
-    gt_state = np.zeros((3, 1))
-    cmd_state = np.zeros((3, 1))
+    gt_state = np.zeros((3, 1))  # commanded trajectory
+    fk_state = np.zeros((3, 1))  # FK from quantised encoder
+    act_state = np.zeros((3, 1))  # true physical trajectory (from omega_actual)
     gt_traj = [gt_state.flatten().tolist()]
-    cmd_traj = [cmd_state.flatten().tolist()]
+    fk_traj = [fk_state.flatten().tolist()]
     times, cmds, fk_error, cmd_error = [], [], [], []
     wheel_omega: dict[str, list] = {"left": [], "right": []}
     wheel_enc: dict[str, list] = {"left": [], "right": []}
+    prev_ticks: dict[str, int] = {"left": 0, "right": 0}
 
     for i in range(N):
         t = i * DT
         v_cmd = V_MAX * bell(t, T)
         om_cmd = OM_MAX * wave(t, T)
         vel = make_vel(v_cmd, om_cmd)
+
         layout.step(vel, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
-        wheel_omega["left"].append(ws["left"].omega_actual)
-        wheel_omega["right"].append(ws["right"].omega_actual)
-        wheel_enc["left"].append(enc["left"]["theta_enc"])
-        wheel_enc["right"].append(enc["right"]["theta_enc"])
+
+        for nm in ["left", "right"]:
+            wheel_omega[nm].append(ws[nm].omega_actual)
+            wheel_enc[nm].append(enc[nm]["theta_enc"])
         times.append(t)
         cmds.append([v_cmd, om_cmd])
 
-        v_fk, om_fk = diff_fwd_kin(
+        # GT: commanded trajectory
+        gt_state = differential_kinematics(gt_state, vel, DT)
+        gt_traj.append(gt_state.flatten().tolist())
+
+        # FK from quantised encoder ticks
+        om_l = omega_from_ticks(enc["left"]["ticks"], prev_ticks["left"], RAD_PER_TICK)
+        om_r = omega_from_ticks(
+            enc["right"]["ticks"], prev_ticks["right"], RAD_PER_TICK
+        )
+        v_fk, omz_fk = diff_fwd_kin(om_l, om_r, R, TRACK)
+        fk_state = differential_kinematics(fk_state, make_vel(v_fk, omz_fk), DT)
+        fk_traj.append(fk_state.flatten().tolist())
+
+        # True physical trajectory (omega_actual, no quantisation)
+        v_act, omz_act = diff_fwd_kin(
             ws["left"].omega_actual, ws["right"].omega_actual, R, TRACK
         )
-        gt_state = differential_kinematics(gt_state, make_vel(v_fk, om_fk), DT)
-        gt_traj.append(gt_state.flatten().tolist())
-        cmd_state = differential_kinematics(cmd_state, vel, DT)
-        cmd_traj.append(cmd_state.flatten().tolist())
-        fk_error.append(0.0)
+        act_state = differential_kinematics(act_state, make_vel(v_act, omz_act), DT)
+
+        fk_error.append(
+            math.hypot(fk_state[0, 0] - gt_state[0, 0], fk_state[1, 0] - gt_state[1, 0])
+        )
         cmd_error.append(
             math.hypot(
-                gt_state[0, 0] - cmd_state[0, 0], gt_state[1, 0] - cmd_state[1, 0]
+                act_state[0, 0] - gt_state[0, 0], act_state[1, 0] - gt_state[1, 0]
             )
         )
+
+        prev_ticks["left"] = enc["left"]["ticks"]
+        prev_ticks["right"] = enc["right"]["ticks"]
 
     return {
         "name": "Differential Drive",
@@ -114,7 +153,7 @@ def run_diff() -> dict:
         "cmds": cmds,
         "cmd_labels": ["v (m/s)", "omega (rad/s)"],
         "gt_traj": gt_traj,
-        "cmd_traj": cmd_traj,
+        "enc_traj": fk_traj,
         "fk_error": fk_error,
         "cmd_error": cmd_error,
         "wheel_omega": wheel_omega,
@@ -123,21 +162,30 @@ def run_diff() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Mecanum Drive
+# ---------------------------------------------------------------------------
+
+
 def run_mecanum() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, HL, HW = 0.05, 0.15, 0.15
     VX_MAX, VY_MAX, OMZ_MAX = 0.20, 0.08, 0.18
+    RAD_PER_TICK = RAD_PER_TICK_1024
 
     layout = MecanumWheelLayout(
         wheel_radius=R, half_length=HL, half_width=HW, encoder_cpr=1024
     )
     gt_state = np.zeros((3, 1))
-    cmd_state = np.zeros((3, 1))
+    fk_state = np.zeros((3, 1))
+    act_state = np.zeros((3, 1))
     gt_traj = [gt_state.flatten().tolist()]
-    cmd_traj = [cmd_state.flatten().tolist()]
+    fk_traj = [fk_state.flatten().tolist()]
     times, cmds, fk_error, cmd_error = [], [], [], []
-    wheel_omega: dict[str, list] = {n: [] for n in ["FL", "FR", "RL", "RR"]}
-    wheel_enc: dict[str, list] = {n: [] for n in ["FL", "FR", "RL", "RR"]}
+    names4 = ["FL", "FR", "RL", "RR"]
+    wheel_omega: dict[str, list] = {n: [] for n in names4}
+    wheel_enc: dict[str, list] = {n: [] for n in names4}
+    prev_ticks: dict[str, int] = dict.fromkeys(names4, 0)
 
     for i in range(N):
         t = i * DT
@@ -145,16 +193,31 @@ def run_mecanum() -> dict:
         vy = VY_MAX * wave(t, T)
         omz = OMZ_MAX * wave(t, T)
         vel = make_vel(vx, vy, omz)
+
         layout.step(vel, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
-        for nm in ["FL", "FR", "RL", "RR"]:
+
+        for nm in names4:
             wheel_omega[nm].append(ws[nm].omega_actual)
             wheel_enc[nm].append(enc[nm]["theta_enc"])
         times.append(t)
         cmds.append([vx, vy, omz])
 
+        gt_state = omni_angular_kinematics(gt_state, vel, DT)
+        gt_traj.append(gt_state.flatten().tolist())
+
+        om = {
+            nm: omega_from_ticks(enc[nm]["ticks"], prev_ticks[nm], RAD_PER_TICK)
+            for nm in names4
+        }
         vx_fk, vy_fk, omz_fk = mecanum_fwd_kin(
+            om["FL"], om["FR"], om["RL"], om["RR"], R, HL, HW
+        )
+        fk_state = omni_angular_kinematics(fk_state, make_vel(vx_fk, vy_fk, omz_fk), DT)
+        fk_traj.append(fk_state.flatten().tolist())
+
+        vx_a, vy_a, omz_a = mecanum_fwd_kin(
             ws["FL"].omega_actual,
             ws["FR"].omega_actual,
             ws["RL"].omega_actual,
@@ -163,16 +226,19 @@ def run_mecanum() -> dict:
             HL,
             HW,
         )
-        gt_state = omni_angular_kinematics(gt_state, make_vel(vx_fk, vy_fk, omz_fk), DT)
-        gt_traj.append(gt_state.flatten().tolist())
-        cmd_state = omni_angular_kinematics(cmd_state, vel, DT)
-        cmd_traj.append(cmd_state.flatten().tolist())
-        fk_error.append(0.0)
+        act_state = omni_angular_kinematics(act_state, make_vel(vx_a, vy_a, omz_a), DT)
+
+        fk_error.append(
+            math.hypot(fk_state[0, 0] - gt_state[0, 0], fk_state[1, 0] - gt_state[1, 0])
+        )
         cmd_error.append(
             math.hypot(
-                gt_state[0, 0] - cmd_state[0, 0], gt_state[1, 0] - cmd_state[1, 0]
+                act_state[0, 0] - gt_state[0, 0], act_state[1, 0] - gt_state[1, 0]
             )
         )
+
+        for nm in names4:
+            prev_ticks[nm] = enc[nm]["ticks"]
 
     return {
         "name": "Mecanum Drive",
@@ -180,7 +246,7 @@ def run_mecanum() -> dict:
         "cmds": cmds,
         "cmd_labels": ["vx (m/s)", "vy (m/s)", "omega_z (rad/s)"],
         "gt_traj": gt_traj,
-        "cmd_traj": cmd_traj,
+        "enc_traj": fk_traj,
         "fk_error": fk_error,
         "cmd_error": cmd_error,
         "wheel_omega": wheel_omega,
@@ -189,31 +255,41 @@ def run_mecanum() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Ackermann (Car-like)
+# ---------------------------------------------------------------------------
+
+
 def run_acker() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, WB, TRACK = 0.15, 1.0, 0.5
     V_MAX, PSI_MAX = 1.0, 0.30
+    RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = AckerWheelLayout(
         wheel_radius=R, wheelbase=WB, track=TRACK, encoder_cpr=512
     )
     gt_state = np.zeros((4, 1))
-    cmd_state = np.zeros((4, 1))
+    fk_state = np.zeros((4, 1))
+    act_state = np.zeros((4, 1))
     gt_traj = [gt_state[:3].flatten().tolist()]
-    cmd_traj = [cmd_state[:3].flatten().tolist()]
+    fk_traj = [fk_state[:3].flatten().tolist()]
     times, cmds, fk_error, cmd_error = [], [], [], []
     wheel_omega: dict[str, list] = {"RL": [], "RR": []}
     wheel_enc: dict[str, list] = {"RL": [], "RR": []}
     wheel_delta: dict[str, list] = {"FL": [], "FR": []}
+    prev_ticks: dict[str, int] = {"RL": 0, "RR": 0}
 
     for i in range(N):
         t = i * DT
         v_cmd = V_MAX * bell(t, T)
         psi_cmd = PSI_MAX * wave(t, T)
         vel = make_vel(v_cmd, psi_cmd)
+
         layout.step(vel, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
+
         wheel_omega["RL"].append(ws["RL"].omega_actual)
         wheel_omega["RR"].append(ws["RR"].omega_actual)
         wheel_enc["RL"].append(enc["RL"]["theta_enc"])
@@ -223,28 +299,49 @@ def run_acker() -> dict:
         times.append(t)
         cmds.append([v_cmd, psi_cmd])
 
-        v_fk = R * (ws["RL"].omega_actual + ws["RR"].omega_actual) / 2.0
-        diff_spd = ws["RR"].omega_actual - ws["RL"].omega_actual
+        gt_state = ackermann_kinematics(gt_state, vel, DT)
+        gt_traj.append(gt_state[:3].flatten().tolist())
+
+        # FK from ticks: v from avg rear speed, psi from speed ratio
+        om_rl = omega_from_ticks(enc["RL"]["ticks"], prev_ticks["RL"], RAD_PER_TICK)
+        om_rr = omega_from_ticks(enc["RR"]["ticks"], prev_ticks["RR"], RAD_PER_TICK)
+        v_fk = R * (om_rl + om_rr) / 2.0
+        diff_spd = om_rr - om_rl
         if abs(diff_spd) < 1e-9:
             psi_fk = 0.0
         else:
-            R_turn = (
-                TRACK
-                * (ws["RL"].omega_actual + ws["RR"].omega_actual)
-                / (2.0 * diff_spd)
-            )
+            R_turn = TRACK * (om_rl + om_rr) / (2.0 * diff_spd)
             psi_fk = float(np.arctan2(WB, R_turn))
+        fk_state = ackermann_kinematics(fk_state, make_vel(v_fk, psi_fk), DT)
+        fk_traj.append(fk_state[:3].flatten().tolist())
 
-        gt_state = ackermann_kinematics(gt_state, make_vel(v_fk, psi_fk), DT)
-        gt_traj.append(gt_state[:3].flatten().tolist())
-        cmd_state = ackermann_kinematics(cmd_state, vel, DT)
-        cmd_traj.append(cmd_state[:3].flatten().tolist())
-        fk_error.append(0.0)
-        cmd_error.append(
-            math.hypot(
-                gt_state[0, 0] - cmd_state[0, 0], gt_state[1, 0] - cmd_state[1, 0]
+        v_act = R * (ws["RL"].omega_actual + ws["RR"].omega_actual) / 2.0
+        d_act = ws["RR"].omega_actual - ws["RL"].omega_actual
+        psi_act = (
+            0.0
+            if abs(d_act) < 1e-9
+            else float(
+                np.arctan2(
+                    WB,
+                    TRACK
+                    * (ws["RL"].omega_actual + ws["RR"].omega_actual)
+                    / (2.0 * d_act),
+                )
             )
         )
+        act_state = ackermann_kinematics(act_state, make_vel(v_act, psi_act), DT)
+
+        fk_error.append(
+            math.hypot(fk_state[0, 0] - gt_state[0, 0], fk_state[1, 0] - gt_state[1, 0])
+        )
+        cmd_error.append(
+            math.hypot(
+                act_state[0, 0] - gt_state[0, 0], act_state[1, 0] - gt_state[1, 0]
+            )
+        )
+
+        prev_ticks["RL"] = enc["RL"]["ticks"]
+        prev_ticks["RR"] = enc["RR"]["ticks"]
 
     return {
         "name": "Ackermann (Car-like)",
@@ -252,7 +349,7 @@ def run_acker() -> dict:
         "cmds": cmds,
         "cmd_labels": ["v (m/s)", "psi (rad)"],
         "gt_traj": gt_traj,
-        "cmd_traj": cmd_traj,
+        "enc_traj": fk_traj,
         "fk_error": fk_error,
         "cmd_error": cmd_error,
         "wheel_omega": wheel_omega,
@@ -261,31 +358,41 @@ def run_acker() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Forklift (2 front drive + 1 rear steer+drive)
+# ---------------------------------------------------------------------------
+
+
 def run_forklift() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, HWB, TRACK = 0.15, 0.6, 0.5
     V_CONST, OM_MAX = 0.28, 0.35
+    RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = ForkiftWheelLayout(
         wheel_radius=R, half_wheelbase=HWB, track=TRACK, encoder_cpr=512
     )
     gt_state = np.zeros((3, 1))
-    cmd_state = np.zeros((3, 1))
+    fk_state = np.zeros((3, 1))
+    act_state = np.zeros((3, 1))
     gt_traj = [gt_state.flatten().tolist()]
-    cmd_traj = [cmd_state.flatten().tolist()]
+    fk_traj = [fk_state.flatten().tolist()]
     times, cmds, fk_error, cmd_error = [], [], [], []
     wheel_omega: dict[str, list] = {"FL": [], "FR": []}
     wheel_enc: dict[str, list] = {"FL": [], "FR": []}
     wheel_delta: dict[str, list] = {"RC": []}
+    prev_ticks: dict[str, int] = {"FL": 0, "FR": 0}
 
     for i in range(N):
         t = i * DT
         v_cmd = V_CONST
         om_cmd = OM_MAX * wave(t, T)
         vel = make_vel(v_cmd, om_cmd)
+
         layout.step(vel, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
+
         wheel_omega["FL"].append(ws["FL"].omega_actual)
         wheel_omega["FR"].append(ws["FR"].omega_actual)
         wheel_enc["FL"].append(enc["FL"]["theta_enc"])
@@ -294,20 +401,31 @@ def run_forklift() -> dict:
         times.append(t)
         cmds.append([v_cmd, om_cmd])
 
-        # FK via front drive pair (pure DC motors, exact inverse of forklift IK front pair)
-        v_fk, om_fk = diff_fwd_kin(
+        gt_state = differential_kinematics(gt_state, vel, DT)
+        gt_traj.append(gt_state.flatten().tolist())
+
+        om_fl = omega_from_ticks(enc["FL"]["ticks"], prev_ticks["FL"], RAD_PER_TICK)
+        om_fr = omega_from_ticks(enc["FR"]["ticks"], prev_ticks["FR"], RAD_PER_TICK)
+        v_fk, omz_fk = diff_fwd_kin(om_fl, om_fr, R, TRACK)
+        fk_state = differential_kinematics(fk_state, make_vel(v_fk, omz_fk), DT)
+        fk_traj.append(fk_state.flatten().tolist())
+
+        v_act, omz_act = diff_fwd_kin(
             ws["FL"].omega_actual, ws["FR"].omega_actual, R, TRACK
         )
-        gt_state = differential_kinematics(gt_state, make_vel(v_fk, om_fk), DT)
-        gt_traj.append(gt_state.flatten().tolist())
-        cmd_state = differential_kinematics(cmd_state, vel, DT)
-        cmd_traj.append(cmd_state.flatten().tolist())
-        fk_error.append(0.0)
+        act_state = differential_kinematics(act_state, make_vel(v_act, omz_act), DT)
+
+        fk_error.append(
+            math.hypot(fk_state[0, 0] - gt_state[0, 0], fk_state[1, 0] - gt_state[1, 0])
+        )
         cmd_error.append(
             math.hypot(
-                gt_state[0, 0] - cmd_state[0, 0], gt_state[1, 0] - cmd_state[1, 0]
+                act_state[0, 0] - gt_state[0, 0], act_state[1, 0] - gt_state[1, 0]
             )
         )
+
+        prev_ticks["FL"] = enc["FL"]["ticks"]
+        prev_ticks["FR"] = enc["FR"]["ticks"]
 
     return {
         "name": "Forklift",
@@ -315,7 +433,7 @@ def run_forklift() -> dict:
         "cmds": cmds,
         "cmd_labels": ["v (m/s)", "omega (rad/s)"],
         "gt_traj": gt_traj,
-        "cmd_traj": cmd_traj,
+        "enc_traj": fk_traj,
         "fk_error": fk_error,
         "cmd_error": cmd_error,
         "wheel_omega": wheel_omega,
@@ -324,27 +442,36 @@ def run_forklift() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Dual Steer (2-wheel swerve: FC at +HWB, RC at -HWB)
+# ---------------------------------------------------------------------------
+
+
 def run_dual_steer() -> dict:
     T, N = T_STEER, N_STEPS_STEER
     R, HWB = 0.10, 0.4
     VX_CONST, OMZ_MAX = 0.50, 0.45
+    RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = DualSteerWheelLayout(wheel_radius=R, half_wheelbase=HWB, encoder_cpr=512)
     gt_state = np.zeros((3, 1))
-    cmd_state = np.zeros((3, 1))
+    fk_state = np.zeros((3, 1))
+    act_state = np.zeros((3, 1))
     gt_traj = [gt_state.flatten().tolist()]
-    cmd_traj = [cmd_state.flatten().tolist()]
+    fk_traj = [fk_state.flatten().tolist()]
     times, cmds, fk_error, cmd_error = [], [], [], []
     wheel_omega: dict[str, list] = {"FC": [], "RC": []}
     wheel_enc: dict[str, list] = {"FC": [], "RC": []}
     wheel_delta: dict[str, list] = {"FC": [], "RC": []}
     wheel_delta_cmd: dict[str, list] = {"FC": [], "RC": []}
+    prev_ticks: dict[str, int] = {"FC": 0, "RC": 0}
 
     for i in range(N):
         t = i * DT
         vx = VX_CONST
         omz = OMZ_MAX * wave(t, T)
         vel = make_vel(vx, 0.0, omz)
+
         layout.step(vel, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
@@ -361,25 +488,49 @@ def run_dual_steer() -> dict:
         times.append(t)
         cmds.append([vx, omz])
 
+        gt_state = omni_angular_kinematics(gt_state, vel, DT)
+        gt_traj.append(gt_state.flatten().tolist())
+
+        # FK from ticks + actual delta (servo position encoder assumed ideal)
         fc, rc_w = ws["FC"], ws["RC"]
-        vwx_FC = fc.omega_actual * R * math.cos(fc.delta_actual)
-        vwy_FC = fc.omega_actual * R * math.sin(fc.delta_actual)
-        vwx_RC = rc_w.omega_actual * R * math.cos(rc_w.delta_actual)
-        vwy_RC = rc_w.omega_actual * R * math.sin(rc_w.delta_actual)
+        om_fc = omega_from_ticks(enc["FC"]["ticks"], prev_ticks["FC"], RAD_PER_TICK)
+        om_rc = omega_from_ticks(enc["RC"]["ticks"], prev_ticks["RC"], RAD_PER_TICK)
+        vwx_FC = om_fc * R * math.cos(fc.delta_actual)
+        vwy_FC = om_fc * R * math.sin(fc.delta_actual)
+        vwx_RC = om_rc * R * math.cos(rc_w.delta_actual)
+        vwy_RC = om_rc * R * math.sin(rc_w.delta_actual)
         vx_fk = (vwx_FC + vwx_RC) / 2.0
         vy_fk = (vwy_FC + vwy_RC) / 2.0
         omz_fk = (vwy_FC - vwy_RC) / (2.0 * HWB)
+        fk_state = omni_angular_kinematics(fk_state, make_vel(vx_fk, vy_fk, omz_fk), DT)
+        fk_traj.append(fk_state.flatten().tolist())
 
-        gt_state = omni_angular_kinematics(gt_state, make_vel(vx_fk, vy_fk, omz_fk), DT)
-        gt_traj.append(gt_state.flatten().tolist())
-        cmd_state = omni_angular_kinematics(cmd_state, vel, DT)
-        cmd_traj.append(cmd_state.flatten().tolist())
-        fk_error.append(0.0)
+        # True physical trajectory (omega_actual, delta_actual, no quantisation)
+        vwx_FC_a = fc.omega_actual * R * math.cos(fc.delta_actual)
+        vwy_FC_a = fc.omega_actual * R * math.sin(fc.delta_actual)
+        vwx_RC_a = rc_w.omega_actual * R * math.cos(rc_w.delta_actual)
+        vwy_RC_a = rc_w.omega_actual * R * math.sin(rc_w.delta_actual)
+        act_state = omni_angular_kinematics(
+            act_state,
+            make_vel(
+                (vwx_FC_a + vwx_RC_a) / 2.0,
+                (vwy_FC_a + vwy_RC_a) / 2.0,
+                (vwy_FC_a - vwy_RC_a) / (2.0 * HWB),
+            ),
+            DT,
+        )
+
+        fk_error.append(
+            math.hypot(fk_state[0, 0] - gt_state[0, 0], fk_state[1, 0] - gt_state[1, 0])
+        )
         cmd_error.append(
             math.hypot(
-                gt_state[0, 0] - cmd_state[0, 0], gt_state[1, 0] - cmd_state[1, 0]
+                act_state[0, 0] - gt_state[0, 0], act_state[1, 0] - gt_state[1, 0]
             )
         )
+
+        prev_ticks["FC"] = enc["FC"]["ticks"]
+        prev_ticks["RC"] = enc["RC"]["ticks"]
 
     return {
         "name": "Dual Steer",
@@ -387,7 +538,7 @@ def run_dual_steer() -> dict:
         "cmds": cmds,
         "cmd_labels": ["vx (m/s)", "omega_z (rad/s)"],
         "gt_traj": gt_traj,
-        "cmd_traj": cmd_traj,
+        "enc_traj": fk_traj,
         "fk_error": fk_error,
         "cmd_error": cmd_error,
         "wheel_omega": wheel_omega,
@@ -397,10 +548,16 @@ def run_dual_steer() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Quad Steer / Swerve (4-wheel independent steer+drive)
+# ---------------------------------------------------------------------------
+
+
 def run_quad_steer() -> dict:
     T, N = T_STEER, N_STEPS_STEER
     R, HL, HW = 0.05, 0.15, 0.15
     VX_CONST, VY_MAX, OMZ_MAX = 0.20, 0.10, 0.20
+    RAD_PER_TICK = RAD_PER_TICK_512
 
     positions = np.array([[HL, HW], [HL, -HW], [-HL, HW], [-HL, -HW]])
     names = ["FL", "FR", "RL", "RR"]
@@ -409,14 +566,16 @@ def run_quad_steer() -> dict:
         wheel_radius=R, half_length=HL, half_width=HW, encoder_cpr=512
     )
     gt_state = np.zeros((3, 1))
-    cmd_state = np.zeros((3, 1))
+    fk_state = np.zeros((3, 1))
+    act_state = np.zeros((3, 1))
     gt_traj = [gt_state.flatten().tolist()]
-    cmd_traj = [cmd_state.flatten().tolist()]
+    fk_traj = [fk_state.flatten().tolist()]
     times, cmds, fk_error, cmd_error = [], [], [], []
     wheel_omega: dict[str, list] = {n: [] for n in names}
     wheel_enc: dict[str, list] = {n: [] for n in names}
     wheel_delta: dict[str, list] = {n: [] for n in names}
     wheel_delta_cmd: dict[str, list] = {n: [] for n in names}
+    prev_ticks: dict[str, int] = dict.fromkeys(names, 0)
 
     # Swerve FK matrix A (8x3)
     A = np.zeros((8, 3))
@@ -430,6 +589,7 @@ def run_quad_steer() -> dict:
         vy = VY_MAX * wave(t, T)
         omz = OMZ_MAX * wave(t, T)
         vel = make_vel(vx, vy, omz)
+
         layout.step(vel, DT)
         ws = layout.get_wheel_states()
         enc = layout.get_encoder_readings()
@@ -450,25 +610,44 @@ def run_quad_steer() -> dict:
         times.append(t)
         cmds.append([vx, vy, omz])
 
-        b = np.empty(8)
-        for k, nm in enumerate(names):
-            spd = ws[nm].omega_actual * R
-            d = ws[nm].delta_actual
-            b[2 * k] = spd * math.cos(d)
-            b[2 * k + 1] = spd * math.sin(d)
-        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-        vx_fk, vy_fk, omz_fk = float(sol[0]), float(sol[1]), float(sol[2])
-
-        gt_state = omni_angular_kinematics(gt_state, make_vel(vx_fk, vy_fk, omz_fk), DT)
+        gt_state = omni_angular_kinematics(gt_state, vel, DT)
         gt_traj.append(gt_state.flatten().tolist())
-        cmd_state = omni_angular_kinematics(cmd_state, vel, DT)
-        cmd_traj.append(cmd_state.flatten().tolist())
-        fk_error.append(0.0)
+
+        # FK from ticks: least-squares swerve reconstruction
+        b = np.empty(8)
+        b_act = np.empty(8)
+        for k, nm in enumerate(names):
+            om_enc = omega_from_ticks(enc[nm]["ticks"], prev_ticks[nm], RAD_PER_TICK)
+            d = ws[nm].delta_actual
+            b[2 * k] = om_enc * R * math.cos(d)
+            b[2 * k + 1] = om_enc * R * math.sin(d)
+            b_act[2 * k] = ws[nm].omega_actual * R * math.cos(d)
+            b_act[2 * k + 1] = ws[nm].omega_actual * R * math.sin(d)
+
+        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        fk_state = omni_angular_kinematics(
+            fk_state, make_vel(float(sol[0]), float(sol[1]), float(sol[2])), DT
+        )
+        fk_traj.append(fk_state.flatten().tolist())
+
+        sol_act, _, _, _ = np.linalg.lstsq(A, b_act, rcond=None)
+        act_state = omni_angular_kinematics(
+            act_state,
+            make_vel(float(sol_act[0]), float(sol_act[1]), float(sol_act[2])),
+            DT,
+        )
+
+        fk_error.append(
+            math.hypot(fk_state[0, 0] - gt_state[0, 0], fk_state[1, 0] - gt_state[1, 0])
+        )
         cmd_error.append(
             math.hypot(
-                gt_state[0, 0] - cmd_state[0, 0], gt_state[1, 0] - cmd_state[1, 0]
+                act_state[0, 0] - gt_state[0, 0], act_state[1, 0] - gt_state[1, 0]
             )
         )
+
+        for nm in names:
+            prev_ticks[nm] = enc[nm]["ticks"]
 
     return {
         "name": "Quad Steer (Swerve)",
@@ -476,7 +655,7 @@ def run_quad_steer() -> dict:
         "cmds": cmds,
         "cmd_labels": ["vx (m/s)", "vy (m/s)", "omega_z (rad/s)"],
         "gt_traj": gt_traj,
-        "cmd_traj": cmd_traj,
+        "enc_traj": fk_traj,
         "fk_error": fk_error,
         "cmd_error": cmd_error,
         "wheel_omega": wheel_omega,
@@ -484,6 +663,11 @@ def run_quad_steer() -> dict:
         "wheel_delta": wheel_delta,
         "wheel_delta_cmd": wheel_delta_cmd,
     }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -508,15 +692,18 @@ def main() -> None:
     }
 
     print("Wheel FK Correctness Results")
-    print("=" * 72)
-    print(f"{'Model':<30}  {'FK error (max)':<18}  {'Cmd tracking (max)'}")
-    print("-" * 72)
+    print("=" * 76)
+    print(f"{'Model':<30}  {'FK error (max)':<20}  {'Cmd tracking (max)'}")
+    print("-" * 76)
     for m in results["models"]:
         fe = m["fk_error"]
         ce = m["cmd_error"]
         max_fk = max(fe) * 1000
+        rms_fk = (sum(e**2 for e in fe) / len(fe)) ** 0.5 * 1000
         max_cmd = max(ce) * 1000
-        print(f"  {m['name']:<28}  {max_fk:.4f} mm        {max_cmd:.3f} mm")
+        print(
+            f"  {m['name']:<28}  max={max_fk:.3f} mm  rms={rms_fk:.3f} mm  |  {max_cmd:.3f} mm"
+        )
 
     if args.save:
         out = "sim_data.json"
