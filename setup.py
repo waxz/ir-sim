@@ -36,7 +36,10 @@ class _OmpBuildExt(build_ext):
     """Inject per-platform OpenMP compiler/linker flags at build time."""
 
     def build_extension(self, ext: Extension) -> None:
-        if ext.name == "irsim.lib.algorithm._ray_casting_omp":
+        if ext.name in (
+            "irsim.lib.algorithm._ray_casting_omp",
+            "irsim.lib.algorithm._imu_c_ext",
+        ):
             self._apply_omp_flags(ext)
         try:
             super().build_extension(ext)
@@ -78,13 +81,20 @@ setup(
     ext_modules=[
         Extension(
             "irsim.lib.algorithm._ray_casting_omp",
-            # Relative paths required by setuptools; absolute paths are rejected.
             sources=[
                 "irsim/lib/algorithm/_ray_casting_omp_module.c",
                 "irsim/lib/algorithm/ray_casting_omp.c",
             ],
-            optional=True,  # build failure is non-fatal
-        )
+            optional=True,
+        ),
+        Extension(
+            "irsim.lib.algorithm._imu_c_ext",
+            sources=[
+                "irsim/lib/algorithm/_imu_c_ext_module.c",
+                "irsim/lib/algorithm/imu_c_ext.c",
+            ],
+            optional=True,
+        ),
     ],
     cmdclass={"build_ext": _OmpBuildExt},
 )
