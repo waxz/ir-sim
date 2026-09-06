@@ -41,6 +41,7 @@ from irsim.lib.handler.wheel_handler import (
     DiffWheelLayout,
     DualSteerWheelLayout,
     ForkiftWheelLayout,
+    GearboxParams,
     MecanumWheelLayout,
     MotorController,
     QuadSteerWheelLayout,
@@ -547,6 +548,113 @@ def test_position_controller_presets_keys():
     """POSITION_CONTROLLER_PRESETS has an entry for every SERVO_PRESETS key."""
     for key in SERVO_PRESETS:
         assert key in POSITION_CONTROLLER_PRESETS, f"Missing position preset for {key!r}"
+
+
+# ---------------------------------------------------------------------------
+# GearboxParams
+# ---------------------------------------------------------------------------
+
+
+def test_gearbox_params_defaults():
+    """GearboxParams defaults: ratio=1, efficiency=1, backlash=0."""
+    g = GearboxParams()
+    assert g.ratio == 1.0
+    assert g.efficiency == 1.0
+    assert g.backlash == 0.0
+
+
+def test_dc_motor_params_gear_ratio_property():
+    """DCMotorParams.gear_ratio returns gearbox.ratio or 1.0 when no gearbox."""
+    m_no_gb = DCMotorParams()
+    assert m_no_gb.gear_ratio == 1.0
+    m_gb = DCMotorParams(omega_max=10.0, gearbox=GearboxParams(ratio=46.0))
+    assert m_gb.gear_ratio == 46.0
+
+
+def test_dc_motor_params_motor_omega_max():
+    """motor_omega_max = omega_max * gear_ratio."""
+    m = DCMotorParams(omega_max=10.0, gearbox=GearboxParams(ratio=50.0))
+    assert m.motor_omega_max == pytest.approx(500.0)
+
+
+def test_dc_motor_params_motor_rpm():
+    """motor_rpm converts motor_omega_max to RPM correctly."""
+    m = DCMotorParams(omega_max=10.0, gearbox=GearboxParams(ratio=50.0))
+    expected = 500.0 * 60.0 / (2.0 * math.pi)
+    assert m.motor_rpm == pytest.approx(expected)
+
+
+def test_motor_presets_have_gearbox():
+    """All MOTOR_PRESETS carry a GearboxParams."""
+    for key, m in MOTOR_PRESETS.items():
+        assert m.gearbox is not None, f"{key}: gearbox should not be None"
+
+
+def test_commercial_motor_presets_exist():
+    """Commercial motor presets are registered."""
+    for name in ("dynamixel_xl430", "pololu_37d_50", "maxon_ec45_43"):
+        assert name in MOTOR_PRESETS, f"Missing motor preset {name!r}"
+        assert name in VELOCITY_CONTROLLER_PRESETS, f"Missing ctrl preset {name!r}"
+
+
+def test_dc_motor_actuator_sets_motor_omega():
+    """DCMotorActuator.step() updates WheelState.motor_omega = omega * ratio."""
+    m = DCMotorParams(
+        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        gearbox=GearboxParams(ratio=46.0, efficiency=0.72, backlash=0.0),
+    )
+    act = DCMotorActuator(m)
+    wheel = WheelState(name="t", role="drive")
+    for _ in range(500):
+        act.step(wheel, 10.0, 0.001)
+    assert wheel.motor_omega == pytest.approx(wheel.omega_actual * 46.0, abs=0.01)
+
+
+def test_dc_motor_actuator_backlash_suppresses_small_motion():
+    """With backlash > commanded step, initial output velocity stays near zero."""
+    backlash = 0.05  # 0.05 rad dead zone
+    m = DCMotorParams(
+        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        gearbox=GearboxParams(ratio=1.0, efficiency=1.0, backlash=backlash),
+    )
+    act = DCMotorActuator(m)
+    wheel = WheelState(name="t", role="drive")
+    # Very first step: motor moves, output in dead zone → omega_actual near 0
+    act.step(wheel, 0.1, 0.001)  # tiny command, integrated ~1e-4 rad < backlash/2
+    assert abs(wheel.omega_actual) < 0.01
+
+
+def test_dc_motor_actuator_backlash_clears_after_full_play():
+    """After consuming full backlash play, output tracks motor again."""
+    backlash = 0.01  # small backlash
+    m = DCMotorParams(
+        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        gearbox=GearboxParams(ratio=1.0, efficiency=1.0, backlash=backlash),
+    )
+    act = DCMotorActuator(m)
+    wheel = WheelState(name="t", role="drive")
+    # Run long enough to consume backlash and reach steady state
+    for _ in range(500):
+        act.step(wheel, 10.0, 0.001)
+    # Motor should be tracking well past the backlash dead zone
+    assert wheel.omega_actual > 5.0, "Motor should be tracking after backlash consumed"
+
+
+def test_dc_motor_actuator_reset_clears_backlash_state():
+    """reset_controller() clears accumulated output-shaft and backlash-contact state."""
+    m = DCMotorParams(
+        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        gearbox=GearboxParams(ratio=1.0, efficiency=1.0, backlash=0.05),
+    )
+    act = DCMotorActuator(m)
+    wheel = WheelState(name="t", role="drive")
+    for _ in range(200):
+        act.step(wheel, 10.0, 0.001)
+    assert act._theta_ideal != 0.0 or act._theta_out != 0.0
+    act.reset_controller()
+    assert act._theta_ideal == 0.0
+    assert act._theta_out == 0.0
+    assert act._backlash_contact == 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -48,9 +48,22 @@ Feedforward reduces tracking error at its source:
 - ``Kff_acc = J``: pre-injects inertial torque during ramps; tracking lag
   drops from ``tau * alpha`` to near zero (alpha = d(omega)/dt of profile).
 
+Gearbox model
+-------------
+:class:`GearboxParams` captures the three gearbox properties that matter for
+command-profile design: gear ratio (speed scaling), efficiency (torque loss),
+and backlash (angular dead zone).  Attach one to :class:`DCMotorParams` via
+the ``gearbox=`` field.  The actuator then:
+
+- exposes ``motor_omega_max`` / ``motor_rpm`` to size the motor-shaft profile
+- reports ``WheelState.motor_omega = omega_actual * ratio`` each step
+- applies the backlash dead zone so velocity drops to zero at direction
+  reversals until the full backlash play is consumed
+
 Named presets
 -------------
 Drive motors: ``"small_dc"``, ``"agv_hub_motor"``, ``"forklift_drive"``
+Commercial motors: ``"dynamixel_xl430"``, ``"pololu_37d_50"``, ``"maxon_ec45_43"``
 Steer servos: ``"light_servo"``, ``"agv_servo"``, ``"forklift_steer"``,
               ``"swerve_module"``
 Velocity controllers: ``VELOCITY_CONTROLLER_PRESETS`` (key = motor name)
@@ -65,7 +78,7 @@ Usage::
 
     # Default (exact first-order solution, backward-compatible):
     layout = DiffWheelLayout(wheel_radius=0.033, track=0.16,
-                             motor="small_dc", encoder_cpr=512)
+                             motor="small_dc", encoder_cpr=4096)
     layout.step(np.array([[1.0], [0.3]]), dt=0.05)
 
     # With explicit PI velocity controller:
@@ -97,29 +110,93 @@ from irsim.lib.algorithm.wheel_kinematics import (
 
 
 @dataclass
+class GearboxParams:
+    """Gearbox between motor shaft and wheel shaft.
+
+    Encodes the three properties that change a velocity profile's shape at the
+    motor shaft vs. the wheel shaft:
+
+    - **Ratio**: the motor spins ``ratio`` times faster than the wheel; commands
+      and velocities scale by this factor between the two shafts.
+    - **Efficiency**: only ``efficiency`` fraction of motor power reaches the
+      wheel, so the effective back-EMF torque seen by the controller is
+      reduced by η at rated load.
+    - **Backlash**: a mechanical dead zone of ``backlash`` radians (at the
+      output shaft) where the wheel does not move even though the motor is
+      turning.  This causes velocity ripple at direction reversals and a
+      position tracking floor of backlash/2.
+
+    Typical values by gearbox type:
+
+    ============= ========= ============= =====================
+    Gearbox type  ratio     efficiency    backlash (output, rad)
+    ============= ========= ============= =====================
+    Precision planetary (Maxon GP)  3-111   0.80-0.90   0.009 (0.5°)
+    Standard planetary (Dynamixel)  40-512  0.65-0.80   0.003 (0.18°)
+    Spur / helical                  5-50    0.85-0.95   0.017 (1°)
+    Chain / sprocket                5-30    0.75-0.85   0.026 (1.5°)
+    Direct drive (hub motor)        1       0.90-0.97   0
+    ============= ========= ============= =====================
+
+    Attributes:
+        ratio:      Gear reduction ratio N (motor shaft turns N times per
+                    output shaft turn).  Must be >= 1.0.
+        efficiency: Power transmission efficiency eta (0-1).
+        backlash:   Total angular play at the output shaft (rad).
+    """
+
+    ratio: float = 1.0
+    efficiency: float = 1.0
+    backlash: float = 0.0
+
+
+@dataclass
 class DCMotorParams:
-    """Wheel-shaft-level DC motor parameters (after gearbox).
+    """Wheel-shaft-level DC motor parameters (after gearbox reflection).
 
     The simplified equation of motion (electrical TC assumed ≪ mechanical)::
 
         J · dω/dt = K_motor · (ω_cmd - ω) - K_back · ω
+
+    All quantities are expressed at the **wheel shaft** (after gearbox).
+    Attach a :class:`GearboxParams` to expose motor-shaft properties
+    (``motor_omega_max``, ``motor_rpm``) and enable the backlash simulation.
 
     Attributes:
         J: Effective rotational inertia at wheel shaft (kg·m²).
         K_motor: Speed-controller forcing gain K_t·K_p_ctrl/R (N·m·s/rad).
         K_back: Back-EMF + friction term K_t·K_b/R + B (N·m·s/rad).
         omega_max: Maximum wheel angular velocity (rad/s).
+        gearbox: Optional :class:`GearboxParams`.  ``None`` means parameters
+            are already reflected to the wheel shaft and no backlash is
+            applied (backward-compatible default).
     """
 
     J: float = 2e-4
     K_motor: float = 2.5
     K_back: float = 1.5
     omega_max: float = 20.0
+    gearbox: GearboxParams | None = None
 
     @property
     def tau(self) -> float:
         """Open-loop mechanical time constant (s)."""
         return self.J / (self.K_motor + self.K_back)
+
+    @property
+    def gear_ratio(self) -> float:
+        """Gear reduction ratio (1.0 if no gearbox attached)."""
+        return self.gearbox.ratio if self.gearbox is not None else 1.0
+
+    @property
+    def motor_omega_max(self) -> float:
+        """Maximum motor shaft angular velocity (rad/s)."""
+        return self.omega_max * self.gear_ratio
+
+    @property
+    def motor_rpm(self) -> float:
+        """No-load motor shaft speed (RPM)."""
+        return self.motor_omega_max * 60.0 / (2.0 * np.pi)
 
 
 @dataclass
@@ -158,23 +235,90 @@ class ServoParams:
 
 
 # ── Named motor presets ──────────────────────────────────────────────────────
-# Parameters are set at the wheel shaft after any gearbox.
-# Time constant τ = J / (K_motor + K_back):
+# All parameters are at the wheel shaft after gearbox reflection.
+# Time constant τ = J / (K_motor + K_back).  Convergence time (2% band) = 4τ.
 #
-#   small_dc      → τ = 5e-3 / (0.065+0.035) = 0.050 s  (50 ms)
-#     Matches Dynamixel XL430-W250 class (TurtleBot3 Burger).  J reflects
-#     motor rotor inertia through ~200:1 gearbox plus 33 mm wheel.
+#   small_dc      → τ = 30 ms  (46:1 planetary gearmotor; J ≈ J_motor x 46²)
+#     J_motor of typical brushed servo ≈ 1.5 µN·m·s² → J_wheel ≈ 3.2e-3 kg·m².
+#     Encoder: 48-64 CPR on motor shaft x 46 = 2200-2950 CPR at wheel.
+#     Recommend: encoder_cpr=2048.
 #
-#   agv_hub_motor → τ = 3e-2 / (0.13+0.07)   = 0.150 s  (150 ms)
-#     Matches 250 W BLDC hub motor, 150 mm radius wheel, ~3 kg.
+#   agv_hub_motor → τ = 26 ms  (BLDC hub motor with FOC, direct drive)
+#     Wheel + rotor inertia ~7e-3 kg·m² (1-1.5 kg hub at 10 cm radius).
+#     FOC current bandwidth ~2 kHz; velocity bandwidth ~200 Hz (τ_vel ≈ 1 ms);
+#     effective closed-loop τ ≈ 26 ms with load and discretisation included.
+#     Encoder: 512-4096 pulse/rev magnetic at wheel shaft.
+#     Recommend: encoder_cpr=1024.
 #
-#   forklift_drive→ τ = 5e-1 / (1.10+0.57)   ≈ 0.300 s  (300 ms)
-#     Heavy AGV / counterbalance forklift: large tyre + chain-drive inertia.
+#   forklift_drive→ τ = 200 ms (heavy brush motor, 20:1 chain/spur reduction)
+#     Large reflected inertia; chain compliance reduces effective bandwidth.
+#     Encoder: 200-500 CPR at wheel shaft (industrial resolver or disk encoder).
+#     Recommend: encoder_cpr=500.
+#
+# Real-world commercial motor presets (wheel-shaft quantities from datasheets):
+#
+#   dynamixel_xl430 → ROBOTIS XL430-W250-T, 46.13:1 planetary, 12 V
+#     No-load 61 RPM out = 6.4 rad/s; stall 1.5 N·m.
+#     Built-in 12-bit absolute encoder: 4096 CPR at output shaft.
+#     τ = 9e-4 / 0.09 = 10 ms. Velocity PI bandwidth ~100-150 Hz.
+#     Recommend: encoder_cpr=4096.
+#
+#   pololu_37d_50 → Pololu 37D metal gearmotor 50:1, 12 V
+#     No-load 120 RPM out = 12.6 rad/s; stall 0.54 N·m.
+#     Motor-shaft encoder: 64 CPR x 50:1 = 3200 CPR at wheel.
+#     τ = 2.3e-3 / 0.066 = 35 ms. No built-in controller (requires MCU PID).
+#     Recommend: encoder_cpr=3200.
+#
+#   maxon_ec45_43 → Maxon EC 45 flat + GP 42 C 43:1, 24 V BLDC
+#     No-load 87 RPM out = 9.1 rad/s; peak torque 4.0 N·m.
+#     Motor-shaft encoder: 2048 CPR; EPOS4 velocity bandwidth ~500 Hz.
+#     τ = 5.4e-3 / 1.35 = 4 ms.
+#     Recommend: encoder_cpr=4096.
 
 MOTOR_PRESETS: dict[str, DCMotorParams] = {
-    "small_dc": DCMotorParams(J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0),
-    "agv_hub_motor": DCMotorParams(J=3e-2, K_motor=0.13, K_back=0.07, omega_max=8.0),
-    "forklift_drive": DCMotorParams(J=5e-1, K_motor=1.10, K_back=0.57, omega_max=4.0),
+    "small_dc": DCMotorParams(
+        J=3e-3,  # J_motor x 46² ≈ 3.2e-3 kg·m²; τ = 3e-3/0.10 = 30 ms
+        K_motor=0.065,
+        K_back=0.035,
+        omega_max=20.0,
+        gearbox=GearboxParams(ratio=46.0, efficiency=0.72, backlash=np.radians(0.18)),
+    ),
+    "agv_hub_motor": DCMotorParams(
+        J=7e-3,  # wheel+rotor ≈ 7e-3 kg·m²; τ = 7e-3/0.27 = 26 ms
+        K_motor=0.20,  # increased for BLDC-FOC bandwidth (~200 Hz velocity loop)
+        K_back=0.07,
+        omega_max=8.0,
+        gearbox=GearboxParams(ratio=1.0, efficiency=0.92, backlash=0.0),
+    ),
+    "forklift_drive": DCMotorParams(
+        J=3.3e-1,  # heavy vehicle reflected inertia; τ = 3.3e-1/1.67 = 198 ms
+        K_motor=1.10,
+        K_back=0.57,
+        omega_max=4.0,
+        gearbox=GearboxParams(ratio=20.0, efficiency=0.80, backlash=np.radians(1.5)),
+    ),
+    # ── Commercial motor presets ──────────────────────────────────────────────
+    "dynamixel_xl430": DCMotorParams(
+        J=9e-4,  # J_motor x 46.13² ≈ 8.5e-4 kg·m²; τ = 9e-4/0.09 = 10 ms
+        K_motor=0.060,
+        K_back=0.030,
+        omega_max=6.4,
+        gearbox=GearboxParams(ratio=46.13, efficiency=0.72, backlash=np.radians(0.18)),
+    ),
+    "pololu_37d_50": DCMotorParams(
+        J=2.3e-3,  # J_motor x 50² ≈ 2.5e-3 kg·m²; τ = 2.3e-3/0.066 = 35 ms
+        K_motor=0.044,
+        K_back=0.022,
+        omega_max=12.6,
+        gearbox=GearboxParams(ratio=50.0, efficiency=0.67, backlash=np.radians(1.0)),
+    ),
+    "maxon_ec45_43": DCMotorParams(
+        J=5.4e-3,  # EC45 J_motor ≈ 2.9e-6 x 43² ≈ 5.4e-3 kg·m²; τ = 4 ms
+        K_motor=1.20,
+        K_back=0.15,
+        omega_max=9.1,
+        gearbox=GearboxParams(ratio=43.0, efficiency=0.82, backlash=np.radians(0.5)),
+    ),
 }
 
 # ── Named servo presets ──────────────────────────────────────────────────────
@@ -390,29 +534,59 @@ VELOCITY_CONTROLLER_PRESETS: dict[str, ControllerParams] = {
     "small_dc": ControllerParams(
         Kp=0.065,
         Ki=0.010,
-        Kff=0.035,    # K_back of small_dc
-        Kff_acc=5e-3, # J of small_dc
+        Kff=0.035,  # K_back of small_dc
+        Kff_acc=3e-3,  # J of small_dc
         i_limit=0.5,
         output_limit=2.0,
         # small_dc: (0.065+0.035)*20 = 2.0 N*m ceiling
     ),
     "agv_hub_motor": ControllerParams(
-        Kp=0.130,
+        Kp=0.200,  # matches K_motor (updated for BLDC-FOC bandwidth)
         Ki=0.015,
-        Kff=0.07,     # K_back of agv_hub_motor
-        Kff_acc=3e-2, # J of agv_hub_motor
+        Kff=0.07,  # K_back of agv_hub_motor
+        Kff_acc=7e-3,  # J of agv_hub_motor
         i_limit=1.0,
-        output_limit=1.6,
-        # agv_hub: (0.13+0.07)*8 = 1.6 N*m
+        output_limit=2.2,
+        # agv_hub: (0.20+0.07)*8 = 2.16 N*m
     ),
     "forklift_drive": ControllerParams(
         Kp=1.100,
         Ki=0.050,
-        Kff=0.57,     # K_back of forklift_drive
-        Kff_acc=5e-1, # J of forklift_drive
+        Kff=0.57,  # K_back of forklift_drive
+        Kff_acc=3.3e-1,  # J of forklift_drive
         i_limit=4.0,
         output_limit=6.7,
         # forklift: (1.10+0.57)*4 = 6.68 N*m
+    ),
+    # ── Commercial motor controller presets ───────────────────────────────────
+    # Kff = K_back (back-EMF cancel), Kff_acc = J (inertia pre-compensation).
+    # output_limit = (Kp + Kback) * omega_max (max torque at full speed).
+    "dynamixel_xl430": ControllerParams(
+        Kp=0.060,
+        Ki=0.012,
+        Kff=0.030,  # K_back
+        Kff_acc=9e-4,  # J
+        i_limit=0.30,
+        output_limit=0.576,
+        # (0.06+0.03)*6.4 = 0.576 N*m
+    ),
+    "pololu_37d_50": ControllerParams(
+        Kp=0.044,
+        Ki=0.008,
+        Kff=0.022,  # K_back
+        Kff_acc=2.3e-3,  # J
+        i_limit=0.40,
+        output_limit=0.83,
+        # (0.044+0.022)*12.6 = 0.83 N*m
+    ),
+    "maxon_ec45_43": ControllerParams(
+        Kp=1.200,
+        Ki=0.200,
+        Kff=0.150,  # K_back
+        Kff_acc=5.4e-3,  # J
+        i_limit=2.0,
+        output_limit=12.3,
+        # (1.20+0.15)*9.1 = 12.3 N*m
     ),
 }
 
@@ -451,6 +625,8 @@ class WheelState:
         role: ``"drive"`` | ``"steer"`` | ``"drive_steer"``.
         omega_cmd: Commanded angular velocity (rad/s) from IK.
         omega_actual: Actual angular velocity after motor lag (rad/s).
+        motor_omega: Motor shaft angular velocity (rad/s) = omega_actual * gear_ratio.
+            Equal to omega_actual when no gearbox is attached.
         theta_enc: Cumulative encoder angle (rad), always monotonically changes.
         delta_cmd: Commanded steering angle (rad); steer/drive_steer only.
         delta_actual: Actual steering angle after servo lag (rad).
@@ -463,6 +639,7 @@ class WheelState:
     role: str
     omega_cmd: float = 0.0
     omega_actual: float = 0.0
+    motor_omega: float = 0.0
     theta_enc: float = 0.0
     delta_cmd: float = 0.0
     delta_actual: float = 0.0
@@ -522,6 +699,10 @@ class DCMotorActuator:
             self._controller = None
         # Tracks previous command for computing dω_cmd/dt (acceleration FF)
         self._prev_omega_cmd: float | None = None
+        # Backlash simulation state
+        self._theta_ideal: float = 0.0  # ideal output shaft angle (no backlash)
+        self._theta_out: float = 0.0  # actual output shaft angle (after backlash)
+        self._backlash_contact: float = 0.0  # edge of the backlash dead zone (rad)
 
     @property
     def control_mode(self) -> ControlMode:
@@ -529,10 +710,13 @@ class DCMotorActuator:
         return ControlMode.VELOCITY
 
     def reset_controller(self) -> None:
-        """Clear the built-in controller's integrator, derivative, and FF history."""
+        """Clear controller integrator, derivative, FF, and backlash state."""
         if self._controller is not None:
             self._controller.reset()
         self._prev_omega_cmd = None
+        self._theta_ideal = 0.0
+        self._theta_out = 0.0
+        self._backlash_contact = 0.0
 
     def step(self, wheel: WheelState, omega_cmd: float, dt: float) -> None:
         """Advance motor state by one timestep.
@@ -564,7 +748,33 @@ class DCMotorActuator:
             decay = float(np.exp(-dt / tau))
             new_omega = omega_cmd + (wheel.omega_actual - omega_cmd) * decay
 
-        wheel.omega_actual = float(np.clip(new_omega, -p.omega_max, p.omega_max))
+        # Apply gearbox backlash dead zone.
+        # _theta_ideal accumulates the frictionless output position.  The real
+        # output (_theta_out) only moves when _theta_ideal escapes the backlash
+        # window; inside the window the wheel stands still even though the motor
+        # is turning (energy absorbed by the gear play).
+        gb = p.gearbox
+        if gb is not None and gb.backlash > 0.0 and dt > 0.0:
+            bl = gb.backlash
+            self._theta_ideal += new_omega * dt
+            prev_out = self._theta_out
+            if self._theta_ideal > self._backlash_contact + bl / 2:
+                self._backlash_contact = self._theta_ideal - bl / 2
+                self._theta_out = self._backlash_contact
+            elif self._theta_ideal < self._backlash_contact - bl / 2:
+                self._backlash_contact = self._theta_ideal + bl / 2
+                self._theta_out = self._backlash_contact
+            # else: inside dead zone — _theta_out unchanged
+            effective_omega = (self._theta_out - prev_out) / dt
+            wheel.omega_actual = float(
+                np.clip(effective_omega, -p.omega_max, p.omega_max)
+            )
+        else:
+            wheel.omega_actual = float(np.clip(new_omega, -p.omega_max, p.omega_max))
+
+        # Report motor-shaft speed (raw motor before gearbox).
+        ratio = gb.ratio if gb is not None else 1.0
+        wheel.motor_omega = float(wheel.omega_actual * ratio)
 
 
 class ServoActuator:
@@ -731,19 +941,27 @@ class WheelLayout(ABC):
     def _add_drive_wheel(self, name: str) -> None:
         ws = WheelState(name=name, role="drive")
         self.wheels.append(ws)
-        self._motor_act[name] = DCMotorActuator(self._motor_params, self._motor_controller)
+        self._motor_act[name] = DCMotorActuator(
+            self._motor_params, self._motor_controller
+        )
         self._encoders[name] = WheelEncoder(self._encoder_cpr)
 
     def _add_steer_wheel(self, name: str) -> None:
         ws = WheelState(name=name, role="steer")
         self.wheels.append(ws)
-        self._servo_act[name] = ServoActuator(self._servo_params, self._servo_controller)
+        self._servo_act[name] = ServoActuator(
+            self._servo_params, self._servo_controller
+        )
 
     def _add_drive_steer_wheel(self, name: str) -> None:
         ws = WheelState(name=name, role="drive_steer")
         self.wheels.append(ws)
-        self._motor_act[name] = DCMotorActuator(self._motor_params, self._motor_controller)
-        self._servo_act[name] = ServoActuator(self._servo_params, self._servo_controller)
+        self._motor_act[name] = DCMotorActuator(
+            self._motor_params, self._motor_controller
+        )
+        self._servo_act[name] = ServoActuator(
+            self._servo_params, self._servo_controller
+        )
         self._encoders[name] = WheelEncoder(self._encoder_cpr)
 
     @abstractmethod
@@ -844,7 +1062,9 @@ class DiffWheelLayout(WheelLayout):
         encoder_cpr: int = 0,
         motor_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, encoder_cpr=encoder_cpr, motor_controller=motor_controller)
+        super().__init__(
+            motor=motor, encoder_cpr=encoder_cpr, motor_controller=motor_controller
+        )
         self.wheel_radius = float(wheel_radius)
         self.track = float(track)
         self._add_drive_wheel("left")
@@ -885,7 +1105,9 @@ class MecanumWheelLayout(WheelLayout):
         encoder_cpr: int = 0,
         motor_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, encoder_cpr=encoder_cpr, motor_controller=motor_controller)
+        super().__init__(
+            motor=motor, encoder_cpr=encoder_cpr, motor_controller=motor_controller
+        )
         self.wheel_radius = float(wheel_radius)
         self.half_length = float(half_length)
         self.half_width = float(half_width)
@@ -940,8 +1162,11 @@ class AckerWheelLayout(WheelLayout):
         servo_controller: ControllerParams | None = None,
     ) -> None:
         super().__init__(
-            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
-            motor_controller=motor_controller, servo_controller=servo_controller,
+            motor=motor,
+            servo=servo,
+            encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller,
+            servo_controller=servo_controller,
         )
         self.wheel_radius = float(wheel_radius)
         self.wheelbase = float(wheelbase)
@@ -1001,8 +1226,11 @@ class ForkiftWheelLayout(WheelLayout):
         servo_controller: ControllerParams | None = None,
     ) -> None:
         super().__init__(
-            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
-            motor_controller=motor_controller, servo_controller=servo_controller,
+            motor=motor,
+            servo=servo,
+            encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller,
+            servo_controller=servo_controller,
         )
         self.wheel_radius = float(wheel_radius)
         self.half_wheelbase = float(half_wheelbase)
@@ -1064,8 +1292,11 @@ class DualSteerWheelLayout(WheelLayout):
         servo_controller: ControllerParams | None = None,
     ) -> None:
         super().__init__(
-            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
-            motor_controller=motor_controller, servo_controller=servo_controller,
+            motor=motor,
+            servo=servo,
+            encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller,
+            servo_controller=servo_controller,
         )
         self.wheel_radius = float(wheel_radius)
         self.half_wheelbase = float(half_wheelbase)
@@ -1125,8 +1356,11 @@ class QuadSteerWheelLayout(WheelLayout):
         servo_controller: ControllerParams | None = None,
     ) -> None:
         super().__init__(
-            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
-            motor_controller=motor_controller, servo_controller=servo_controller,
+            motor=motor,
+            servo=servo,
+            encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller,
+            servo_controller=servo_controller,
         )
         self.wheel_radius = float(wheel_radius)
         self.half_length = float(half_length)
