@@ -97,6 +97,19 @@ class KinematicsHandler(ABC):
         self.name = name
         self.noise = noise
         self.alpha = alpha or [0.03, 0, 0, 0.03]
+        self.wheel_layout = None
+
+    def attach_wheel_layout(self, layout) -> None:
+        """Attach a WheelLayout to this handler.
+
+        After attachment, the layout's actuators and encoders are updated
+        every simulation step alongside the kinematic pose update.
+
+        Args:
+            layout: A WheelLayout instance from
+                :mod:`irsim.lib.handler.wheel_handler`.
+        """
+        self.wheel_layout = layout
 
     @abstractmethod
     def step(

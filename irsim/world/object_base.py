@@ -585,6 +585,8 @@ class ObjectBase:
         self.pre_process()
         behavior_vel = self.gen_behavior_vel(velocity)
         new_state = self.kf.step(self.state, behavior_vel, self._world_param.step_time)
+        if self.kf.wheel_layout is not None:
+            self.kf.wheel_layout.step(behavior_vel, self._world_param.step_time)
         next_state = self.mid_process(new_state)
 
         self._state = next_state
@@ -2022,6 +2024,30 @@ class ObjectBase:
             out = np.zeros((2, 1))
         self._velocity_xy_cache = out
         return out
+
+    @property
+    def wheel_states(self):
+        """Get the current state of all wheels in the attached wheel layout.
+
+        Returns:
+            dict[str, WheelState] | None: Mapping of wheel name to WheelState,
+            or None if no wheel layout is attached.
+        """
+        if self.kf is not None and self.kf.wheel_layout is not None:
+            return self.kf.wheel_layout.get_wheel_states()
+        return None
+
+    @property
+    def encoder_readings(self):
+        """Get encoder readings from the attached wheel layout.
+
+        Returns:
+            dict[str, dict] | None: Mapping of wheel name to encoder data
+            (``theta_enc``, ``ticks``), or None if no layout is attached.
+        """
+        if self.kf is not None and self.kf.wheel_layout is not None:
+            return self.kf.wheel_layout.get_encoder_readings()
+        return None
 
     def vel_world2body(self, velocity_xy: np.ndarray) -> np.ndarray:
         """
