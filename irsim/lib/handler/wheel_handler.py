@@ -29,26 +29,49 @@ Steady-state: ω → ω_cmd.  Time constant: τ = J / (K_motor + K_back).
 
 Integrated with Euler; angle and rate clamped to physical limits.
 
+Built-in controller module
+--------------------------
+Real motor drives (Dynamixel, EPOS4, Elmo Gold, CANopen DS402) expose PID
+gains as tunable registers separate from the motor physics.  The optional
+``MotorController`` class models this layer:
+
+- ``ControlMode``: ``VELOCITY``, ``POSITION``, or ``TORQUE`` operating mode.
+- ``ControllerParams``: PID gains (Kp, Ki, Kd) plus anti-windup and output
+  limits — equivalent to the gain registers in a real drive.
+- ``MotorController``: stateful PID with anti-windup.  Passed as ``controller=``
+  to either actuator to replace the implicit P/PD with an explicit PID loop.
+
 Named presets
 -------------
 Drive motors: ``"small_dc"``, ``"agv_hub_motor"``, ``"forklift_drive"``
 Steer servos: ``"light_servo"``, ``"agv_servo"``, ``"forklift_steer"``,
               ``"swerve_module"``
+Velocity controllers: ``VELOCITY_CONTROLLER_PRESETS`` (key = motor name)
+Position controllers: ``POSITION_CONTROLLER_PRESETS`` (key = servo name)
 
 Usage::
 
-    from irsim.lib.handler.wheel_handler import DiffWheelLayout, MOTOR_PRESETS
+    from irsim.lib.handler.wheel_handler import (
+        DiffWheelLayout, MOTOR_PRESETS,
+        ControllerParams, MotorController, ControlMode,
+    )
 
+    # Default (exact first-order solution, backward-compatible):
     layout = DiffWheelLayout(wheel_radius=0.033, track=0.16,
                              motor="small_dc", encoder_cpr=512)
     layout.step(np.array([[1.0], [0.3]]), dt=0.05)
-    print(layout.get_encoder_readings())
+
+    # With explicit PI velocity controller:
+    from irsim.lib.handler.wheel_handler import VELOCITY_CONTROLLER_PRESETS
+    ctrl_params = VELOCITY_CONTROLLER_PRESETS["small_dc"]   # Kp=0.065, Ki=0.010
+    actuator = DCMotorActuator("small_dc", controller=ctrl_params)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import numpy as np
@@ -195,6 +218,178 @@ SERVO_PRESETS: dict[str, ServoParams] = {
 
 
 # ---------------------------------------------------------------------------
+# Controller module  (ControlMode / ControllerParams / MotorController)
+# ---------------------------------------------------------------------------
+
+
+class ControlMode(str, Enum):
+    """Motor drive operating mode.
+
+    Matches the profile modes common to servo-drive standards (CANopen DS402,
+    Dynamixel protocol 2.0, Modbus RTU drives):
+
+    - ``VELOCITY``: PI/PID speed loop; typical for drive wheels.
+    - ``POSITION``: PID position loop, often cascaded over an inner speed loop.
+    - ``TORQUE``:   Direct torque/current reference; no feedback in this layer.
+    """
+
+    VELOCITY = "velocity"
+    POSITION = "position"
+    TORQUE = "torque"
+
+
+@dataclass
+class ControllerParams:
+    """Built-in PID controller gains — the tunable registers of a servo drive.
+
+    Real examples of what these map to:
+
+    - **Dynamixel XL430**: Position_P_Gain (addr 84), Position_I_Gain (86),
+      Position_D_Gain (88), Velocity_P_Gain (78), Velocity_I_Gain (76).
+    - **Maxon EPOS4**: Velocity PI (Kp, Ki in the Motion Controller tab),
+      Position PID with velocity feedforward.
+    - **Elmo Gold**: CL[1]/CL[2] current-loop PI; VL[1]/VL[2] velocity PI.
+
+    Attributes:
+        Kp: Proportional gain.
+        Ki: Integral gain (0 = P/PD only; add to eliminate steady-state error
+            under constant load or gravity).
+        Kd: Derivative gain.
+        i_limit: Anti-windup clamp on the integrator state (same units as
+            ``Kp * error``).  ``inf`` means unlimited.
+        output_limit: Hard clamp on total controller output magnitude.
+    """
+
+    Kp: float = 1.0
+    Ki: float = 0.0
+    Kd: float = 0.0
+    i_limit: float = float("inf")
+    output_limit: float = float("inf")
+
+
+class MotorController:
+    """Stateful PID controller modelling a motor drive's built-in control loop.
+
+    Maintains integrator and previous-error state across :meth:`step` calls.
+    Call :meth:`reset` after abrupt setpoint changes to avoid integrator kick.
+
+    Derivative is computed on the **error** (not measurement), which is the
+    standard for velocity loops.  For position loops the same formula holds
+    when the setpoint is constant (d(error)/dt = -δ̇), matching the existing
+    ``ServoActuator`` PD equation.
+
+    Args:
+        params: :class:`ControllerParams` with gains and limits.
+        mode:   :class:`ControlMode` — ``VELOCITY``, ``POSITION``, or
+                ``TORQUE``.
+    """
+
+    def __init__(
+        self,
+        params: ControllerParams,
+        mode: ControlMode = ControlMode.VELOCITY,
+    ) -> None:
+        self.params = params
+        self.mode = mode
+        self._integral: float = 0.0
+        self._prev_error: float = 0.0
+        self._initialized: bool = False
+
+    def step(self, setpoint: float, measurement: float, dt: float) -> float:
+        """Compute one PID step.
+
+        Args:
+            setpoint:    Target value (rad/s for velocity; rad for position).
+            measurement: Current measured value.
+            dt:          Timestep (s).
+
+        Returns:
+            Controller output.  For velocity/torque mode this is a torque
+            command (N·m); for position mode it is the generalized force
+            driving the plant's angular acceleration (N·m, divided by J_s
+            inside the actuator).
+        """
+        p = self.params
+        error = setpoint - measurement
+        # Integrator with symmetric anti-windup clamp
+        self._integral = float(
+            np.clip(self._integral + error * dt, -p.i_limit, p.i_limit)
+        )
+        # Derivative skipped on the very first call to avoid a spike
+        if not self._initialized or dt <= 0.0:
+            d_term = 0.0
+            self._initialized = True
+        else:
+            d_term = p.Kd * (error - self._prev_error) / dt
+        self._prev_error = error
+        output = p.Kp * error + p.Ki * self._integral + d_term
+        return float(np.clip(output, -p.output_limit, p.output_limit))
+
+    def reset(self) -> None:
+        """Clear integrator and derivative history."""
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._initialized = False
+
+    @property
+    def integral(self) -> float:
+        """Current integrator state (read-only)."""
+        return self._integral
+
+
+# ── Default velocity controller presets ──────────────────────────────────────
+# Kp matches the motor's K_motor so the P-only step response is identical to
+# the exact first-order solution.  Ki adds a slow integral to eliminate the
+# small steady-state error that appears under constant load (e.g. incline).
+# output_limit is set to K_motor·ω_max + K_back·ω_max = (K_motor+K_back)·ω_max
+# (max torque the drive can command at full speed).
+
+VELOCITY_CONTROLLER_PRESETS: dict[str, ControllerParams] = {
+    "small_dc": ControllerParams(
+        Kp=0.065,
+        Ki=0.010,
+        i_limit=0.5,
+        output_limit=2.0,
+        # small_dc: (0.065+0.035)*20 = 2.0 N·m ceiling
+    ),
+    "agv_hub_motor": ControllerParams(
+        Kp=0.130,
+        Ki=0.015,
+        i_limit=1.0,
+        output_limit=1.6,
+        # agv_hub: (0.13+0.07)*8 = 1.6 N·m
+    ),
+    "forklift_drive": ControllerParams(
+        Kp=1.100,
+        Ki=0.050,
+        i_limit=4.0,
+        output_limit=6.7,
+        # forklift: (1.10+0.57)*4 = 6.68 N·m
+    ),
+}
+
+# ── Default position controller presets ──────────────────────────────────────
+# Kp and Kd match the K_p / K_d values already in SERVO_PRESETS so the
+# default step response is unchanged.  Ki=0 by default; set a small value
+# (e.g. 0.1-0.5) to eliminate steady-state position error under external load.
+
+POSITION_CONTROLLER_PRESETS: dict[str, ControllerParams] = {
+    "light_servo": ControllerParams(
+        Kp=4.0, Ki=0.0, Kd=0.8, i_limit=1.0, output_limit=float("inf")
+    ),
+    "agv_servo": ControllerParams(
+        Kp=8.0, Ki=0.0, Kd=2.0, i_limit=2.0, output_limit=float("inf")
+    ),
+    "forklift_steer": ControllerParams(
+        Kp=6.0, Ki=0.0, Kd=4.0, i_limit=2.0, output_limit=float("inf")
+    ),
+    "swerve_module": ControllerParams(
+        Kp=3.0, Ki=0.0, Kd=0.4, i_limit=2.0, output_limit=float("inf")
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Wheel state
 # ---------------------------------------------------------------------------
 
@@ -235,18 +430,33 @@ class WheelState:
 class DCMotorActuator:
     """Drive-wheel actuator using a simplified DC motor model.
 
-    The governing ODE::
+    **Default (no controller)** — exact first-order solution::
 
         J · dω/dt = K_motor · (ω_cmd - ω) - K_back · ω
+        ω(t+dt)  = ω_cmd + (ω - ω_cmd) · exp(-dt/τ),   τ = J/(K_motor+K_back)
 
-    is integrated with a first-order Euler step, giving time constant
-    ``τ = J / (K_motor + K_back)``.
+    **With explicit controller** — the motor drive's built-in velocity PI/PID
+    loop drives the plant equation::
+
+        torque   = controller.step(ω_cmd, ω_actual, dt)
+        dω/dt    = (torque - K_back · ω) / J          [Euler integration]
+
+    The explicit controller path lets you tune Kp, Ki, Kd independently of
+    the mechanical plant, matching real drive electronics (Dynamixel velocity
+    PI registers, EPOS4 velocity loop, Elmo VL[1]/VL[2]).
 
     Args:
-        params: A :class:`DCMotorParams` instance or a preset name string.
+        params:     :class:`DCMotorParams` instance or preset name string.
+        controller: Optional :class:`ControllerParams` for the velocity PI/PID
+                    loop.  ``None`` (default) uses the exact analytical solution
+                    — backward-compatible with all existing code.
     """
 
-    def __init__(self, params: DCMotorParams | str = "small_dc") -> None:
+    def __init__(
+        self,
+        params: DCMotorParams | str = "small_dc",
+        controller: ControllerParams | None = None,
+    ) -> None:
         if isinstance(params, str):
             if params not in MOTOR_PRESETS:
                 raise ValueError(
@@ -256,38 +466,81 @@ class DCMotorActuator:
         else:
             self.params = params
 
+        if controller is not None:
+            self._controller: MotorController | None = MotorController(
+                controller, mode=ControlMode.VELOCITY
+            )
+        else:
+            self._controller = None
+
+    @property
+    def control_mode(self) -> ControlMode:
+        """Active control mode (always ``VELOCITY`` for a drive actuator)."""
+        return ControlMode.VELOCITY
+
+    def reset_controller(self) -> None:
+        """Clear the built-in controller's integrator and derivative history."""
+        if self._controller is not None:
+            self._controller.reset()
+
     def step(self, wheel: WheelState, omega_cmd: float, dt: float) -> None:
         """Advance motor state by one timestep.
 
         Args:
-            wheel: Mutable :class:`WheelState` to update in-place.
+            wheel:     Mutable :class:`WheelState` to update in-place.
             omega_cmd: Desired wheel angular velocity (rad/s).
-            dt: Simulation timestep (s).
+            dt:        Simulation timestep (s).
         """
         p = self.params
         wheel.omega_cmd = float(omega_cmd)
-        # Exact solution for J·dω/dt = (K_motor+K_back)·(ω_cmd - ω):
-        #   ω(t+dt) = ω_cmd + (ω - ω_cmd)·exp(-dt/τ)
-        tau = p.J / (p.K_motor + p.K_back)
-        decay = float(np.exp(-dt / tau))
-        new_omega = omega_cmd + (wheel.omega_actual - omega_cmd) * decay
+
+        if self._controller is not None:
+            # Explicit velocity PID path: controller output is motor torque.
+            # Plant: J·dω/dt = torque - K_back·ω
+            torque = self._controller.step(omega_cmd, wheel.omega_actual, dt)
+            dw_dt = (torque - p.K_back * wheel.omega_actual) / p.J
+            new_omega = wheel.omega_actual + dw_dt * dt
+        else:
+            # Exact first-order solution (backward-compatible default):
+            #   ω(t+dt) = ω_cmd + (ω - ω_cmd)·exp(-dt/τ)
+            tau = p.J / (p.K_motor + p.K_back)
+            decay = float(np.exp(-dt / tau))
+            new_omega = omega_cmd + (wheel.omega_actual - omega_cmd) * decay
+
         wheel.omega_actual = float(np.clip(new_omega, -p.omega_max, p.omega_max))
 
 
 class ServoActuator:
-    """Steering-wheel actuator using a 2nd-order PD position controller.
+    """Steering-wheel actuator using a 2nd-order position controller.
 
-    The governing ODE::
+    **Default (no controller)** — PD control via :class:`ServoParams`::
 
         J_s · δ̈ = K_p · (δ_cmd - δ) - (K_d + B_s) · δ̇
 
     is integrated with Euler; angle and rate are clamped to their limits.
 
+    **With explicit controller** — the servo drive's built-in PID loop
+    (e.g., Dynamixel position PID registers) drives the plant::
+
+        force   = controller.step(δ_cmd, δ_actual, dt)   [N·m, PID output]
+        δ̈       = (force - B_s · δ̇) / J_s               [Euler integration]
+
+    Adding ``Ki > 0`` in :class:`ControllerParams` eliminates the small
+    steady-state angular error that appears when the servo holds against
+    an external moment (gravity on a tilted arm, for example).
+
     Args:
-        params: A :class:`ServoParams` instance or a preset name string.
+        params:     :class:`ServoParams` instance or preset name string.
+        controller: Optional :class:`ControllerParams` for the position PID
+                    loop.  ``None`` (default) uses ``K_p``/``K_d`` from
+                    ``params`` directly — identical to the previous behaviour.
     """
 
-    def __init__(self, params: ServoParams | str = "light_servo") -> None:
+    def __init__(
+        self,
+        params: ServoParams | str = "light_servo",
+        controller: ControllerParams | None = None,
+    ) -> None:
         if isinstance(params, str):
             if params not in SERVO_PRESETS:
                 raise ValueError(
@@ -297,21 +550,48 @@ class ServoActuator:
         else:
             self.params = params
 
+        if controller is not None:
+            self._controller: MotorController | None = MotorController(
+                controller, mode=ControlMode.POSITION
+            )
+        else:
+            self._controller = None
+
+    @property
+    def control_mode(self) -> ControlMode:
+        """Active control mode (always ``POSITION`` for a steering actuator)."""
+        return ControlMode.POSITION
+
+    def reset_controller(self) -> None:
+        """Clear the built-in controller's integrator and derivative history."""
+        if self._controller is not None:
+            self._controller.reset()
+
     def step(self, wheel: WheelState, delta_cmd: float, dt: float) -> None:
         """Advance servo state by one timestep.
 
         Args:
-            wheel: Mutable :class:`WheelState` to update in-place.
+            wheel:     Mutable :class:`WheelState` to update in-place.
             delta_cmd: Desired steering angle (rad).
-            dt: Simulation timestep (s).
+            dt:        Simulation timestep (s).
         """
         p = self.params
         delta_cmd = float(np.clip(delta_cmd, p.delta_min, p.delta_max))
         wheel.delta_cmd = delta_cmd
-        tau = (
-            p.K_p * (delta_cmd - wheel.delta_actual) - (p.K_d + p.B_s) * wheel.delta_dot
-        )
-        delta_ddot = tau / p.J_s
+
+        if self._controller is not None:
+            # Explicit position PID: controller drives the plant J_s·δ̈ = force - B_s·δ̇
+            force = self._controller.step(delta_cmd, wheel.delta_actual, dt)
+            delta_ddot = (force - p.B_s * wheel.delta_dot) / p.J_s
+        else:
+            # Default PD from ServoParams (backward-compatible):
+            #   J_s·δ̈ = K_p·(e) - (K_d + B_s)·δ̇
+            force = (
+                p.K_p * (delta_cmd - wheel.delta_actual)
+                - (p.K_d + p.B_s) * wheel.delta_dot
+            )
+            delta_ddot = force / p.J_s
+
         new_dot = float(
             np.clip(wheel.delta_dot + delta_ddot * dt, -p.omega_max, p.omega_max)
         )
@@ -378,6 +658,8 @@ class WheelLayout(ABC):
         motor: DCMotorParams | str = "small_dc",
         servo: ServoParams | str = "light_servo",
         encoder_cpr: int = 0,
+        motor_controller: ControllerParams | None = None,
+        servo_controller: ControllerParams | None = None,
     ) -> None:
         self.wheels: list[WheelState] = []
         self._motor_act: dict[str, DCMotorActuator] = {}
@@ -386,23 +668,25 @@ class WheelLayout(ABC):
         self._motor_params = motor
         self._servo_params = servo
         self._encoder_cpr = encoder_cpr
+        self._motor_controller = motor_controller
+        self._servo_controller = servo_controller
 
     def _add_drive_wheel(self, name: str) -> None:
         ws = WheelState(name=name, role="drive")
         self.wheels.append(ws)
-        self._motor_act[name] = DCMotorActuator(self._motor_params)
+        self._motor_act[name] = DCMotorActuator(self._motor_params, self._motor_controller)
         self._encoders[name] = WheelEncoder(self._encoder_cpr)
 
     def _add_steer_wheel(self, name: str) -> None:
         ws = WheelState(name=name, role="steer")
         self.wheels.append(ws)
-        self._servo_act[name] = ServoActuator(self._servo_params)
+        self._servo_act[name] = ServoActuator(self._servo_params, self._servo_controller)
 
     def _add_drive_steer_wheel(self, name: str) -> None:
         ws = WheelState(name=name, role="drive_steer")
         self.wheels.append(ws)
-        self._motor_act[name] = DCMotorActuator(self._motor_params)
-        self._servo_act[name] = ServoActuator(self._servo_params)
+        self._motor_act[name] = DCMotorActuator(self._motor_params, self._motor_controller)
+        self._servo_act[name] = ServoActuator(self._servo_params, self._servo_controller)
         self._encoders[name] = WheelEncoder(self._encoder_cpr)
 
     @abstractmethod
@@ -458,8 +742,15 @@ class WheelLayout(ABC):
             if w.role in ("drive", "drive_steer")
         }
 
+    def reset_controllers(self) -> None:
+        """Clear integrator and derivative history of all built-in controllers."""
+        for act in self._motor_act.values():
+            act.reset_controller()
+        for act in self._servo_act.values():
+            act.reset_controller()
+
     def reset(self) -> None:
-        """Reset all wheel states to zero."""
+        """Reset all wheel states and controller history to zero."""
         for w in self.wheels:
             w.omega_cmd = 0.0
             w.omega_actual = 0.0
@@ -468,6 +759,7 @@ class WheelLayout(ABC):
             w.delta_actual = 0.0
             w.delta_dot = 0.0
             w.ticks = 0
+        self.reset_controllers()
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +785,9 @@ class DiffWheelLayout(WheelLayout):
         track: float = 0.16,
         motor: DCMotorParams | str = "small_dc",
         encoder_cpr: int = 0,
+        motor_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, encoder_cpr=encoder_cpr)
+        super().__init__(motor=motor, encoder_cpr=encoder_cpr, motor_controller=motor_controller)
         self.wheel_radius = float(wheel_radius)
         self.track = float(track)
         self._add_drive_wheel("left")
@@ -533,8 +826,9 @@ class MecanumWheelLayout(WheelLayout):
         half_width: float = 0.15,
         motor: DCMotorParams | str = "agv_hub_motor",
         encoder_cpr: int = 0,
+        motor_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, encoder_cpr=encoder_cpr)
+        super().__init__(motor=motor, encoder_cpr=encoder_cpr, motor_controller=motor_controller)
         self.wheel_radius = float(wheel_radius)
         self.half_length = float(half_length)
         self.half_width = float(half_width)
@@ -585,8 +879,13 @@ class AckerWheelLayout(WheelLayout):
         motor: DCMotorParams | str = "agv_hub_motor",
         servo: ServoParams | str = "light_servo",
         encoder_cpr: int = 0,
+        motor_controller: ControllerParams | None = None,
+        servo_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, servo=servo, encoder_cpr=encoder_cpr)
+        super().__init__(
+            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller, servo_controller=servo_controller,
+        )
         self.wheel_radius = float(wheel_radius)
         self.wheelbase = float(wheelbase)
         self.track = float(track)
@@ -641,8 +940,13 @@ class ForkiftWheelLayout(WheelLayout):
         motor: DCMotorParams | str = "forklift_drive",
         servo: ServoParams | str = "forklift_steer",
         encoder_cpr: int = 0,
+        motor_controller: ControllerParams | None = None,
+        servo_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, servo=servo, encoder_cpr=encoder_cpr)
+        super().__init__(
+            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller, servo_controller=servo_controller,
+        )
         self.wheel_radius = float(wheel_radius)
         self.half_wheelbase = float(half_wheelbase)
         self.track = float(track)
@@ -699,8 +1003,13 @@ class DualSteerWheelLayout(WheelLayout):
         motor: DCMotorParams | str = "agv_hub_motor",
         servo: ServoParams | str = "agv_servo",
         encoder_cpr: int = 0,
+        motor_controller: ControllerParams | None = None,
+        servo_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, servo=servo, encoder_cpr=encoder_cpr)
+        super().__init__(
+            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller, servo_controller=servo_controller,
+        )
         self.wheel_radius = float(wheel_radius)
         self.half_wheelbase = float(half_wheelbase)
         # body-frame positions [x, y]
@@ -755,8 +1064,13 @@ class QuadSteerWheelLayout(WheelLayout):
         motor: DCMotorParams | str = "agv_hub_motor",
         servo: ServoParams | str = "swerve_module",
         encoder_cpr: int = 0,
+        motor_controller: ControllerParams | None = None,
+        servo_controller: ControllerParams | None = None,
     ) -> None:
-        super().__init__(motor=motor, servo=servo, encoder_cpr=encoder_cpr)
+        super().__init__(
+            motor=motor, servo=servo, encoder_cpr=encoder_cpr,
+            motor_controller=motor_controller, servo_controller=servo_controller,
+        )
         self.wheel_radius = float(wheel_radius)
         self.half_length = float(half_length)
         self.half_width = float(half_width)

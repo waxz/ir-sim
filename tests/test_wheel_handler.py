@@ -30,14 +30,19 @@ from irsim.lib.algorithm.wheel_kinematics import (
 )
 from irsim.lib.handler.wheel_handler import (
     MOTOR_PRESETS,
+    POSITION_CONTROLLER_PRESETS,
     SERVO_PRESETS,
+    VELOCITY_CONTROLLER_PRESETS,
     AckerWheelLayout,
+    ControllerParams,
+    ControlMode,
     DCMotorActuator,
     DCMotorParams,
     DiffWheelLayout,
     DualSteerWheelLayout,
     ForkiftWheelLayout,
     MecanumWheelLayout,
+    MotorController,
     QuadSteerWheelLayout,
     ServoActuator,
     ServoParams,
@@ -388,3 +393,203 @@ def test_mecanum_layout_has_four_wheels():
     layout = MecanumWheelLayout()
     states = layout.get_wheel_states()
     assert set(states.keys()) == {"FL", "FR", "RL", "RR"}
+
+
+# ---------------------------------------------------------------------------
+# ControlMode / ControllerParams / MotorController
+# ---------------------------------------------------------------------------
+
+
+def test_control_mode_values():
+    """ControlMode has the three standard string values."""
+    assert ControlMode.VELOCITY == "velocity"
+    assert ControlMode.POSITION == "position"
+    assert ControlMode.TORQUE == "torque"
+
+
+def test_controller_params_defaults():
+    """ControllerParams default Kp=1, Ki=Kd=0, unlimited limits."""
+    p = ControllerParams()
+    assert p.Kp == 1.0
+    assert p.Ki == 0.0
+    assert p.Kd == 0.0
+    assert p.i_limit == float("inf")
+    assert p.output_limit == float("inf")
+
+
+def test_motor_controller_p_only():
+    """P-only MotorController produces Kp * error output."""
+    ctrl = MotorController(ControllerParams(Kp=2.0), mode=ControlMode.VELOCITY)
+    out = ctrl.step(setpoint=5.0, measurement=3.0, dt=0.01)
+    assert out == pytest.approx(4.0)  # 2.0 * (5-3)
+
+
+def test_motor_controller_integral_accumulates():
+    """Integral term accumulates over multiple steps."""
+    ctrl = MotorController(ControllerParams(Kp=0.0, Ki=1.0), mode=ControlMode.VELOCITY)
+    ctrl.step(1.0, 0.0, 0.1)  # integral += 1.0 * 0.1 = 0.1
+    ctrl.step(1.0, 0.0, 0.1)  # integral += 1.0 * 0.1 = 0.2
+    assert ctrl.integral == pytest.approx(0.2, abs=1e-10)
+
+
+def test_motor_controller_anti_windup():
+    """Integrator clamps to i_limit."""
+    ctrl = MotorController(
+        ControllerParams(Kp=0.0, Ki=10.0, i_limit=0.5), mode=ControlMode.VELOCITY
+    )
+    for _ in range(100):
+        ctrl.step(1.0, 0.0, 0.1)
+    assert abs(ctrl.integral) <= 0.5 + 1e-9
+
+
+def test_motor_controller_output_clamp():
+    """Output is clamped to output_limit."""
+    ctrl = MotorController(
+        ControllerParams(Kp=100.0, output_limit=3.0), mode=ControlMode.VELOCITY
+    )
+    out = ctrl.step(1.0, 0.0, 0.01)
+    assert abs(out) <= 3.0 + 1e-9
+
+
+def test_motor_controller_reset():
+    """reset() clears integrator and derivative state."""
+    ctrl = MotorController(ControllerParams(Kp=0.0, Ki=1.0), mode=ControlMode.VELOCITY)
+    ctrl.step(1.0, 0.0, 0.1)
+    ctrl.reset()
+    assert ctrl.integral == 0.0
+
+
+def test_motor_controller_derivative_zero_first_step():
+    """Derivative term is zero on the first call (no spike)."""
+    ctrl = MotorController(ControllerParams(Kp=0.0, Kd=100.0), mode=ControlMode.VELOCITY)
+    out = ctrl.step(1.0, 0.0, 0.01)
+    assert out == pytest.approx(0.0)
+
+
+def test_velocity_controller_presets_keys():
+    """VELOCITY_CONTROLLER_PRESETS has an entry for every MOTOR_PRESETS key."""
+    for key in MOTOR_PRESETS:
+        assert key in VELOCITY_CONTROLLER_PRESETS, f"Missing velocity preset for {key!r}"
+
+
+def test_position_controller_presets_keys():
+    """POSITION_CONTROLLER_PRESETS has an entry for every SERVO_PRESETS key."""
+    for key in SERVO_PRESETS:
+        assert key in POSITION_CONTROLLER_PRESETS, f"Missing position preset for {key!r}"
+
+
+# ---------------------------------------------------------------------------
+# DCMotorActuator with explicit controller
+# ---------------------------------------------------------------------------
+
+
+def test_dc_motor_actuator_explicit_controller_p_steady_state():
+    """P-only controller reaches ω_ss = Kp*cmd/(Kp+K_back) (back-EMF limits steady state)."""
+    params = DCMotorParams(J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0)
+    ctrl_p = ControllerParams(Kp=0.065, Ki=0.0, output_limit=5.0)
+    act = DCMotorActuator(params, controller=ctrl_p)
+    wheel = WheelState(name="test", role="drive")
+    # Run well past 5τ (τ = J/(Kp+K_back) = 5e-3/0.1 = 50 ms → 500 steps)
+    for _ in range(1000):
+        act.step(wheel, 20.0, 0.001)
+    # Expected steady state: ω_ss = Kp*cmd/(Kp+K_back) = 0.065*20/0.1 = 13 rad/s
+    omega_ss_expected = 0.065 * 20.0 / (0.065 + 0.035)
+    assert wheel.omega_actual == pytest.approx(omega_ss_expected, abs=0.1)
+
+
+def test_dc_motor_actuator_pi_controller_eliminates_offset():
+    """PI controller drives ω_actual → ω_cmd (integral eliminates back-EMF offset)."""
+    params = DCMotorParams(J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0)
+    # P-only — has steady-state error proportional to K_back
+    p_ctrl = ControllerParams(Kp=0.065, Ki=0.0, output_limit=3.0)
+    act_p = DCMotorActuator(params, controller=p_ctrl)
+    wheel_p = WheelState(name="p", role="drive")
+    # PI — integral eliminates the back-EMF steady-state error
+    pi_ctrl = ControllerParams(Kp=0.065, Ki=0.5, i_limit=2.0, output_limit=3.0)
+    act_pi = DCMotorActuator(params, controller=pi_ctrl)
+    wheel_pi = WheelState(name="pi", role="drive")
+    # Run 2 seconds at 1 ms step
+    for _ in range(2000):
+        act_p.step(wheel_p, 10.0, 0.001)
+        act_pi.step(wheel_pi, 10.0, 0.001)
+    err_p = abs(wheel_p.omega_actual - 10.0)
+    err_pi = abs(wheel_pi.omega_actual - 10.0)
+    assert err_pi < err_p, f"PI error {err_pi:.4f} should be less than P error {err_p:.4f}"
+
+
+def test_dc_motor_actuator_control_mode_property():
+    """control_mode is always VELOCITY for DCMotorActuator."""
+    act = DCMotorActuator("small_dc")
+    assert act.control_mode == ControlMode.VELOCITY
+
+
+def test_dc_motor_actuator_reset_controller_noop_when_none():
+    """reset_controller() does not raise when no explicit controller set."""
+    act = DCMotorActuator("small_dc")
+    act.reset_controller()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# ServoActuator with explicit controller
+# ---------------------------------------------------------------------------
+
+
+def test_servo_actuator_explicit_controller_converges():
+    """ServoActuator with explicit PD controller reaches target angle."""
+    ctrl_pd = ControllerParams(Kp=4.0, Kd=0.8, output_limit=50.0)
+    act = ServoActuator("light_servo", controller=ctrl_pd)
+    wheel = WheelState(name="test", role="steer")
+    for _ in range(2000):
+        act.step(wheel, 0.5, 0.001)
+    assert wheel.delta_actual == pytest.approx(0.5, abs=0.05)
+
+
+def test_servo_actuator_control_mode_property():
+    """control_mode is always POSITION for ServoActuator."""
+    act = ServoActuator("light_servo")
+    assert act.control_mode == ControlMode.POSITION
+
+
+def test_servo_actuator_pid_integral_state():
+    """ServoActuator with Ki > 0 accumulates integral state."""
+    ctrl_pid = ControllerParams(Kp=4.0, Ki=1.0, Kd=0.8, i_limit=5.0)
+    act = ServoActuator("light_servo", controller=ctrl_pid)
+    assert act._controller is not None
+    wheel = WheelState(name="test", role="steer")
+    for _ in range(100):
+        act.step(wheel, 0.3, 0.01)
+    # Integral should be non-zero after tracking a non-zero setpoint
+    assert act._controller.integral != 0.0
+
+
+# ---------------------------------------------------------------------------
+# WheelLayout with motor_controller / servo_controller
+# ---------------------------------------------------------------------------
+
+
+def test_diff_layout_with_motor_controller():
+    """DiffWheelLayout accepts motor_controller and passes it to actuators."""
+    ctrl = ControllerParams(Kp=0.065, Ki=0.01, i_limit=0.5, output_limit=2.0)
+    layout = DiffWheelLayout(motor_controller=ctrl)
+    vel = np.array([[0.5], [0.0]])
+    for _ in range(50):
+        layout.step(vel, 0.01)
+    # Both actuators should have a MotorController attached
+    for act in layout._motor_act.values():
+        assert act._controller is not None
+
+
+def test_layout_reset_clears_controller_state():
+    """layout.reset() clears controller integrator state."""
+    ctrl = ControllerParams(Kp=0.065, Ki=1.0, i_limit=10.0, output_limit=5.0)
+    layout = DiffWheelLayout(motor_controller=ctrl)
+    vel = np.array([[1.0], [0.0]])
+    for _ in range(200):
+        layout.step(vel, 0.01)
+    # Integrators should be non-zero
+    for act in layout._motor_act.values():
+        assert act._controller is not None
+    layout.reset()
+    for act in layout._motor_act.values():
+        assert act._controller is not None
+        assert act._controller.integral == 0.0
