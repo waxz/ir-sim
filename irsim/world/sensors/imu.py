@@ -35,6 +35,12 @@ class IMU:
         accel_bias_walk_std (float): Accelerometer bias random-walk rate (m/s²/√s).
         step_time (float): Simulation step time in seconds.
         noise (bool): Enable noise and bias. Set False for ground-truth output.
+        shock_prob (float): Per-step probability of an impulsive shock event
+            (0.0 = none). Models wheel bumps on uneven terrain or collisions.
+        shock_accel_std (float): Standard deviation of the impulsive acceleration
+            spike (m/s²) when a shock event fires.
+        shock_gyro_std (float): Standard deviation of the impulsive angular-rate
+            spike (rad/s) when a shock event fires.
         **kwargs: Ignored extra keyword arguments passed by SensorFactory.
 
     Attr:
@@ -104,6 +110,9 @@ class IMU:
         step_time: float = 0.001,
         noise: bool = True,
         profile: str | None = None,
+        shock_prob: float = 0.0,
+        shock_accel_std: float = 5.0,
+        shock_gyro_std: float = 0.5,
         **kwargs,
     ) -> None:
         self.sensor_type = "imu"
@@ -129,6 +138,10 @@ class IMU:
         # Bias random-walk rate
         self._K_g = gyro_bias_walk_std
         self._K_a = accel_bias_walk_std
+        # Impulsive shock model (mobile robot bumping on uneven terrain)
+        self._shock_prob = float(shock_prob)
+        self._shock_accel_std = float(shock_accel_std)
+        self._shock_gyro_std = float(shock_gyro_std)
 
         # Running bias state
         self.gyro_bias: float = 0.0
@@ -193,6 +206,11 @@ class IMU:
                 omega_true + self.gyro_bias + sigma_g * float(rng.standard_normal())
             )
             accel_meas = accel_body + self.accel_bias + sigma_a * rng.standard_normal(2)
+
+            # Impulsive shock (bump / collision)
+            if self._shock_prob > 0.0 and float(rng.random()) < self._shock_prob:
+                accel_meas += self._shock_accel_std * rng.standard_normal(2)
+                omega_meas += self._shock_gyro_std * float(rng.standard_normal())
         else:
             omega_meas = omega_true
             accel_meas = accel_body
