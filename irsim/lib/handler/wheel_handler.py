@@ -36,10 +36,17 @@ gains as tunable registers separate from the motor physics.  The optional
 ``MotorController`` class models this layer:
 
 - ``ControlMode``: ``VELOCITY``, ``POSITION``, or ``TORQUE`` operating mode.
-- ``ControllerParams``: PID gains (Kp, Ki, Kd) plus anti-windup and output
-  limits — equivalent to the gain registers in a real drive.
-- ``MotorController``: stateful PID with anti-windup.  Passed as ``controller=``
-  to either actuator to replace the implicit P/PD with an explicit PID loop.
+- ``ControllerParams``: PID gains (Kp, Ki, Kd) plus feedforward gains (Kff,
+  Kff_acc) and anti-windup / output limits — equivalent to the gain registers
+  in a real drive.
+- ``MotorController``: stateful PID + feedforward.  Passed as ``controller=``
+  to either actuator to replace the implicit P/PD with an explicit loop.
+
+Feedforward reduces tracking error at its source:
+
+- ``Kff = K_back``: cancels back-EMF; zero steady-state droop with P-only.
+- ``Kff_acc = J``: pre-injects inertial torque during ramps; tracking lag
+  drops from ``tau * alpha`` to near zero (alpha = d(omega)/dt of profile).
 
 Named presets
 -------------
@@ -255,6 +262,14 @@ class ControllerParams:
         Ki: Integral gain (0 = P/PD only; add to eliminate steady-state error
             under constant load or gravity).
         Kd: Derivative gain.
+        Kff: Velocity feedforward gain (N·m·s/rad).  Set to the motor's
+            ``K_back`` value to cancel back-EMF at the setpoint, eliminating
+            steady-state droop with P-only control (EPOS4 "Velocity FF Gain";
+            Dynamixel "Feedforward 2nd Gain").
+        Kff_acc: Acceleration feedforward gain (N·m·s²/rad ≈ effective inertia
+            J).  Pre-injects the inertial torque needed to follow a ramp
+            command, reducing ramp tracking lag to near zero.  Matches the
+            "Feedforward 1st Gain" register on Dynamixel XL430.
         i_limit: Anti-windup clamp on the integrator state (same units as
             ``Kp * error``).  ``inf`` means unlimited.
         output_limit: Hard clamp on total controller output magnitude.
@@ -263,6 +278,8 @@ class ControllerParams:
     Kp: float = 1.0
     Ki: float = 0.0
     Kd: float = 0.0
+    Kff: float = 0.0
+    Kff_acc: float = 0.0
     i_limit: float = float("inf")
     output_limit: float = float("inf")
 
@@ -295,13 +312,33 @@ class MotorController:
         self._prev_error: float = 0.0
         self._initialized: bool = False
 
-    def step(self, setpoint: float, measurement: float, dt: float) -> float:
-        """Compute one PID step.
+    def step(
+        self,
+        setpoint: float,
+        measurement: float,
+        dt: float,
+        setpoint_rate: float = 0.0,
+    ) -> float:
+        """Compute one PID + feedforward step.
+
+        The feedforward path pre-computes the torque the plant needs and leaves
+        the PID loop to correct only model mismatch and disturbances::
+
+            u = Kff * setpoint + Kff_acc * setpoint_rate
+              + Kp * e + Ki * integral(e) + Kd * de/dt
+
+        With ``Kff = K_back`` the back-EMF droop is cancelled at steady state,
+        giving zero error even with ``Ki = 0``.  Adding ``Kff_acc = J`` also
+        pre-injects the inertial torque during ramps, reducing ramp lag to
+        near zero.
 
         Args:
-            setpoint:    Target value (rad/s for velocity; rad for position).
-            measurement: Current measured value.
-            dt:          Timestep (s).
+            setpoint:      Target value (rad/s for velocity; rad for position).
+            measurement:   Current measured value.
+            dt:            Timestep (s).
+            setpoint_rate: Rate of change of the setpoint (rad/s² for velocity
+                           mode).  Used by the acceleration feedforward term.
+                           Pass 0.0 (default) if unknown or for step inputs.
 
         Returns:
             Controller output.  For velocity/torque mode this is a torque
@@ -311,6 +348,8 @@ class MotorController:
         """
         p = self.params
         error = setpoint - measurement
+        # Model-inversion feedforward (velocity + acceleration)
+        ff_term = p.Kff * setpoint + p.Kff_acc * setpoint_rate
         # Integrator with symmetric anti-windup clamp
         self._integral = float(
             np.clip(self._integral + error * dt, -p.i_limit, p.i_limit)
@@ -322,7 +361,7 @@ class MotorController:
         else:
             d_term = p.Kd * (error - self._prev_error) / dt
         self._prev_error = error
-        output = p.Kp * error + p.Ki * self._integral + d_term
+        output = ff_term + p.Kp * error + p.Ki * self._integral + d_term
         return float(np.clip(output, -p.output_limit, p.output_limit))
 
     def reset(self) -> None:
@@ -345,26 +384,35 @@ class MotorController:
 # (max torque the drive can command at full speed).
 
 VELOCITY_CONTROLLER_PRESETS: dict[str, ControllerParams] = {
+    # Feedforward gains: Kff = K_back (back-EMF cancellation, eliminates
+    # steady-state droop with P-only), Kff_acc = J (inertia pre-compensation,
+    # reduces ramp tracking lag to near zero).
     "small_dc": ControllerParams(
         Kp=0.065,
         Ki=0.010,
+        Kff=0.035,    # K_back of small_dc
+        Kff_acc=5e-3, # J of small_dc
         i_limit=0.5,
         output_limit=2.0,
-        # small_dc: (0.065+0.035)*20 = 2.0 N·m ceiling
+        # small_dc: (0.065+0.035)*20 = 2.0 N*m ceiling
     ),
     "agv_hub_motor": ControllerParams(
         Kp=0.130,
         Ki=0.015,
+        Kff=0.07,     # K_back of agv_hub_motor
+        Kff_acc=3e-2, # J of agv_hub_motor
         i_limit=1.0,
         output_limit=1.6,
-        # agv_hub: (0.13+0.07)*8 = 1.6 N·m
+        # agv_hub: (0.13+0.07)*8 = 1.6 N*m
     ),
     "forklift_drive": ControllerParams(
         Kp=1.100,
         Ki=0.050,
+        Kff=0.57,     # K_back of forklift_drive
+        Kff_acc=5e-1, # J of forklift_drive
         i_limit=4.0,
         output_limit=6.7,
-        # forklift: (1.10+0.57)*4 = 6.68 N·m
+        # forklift: (1.10+0.57)*4 = 6.68 N*m
     ),
 }
 
@@ -472,6 +520,8 @@ class DCMotorActuator:
             )
         else:
             self._controller = None
+        # Tracks previous command for computing dω_cmd/dt (acceleration FF)
+        self._prev_omega_cmd: float | None = None
 
     @property
     def control_mode(self) -> ControlMode:
@@ -479,9 +529,10 @@ class DCMotorActuator:
         return ControlMode.VELOCITY
 
     def reset_controller(self) -> None:
-        """Clear the built-in controller's integrator and derivative history."""
+        """Clear the built-in controller's integrator, derivative, and FF history."""
         if self._controller is not None:
             self._controller.reset()
+        self._prev_omega_cmd = None
 
     def step(self, wheel: WheelState, omega_cmd: float, dt: float) -> None:
         """Advance motor state by one timestep.
@@ -495,9 +546,15 @@ class DCMotorActuator:
         wheel.omega_cmd = float(omega_cmd)
 
         if self._controller is not None:
-            # Explicit velocity PID path: controller output is motor torque.
+            # Compute dω_cmd/dt for the acceleration feedforward term.
+            if self._prev_omega_cmd is not None and dt > 0.0:
+                cmd_rate = (omega_cmd - self._prev_omega_cmd) / dt
+            else:
+                cmd_rate = 0.0
+            self._prev_omega_cmd = float(omega_cmd)
+            # Explicit velocity PID + FF path: controller output is motor torque.
             # Plant: J·dω/dt = torque - K_back·ω
-            torque = self._controller.step(omega_cmd, wheel.omega_actual, dt)
+            torque = self._controller.step(omega_cmd, wheel.omega_actual, dt, cmd_rate)
             dw_dt = (torque - p.K_back * wheel.omega_actual) / p.J
             new_omega = wheel.omega_actual + dw_dt * dt
         else:

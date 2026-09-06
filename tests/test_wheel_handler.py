@@ -408,11 +408,13 @@ def test_control_mode_values():
 
 
 def test_controller_params_defaults():
-    """ControllerParams default Kp=1, Ki=Kd=0, unlimited limits."""
+    """ControllerParams default Kp=1, Ki=Kd=Kff=Kff_acc=0, unlimited limits."""
     p = ControllerParams()
     assert p.Kp == 1.0
     assert p.Ki == 0.0
     assert p.Kd == 0.0
+    assert p.Kff == 0.0
+    assert p.Kff_acc == 0.0
     assert p.i_limit == float("inf")
     assert p.output_limit == float("inf")
 
@@ -466,10 +468,79 @@ def test_motor_controller_derivative_zero_first_step():
     assert out == pytest.approx(0.0)
 
 
+def test_motor_controller_velocity_feedforward():
+    """Kff * setpoint is added to the output (velocity feedforward)."""
+    ctrl = MotorController(ControllerParams(Kp=0.0, Kff=2.0), mode=ControlMode.VELOCITY)
+    out = ctrl.step(setpoint=5.0, measurement=5.0, dt=0.01)  # error=0, FF=2*5=10
+    assert out == pytest.approx(10.0)
+
+
+def test_motor_controller_acceleration_feedforward():
+    """Kff_acc * setpoint_rate is added to the output (acceleration feedforward)."""
+    ctrl = MotorController(ControllerParams(Kp=0.0, Kff_acc=0.5), mode=ControlMode.VELOCITY)
+    out = ctrl.step(setpoint=0.0, measurement=0.0, dt=0.01, setpoint_rate=4.0)
+    assert out == pytest.approx(2.0)  # 0.5 * 4.0
+
+
+def test_motor_controller_ff_cancels_back_emf():
+    """Kff = K_back achieves zero steady-state error with P-only (no integral needed)."""
+    J, K_back = 5e-3, 0.035
+    params = DCMotorParams(J=J, K_motor=0.065, K_back=K_back, omega_max=20.0)
+    # P-only with back-EMF feedforward — ω_ss should approach ω_cmd
+    ctrl_ff = ControllerParams(Kp=0.065, Ki=0.0, Kff=K_back, output_limit=5.0)
+    act = DCMotorActuator(params, controller=ctrl_ff)
+    wheel = WheelState(name="test", role="drive")
+    for _ in range(2000):
+        act.step(wheel, 20.0, 0.001)
+    # With feedforward, error should be near zero (< 1% of cmd)
+    assert abs(wheel.omega_actual - 20.0) < 0.2
+
+
+def test_motor_controller_ff_reduces_ramp_lag():
+    """Acceleration feedforward reduces ramp-tracking error vs. P-only with no FF."""
+    J, K_back = 3e-2, 0.07
+    params = DCMotorParams(J=J, K_motor=0.13, K_back=K_back, omega_max=8.0)
+    tau = J / (params.K_motor + K_back)
+    ramp_rate = 8.0 / (3 * tau)  # same ramp as the report (omega_max over 3*tau)
+
+    ctrl_no_ff = ControllerParams(Kp=0.13, Ki=0.0, Kff=0.0, Kff_acc=0.0, output_limit=3.0)
+    ctrl_ff = ControllerParams(Kp=0.13, Ki=0.0, Kff=K_back, Kff_acc=J, output_limit=3.0)
+
+    act_no_ff = DCMotorActuator(params, controller=ctrl_no_ff)
+    act_ff = DCMotorActuator(params, controller=ctrl_ff)
+    w_no_ff = WheelState(name="a", role="drive")
+    w_ff = WheelState(name="b", role="drive")
+
+    dt = 0.001
+    t_ramp = 3 * tau
+    errors_no_ff, errors_ff = [], []
+    t = 0.0
+    while t < t_ramp:
+        cmd = min(ramp_rate * t, 8.0)
+        act_no_ff.step(w_no_ff, cmd, dt)
+        act_ff.step(w_ff, cmd, dt)
+        errors_no_ff.append(abs(cmd - w_no_ff.omega_actual))
+        errors_ff.append(abs(cmd - w_ff.omega_actual))
+        t += dt
+
+    rms_no_ff = (sum(e**2 for e in errors_no_ff) / len(errors_no_ff)) ** 0.5
+    rms_ff = (sum(e**2 for e in errors_ff) / len(errors_ff)) ** 0.5
+    assert rms_ff < rms_no_ff * 0.5, (
+        f"FF ramp RMS {rms_ff:.3f} should be <50% of no-FF {rms_no_ff:.3f}"
+    )
+
+
 def test_velocity_controller_presets_keys():
     """VELOCITY_CONTROLLER_PRESETS has an entry for every MOTOR_PRESETS key."""
     for key in MOTOR_PRESETS:
         assert key in VELOCITY_CONTROLLER_PRESETS, f"Missing velocity preset for {key!r}"
+
+
+def test_velocity_controller_presets_have_feedforward():
+    """Every velocity controller preset has nonzero Kff and Kff_acc."""
+    for key, params in VELOCITY_CONTROLLER_PRESETS.items():
+        assert params.Kff > 0, f"{key}: Kff should be nonzero"
+        assert params.Kff_acc > 0, f"{key}: Kff_acc should be nonzero"
 
 
 def test_position_controller_presets_keys():
