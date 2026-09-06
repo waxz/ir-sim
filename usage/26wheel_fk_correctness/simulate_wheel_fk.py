@@ -13,7 +13,7 @@ Sources of FK error (both present in a real system):
   1. Encoder quantisation  -- omega_est has +-1-tick uncertainty per step.
   2. Hold-constant approximation -- omega is sampled once per dt interval;
      any intra-interval change creates a small prediction error.
-  3. DC motor lag -- tau=100ms motor does not track step changes instantly.
+  3. DC motor lag -- τ=50 ms (diff), 150 ms (mecanum/acker/swerve), 300 ms (forklift).
   4. Servo phase lag (steer models) -- actual steer angle lags commanded angle.
 
 Command tracking error (separate metric): distance between the commanded
@@ -46,7 +46,6 @@ from irsim.lib.algorithm.kinematics import (
 from irsim.lib.algorithm.wheel_kinematics import diff_fwd_kin, mecanum_fwd_kin
 from irsim.lib.handler.wheel_handler import (
     AckerWheelLayout,
-    DCMotorParams,
     DiffWheelLayout,
     DualSteerWheelLayout,
     ForkiftWheelLayout,
@@ -54,18 +53,16 @@ from irsim.lib.handler.wheel_handler import (
     QuadSteerWheelLayout,
 )
 
-DT = 0.01  # 10 ms simulation step
+DT = 0.01  # 10 ms step — motor control loop & encoder topic rate (100 Hz, ROS-typical)
+# Note: raw encoder hardware runs at kHz; motor FOC at 1 kHz; this is the FK update rate.
 T_DRIVE = 10.0  # period (s) for drive-only models
 T_STEER = 40.0  # period (s) for steered models >> servo settling time (0.4-1.5 s)
 N_STEPS_DRIVE = int(T_DRIVE / DT)
 N_STEPS_STEER = int(T_STEER / DT)
 
-RAD_PER_TICK_1024 = 2.0 * math.pi / 1024  # diff / mecanum
-RAD_PER_TICK_512 = 2.0 * math.pi / 512  # acker / forklift / swerve
-
-# DC motor with tau=100ms -- visible tracking lag at T=10s trajectories.
-# tau = J / (K_motor + K_back) = 0.1 / 1.0 = 0.1 s
-SLOW_MOTOR = DCMotorParams(J=0.1, K_motor=0.5, K_back=0.5, omega_max=30.0)
+# 4096 CPR -- Dynamixel XL430-W250 / AMT102 class (12-bit magnetic/optical encoder).
+# The 32-bit MCU counter wraps at ±2^31 ticks (~524 k revolutions at 4096 CPR).
+RAD_PER_TICK = 2.0 * math.pi / 4096
 
 
 def make_vel(*vals: float) -> np.ndarray:
@@ -96,10 +93,9 @@ def run_diff() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, TRACK = 0.033, 0.16
     V_MAX, OM_MAX = 0.5, 0.5
-    RAD_PER_TICK = RAD_PER_TICK_1024
 
     layout = DiffWheelLayout(
-        wheel_radius=R, track=TRACK, motor=SLOW_MOTOR, encoder_cpr=1024
+        wheel_radius=R, track=TRACK, motor="small_dc", encoder_cpr=4096
     )
     gt_state = np.zeros((3, 1))  # commanded trajectory
     fk_state = np.zeros((3, 1))  # FK from quantised encoder
@@ -182,14 +178,13 @@ def run_mecanum() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, HL, HW = 0.05, 0.15, 0.15
     VX_MAX, VY_MAX, OMZ_MAX = 0.20, 0.08, 0.18
-    RAD_PER_TICK = RAD_PER_TICK_1024
 
     layout = MecanumWheelLayout(
         wheel_radius=R,
         half_length=HL,
         half_width=HW,
-        motor=SLOW_MOTOR,
-        encoder_cpr=1024,
+        motor="agv_hub_motor",
+        encoder_cpr=4096,
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))
@@ -279,10 +274,9 @@ def run_acker() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, WB, TRACK = 0.15, 1.0, 0.5
     V_MAX, PSI_MAX = 1.0, 0.30
-    RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = AckerWheelLayout(
-        wheel_radius=R, wheelbase=WB, track=TRACK, motor=SLOW_MOTOR, encoder_cpr=512
+        wheel_radius=R, wheelbase=WB, track=TRACK, motor="agv_hub_motor", encoder_cpr=4096
     )
     gt_state = np.zeros((4, 1))
     fk_state = np.zeros((4, 1))
@@ -382,14 +376,13 @@ def run_forklift() -> dict:
     T, N = T_DRIVE, N_STEPS_DRIVE
     R, HWB, TRACK = 0.15, 0.6, 0.5
     V_CONST, OM_MAX = 0.28, 0.35
-    RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = ForkiftWheelLayout(
         wheel_radius=R,
         half_wheelbase=HWB,
         track=TRACK,
-        motor=SLOW_MOTOR,
-        encoder_cpr=512,
+        motor="forklift_drive",
+        encoder_cpr=4096,
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))
@@ -476,10 +469,9 @@ def run_dual_steer() -> dict:
     T, N = T_STEER, N_STEPS_STEER
     R, HWB = 0.10, 0.4
     V_MAX, PSI_MAX = 0.50, 0.60
-    RAD_PER_TICK = RAD_PER_TICK_512
 
     layout = DualSteerWheelLayout(
-        wheel_radius=R, half_wheelbase=HWB, motor=SLOW_MOTOR, encoder_cpr=512
+        wheel_radius=R, half_wheelbase=HWB, motor="agv_hub_motor", encoder_cpr=4096
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))
@@ -579,12 +571,11 @@ def run_quad_steer() -> dict:
     T, N = T_STEER, N_STEPS_STEER
     R, HL, HW = 0.05, 0.15, 0.15
     V_MAX, PSI_MAX = 0.50, 0.60
-    RAD_PER_TICK = RAD_PER_TICK_512
 
     names = ["FL", "FR", "RL", "RR"]
 
     layout = QuadSteerWheelLayout(
-        wheel_radius=R, half_length=HL, half_width=HW, motor=SLOW_MOTOR, encoder_cpr=512
+        wheel_radius=R, half_length=HL, half_width=HW, motor="small_dc", encoder_cpr=4096
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))

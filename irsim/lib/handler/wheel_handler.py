@@ -128,15 +128,23 @@ class ServoParams:
 
 
 # ── Named motor presets ──────────────────────────────────────────────────────
-# Parameters chosen to give realistic closed-loop time constants:
-#   small_dc     → τ ≈ 0.05 s  (lightweight diff robot, e.g. TurtleBot class)
-#   agv_hub_motor→ τ ≈ 0.15 s  (AMR/AGV hub motor, 500 W class)
-#   forklift_drive→ τ ≈ 0.30 s (heavy AGV/forklift, high-inertia drivetrain)
+# Parameters are set at the wheel shaft after any gearbox.
+# Time constant τ = J / (K_motor + K_back):
+#
+#   small_dc      → τ = 5e-3 / (0.065+0.035) = 0.050 s  (50 ms)
+#     Matches Dynamixel XL430-W250 class (TurtleBot3 Burger).  J reflects
+#     motor rotor inertia through ~200:1 gearbox plus 33 mm wheel.
+#
+#   agv_hub_motor → τ = 3e-2 / (0.13+0.07)   = 0.150 s  (150 ms)
+#     Matches 250 W BLDC hub motor, 150 mm radius wheel, ~3 kg.
+#
+#   forklift_drive→ τ = 5e-1 / (1.10+0.57)   ≈ 0.300 s  (300 ms)
+#     Heavy AGV / counterbalance forklift: large tyre + chain-drive inertia.
 
 MOTOR_PRESETS: dict[str, DCMotorParams] = {
-    "small_dc": DCMotorParams(J=2e-4, K_motor=2.5, K_back=1.5, omega_max=20.0),
-    "agv_hub_motor": DCMotorParams(J=1e-2, K_motor=40.0, K_back=27.0, omega_max=8.0),
-    "forklift_drive": DCMotorParams(J=5e-2, K_motor=100.0, K_back=67.0, omega_max=4.0),
+    "small_dc": DCMotorParams(J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0),
+    "agv_hub_motor": DCMotorParams(J=3e-2, K_motor=0.13, K_back=0.07, omega_max=8.0),
+    "forklift_drive": DCMotorParams(J=5e-1, K_motor=1.10, K_back=0.57, omega_max=4.0),
 }
 
 # ── Named servo presets ──────────────────────────────────────────────────────
@@ -204,7 +212,8 @@ class WheelState:
         delta_cmd: Commanded steering angle (rad); steer/drive_steer only.
         delta_actual: Actual steering angle after servo lag (rad).
         delta_dot: Steering angular rate (rad/s); internal servo state.
-        ticks: Quantised encoder tick count (0 when cpr=0).
+        ticks: Quantised encoder tick count, wrapped to int32 range to simulate
+            a 32-bit MCU hardware counter (0 when cpr=0).
     """
 
     name: str
@@ -342,7 +351,8 @@ class WheelEncoder:
         """
         wheel.theta_enc += wheel.omega_actual * dt
         if self.cpr > 0:
-            wheel.ticks = round(wheel.theta_enc * self._ticks_per_rad)
+            # Wrap to int32 range to simulate 32-bit hardware counter overflow.
+            wheel.ticks = int(np.int32(round(wheel.theta_enc * self._ticks_per_rad)))
 
 
 # ---------------------------------------------------------------------------

@@ -7,10 +7,12 @@ Each test:
   3. Checks that motor/servo responses track their commands within tolerance.
   4. Verifies encoder accumulation matches integrated omega_actual.
 
-Motor time-constants are all < 1 ms, so at dt=0.01 s motors are effectively
-ideal; the tolerance for trajectory convergence reflects only floating-point
-accumulation.  Servos have settling times of 0.5-1.5 s and introduce real
-trajectory lag during the turning phase.
+Motor time-constants match realistic hardware presets (50 ms for small_dc,
+150 ms for agv_hub_motor, 300 ms for forklift_drive).  The initial velocity
+step creates a transient position offset of roughly τ·v_cmd that persists even
+after the motor settles; trajectory tests account for this.  Servos have
+settling times of 0.5-1.5 s and introduce real trajectory lag during the
+turning phase.
 """
 
 from __future__ import annotations
@@ -126,13 +128,15 @@ class TestDiffCorrectness:
         assert enc["left"]["theta_enc"] == pytest.approx(manual_theta, rel=1e-9)
 
     def test_fk_trajectory_matches_gt_straight(self):
-        """FK-reconstructed trajectory matches ground truth during straight phase."""
+        """FK trajectory error at end of straight phase ≤ τ·v (motor transient offset).
+
+        small_dc τ=50ms, v=0.5 m/s → expected offset ≈ τ·v = 25 mm.  Accept < 30 mm.
+        """
         data = self._simulate()
         gt = data["gt"][N_STRAIGHT - 1]
         fk = data["fk"][N_STRAIGHT - 1]
-        # Negligible error (motors ideal at this dt)
-        assert abs(float(fk[0, 0]) - float(gt[0, 0])) < 0.001, "x mismatch"
-        assert abs(float(fk[1, 0]) - float(gt[1, 0])) < 0.001, "y mismatch"
+        assert abs(float(fk[0, 0]) - float(gt[0, 0])) < 0.030, "x mismatch"
+        assert abs(float(fk[1, 0]) - float(gt[1, 0])) < 0.030, "y mismatch"
 
     def test_fk_trajectory_reasonable_during_turn(self):
         """FK trajectory stays within 5 cm of ground truth at end of turn phase."""
@@ -228,7 +232,10 @@ class TestMecanumCorrectness:
         assert abs(ws["FR"].omega_actual - ws["RR"].omega_actual) < 0.01
 
     def test_fk_trajectory_matches_gt_straight(self):
-        """FK trajectory matches ground truth during straight phase < 1 mm."""
+        """FK trajectory error at end of straight phase ≤ τ·v (motor transient offset).
+
+        agv_hub_motor τ=150ms, vx=0.3 m/s → expected offset ≈ τ·vx = 45 mm.  Accept < 55 mm.
+        """
         data = self._simulate()
         gt = data["gt"][N_STRAIGHT - 1]
         fk = data["fk"][N_STRAIGHT - 1]
@@ -236,7 +243,7 @@ class TestMecanumCorrectness:
             (float(gt[0, 0]) - float(fk[0, 0])) ** 2
             + (float(gt[1, 0]) - float(fk[1, 0])) ** 2
         )
-        assert err < 0.001, f"Trajectory error {err:.4f} m in straight phase"
+        assert err < 0.055, f"Trajectory error {err:.4f} m in straight phase"
 
     def test_encoder_readings_present(self):
         """All four wheels provide theta_enc in encoder readings."""
