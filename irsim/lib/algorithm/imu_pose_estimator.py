@@ -141,6 +141,7 @@ class EulerIntegrator(IMUPoseEstimatorBase):
         # Integrate velocity and heading
         self.vel += accel_world * dt
         self.theta += omega * dt
+        self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
 
         self.history_pos.append(self.pos.copy())
         self.history_theta.append(self.theta)
@@ -175,6 +176,7 @@ class MidpointIntegrator(IMUPoseEstimatorBase):
 
         theta_mid = self.theta + 0.5 * omega * dt
         self.theta += omega * dt
+        self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
         accel_world = self._rot2d(theta_mid) @ ab
         self.vel += accel_world * dt
         self.pos += self.vel * dt
@@ -233,7 +235,7 @@ class RK4Integrator(IMUPoseEstimatorBase):
 
         self.pos = xn[:2].copy()
         self.vel = xn[2:4].copy()
-        self.theta = float(xn[4])
+        self.theta = (float(xn[4]) + np.pi) % (2 * np.pi) - np.pi
 
         self.history_pos.append(self.pos.copy())
         self.history_theta.append(self.theta)
@@ -301,6 +303,7 @@ class StrapdownIntegrator(IMUPoseEstimatorBase):
         # Midpoint heading for rotation to world frame
         theta_mid = self.theta + 0.5 * phi
         self.theta += phi
+        self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
         accel_world = self._rot2d(theta_mid) @ (delta_v_body / dt)
 
         self.vel += accel_world * dt

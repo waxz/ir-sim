@@ -729,6 +729,11 @@ class DCMotorActuator:
         p = self.params
         wheel.omega_cmd = float(omega_cmd)
 
+        # Gearbox: read once, used for efficiency, backlash, and ratio below.
+        # eta < 1 slows convergence (longer tau) and reduces effective torque.
+        gb = p.gearbox
+        eta = gb.efficiency if gb is not None else 1.0
+
         if self._controller is not None:
             # Compute dω_cmd/dt for the acceleration feedforward term.
             if self._prev_omega_cmd is not None and dt > 0.0:
@@ -737,14 +742,15 @@ class DCMotorActuator:
                 cmd_rate = 0.0
             self._prev_omega_cmd = float(omega_cmd)
             # Explicit velocity PID + FF path: controller output is motor torque.
-            # Plant: J·dω/dt = torque - K_back·ω
+            # Plant: J·dω/dt = eta·torque - K_back·ω
             torque = self._controller.step(omega_cmd, wheel.omega_actual, dt, cmd_rate)
-            dw_dt = (torque - p.K_back * wheel.omega_actual) / p.J
+            dw_dt = (torque * eta - p.K_back * wheel.omega_actual) / p.J
             new_omega = wheel.omega_actual + dw_dt * dt
         else:
-            # Exact first-order solution (backward-compatible default):
-            #   ω(t+dt) = ω_cmd + (ω - ω_cmd)·exp(-dt/τ)
-            tau = p.J / (p.K_motor + p.K_back)
+            # Exact first-order solution (backward-compatible default).
+            # tau_eff = J / (eta*K_motor + K_back): lower efficiency -> longer tau.
+            #   ω(t+dt) = ω_cmd + (ω - ω_cmd)·exp(-dt/tau_eff)
+            tau = p.J / (eta * p.K_motor + p.K_back)
             decay = float(np.exp(-dt / tau))
             new_omega = omega_cmd + (wheel.omega_actual - omega_cmd) * decay
 
@@ -753,7 +759,6 @@ class DCMotorActuator:
         # output (_theta_out) only moves when _theta_ideal escapes the backlash
         # window; inside the window the wheel stands still even though the motor
         # is turning (energy absorbed by the gear play).
-        gb = p.gearbox
         if gb is not None and gb.backlash > 0.0 and dt > 0.0:
             bl = gb.backlash
             self._theta_ideal += new_omega * dt
@@ -1193,7 +1198,7 @@ class AckerWheelLayout(WheelLayout):
 # ---------------------------------------------------------------------------
 
 
-class ForkiftWheelLayout(WheelLayout):
+class ForkliftWheelLayout(WheelLayout):
     """Three-wheel counterbalance forklift layout.
 
     Wheel arrangement::
@@ -1386,11 +1391,14 @@ class QuadSteerWheelLayout(WheelLayout):
 # Factory
 # ---------------------------------------------------------------------------
 
+#: Backward-compatible alias — prefer :class:`ForkliftWheelLayout`.
+ForkiftWheelLayout = ForkliftWheelLayout
+
 _LAYOUT_REGISTRY: dict[str, type[WheelLayout]] = {
     "diff": DiffWheelLayout,
     "mecanum": MecanumWheelLayout,
     "acker": AckerWheelLayout,
-    "forklift": ForkiftWheelLayout,
+    "forklift": ForkliftWheelLayout,
     "dual_steer": DualSteerWheelLayout,
     "quad_steer": QuadSteerWheelLayout,
 }
