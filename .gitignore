@@ -172,3 +172,6 @@ docs/locale/zh_CN/LC_MESSAGES/api/
 
 # internal roadmap — tracked in GitHub Issues/Projects, not the repo
 /todo_list.md
+
+# generated simulation output
+/sim_data.json
