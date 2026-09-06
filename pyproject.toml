@@ -150,10 +150,42 @@ exclude_dirs = ["tests", "docs", ".venv"]
 #   B101 assert_used      - asserts guard internal invariants
 #   B311 blacklist        - PRNG is for simulation sampling, not cryptography
 #   B110 try_except_pass  - intentional best-effort cleanup paths
-skips = ["B101", "B311", "B110"]
+#   B404 import_subprocess - subprocess is used only for the legacy gcc fallback in ray_casting_2d_omp.py
+#   B603 subprocess_without_shell_equals_true - same call; arguments are hardcoded, not user input
+skips = ["B101", "B311", "B110", "B404", "B603"]
 
 [project.urls]
 "Homepage" = "https://ir-sim.readthedocs.io/en/stable/"
 "Documentation" = "https://ir-sim.readthedocs.io/en/stable/"
 "Repository" = "https://github.com/hanruihua/ir-sim"
 "Issues" = "https://github.com/hanruihua/ir-sim/issues"
+
+# ── cibuildwheel ──────────────────────────────────────────────────────────────
+# Builds the optional C+OpenMP extension for each supported CPython version.
+# Skips musllinux (no libgomp in the Alpine image by default) and PyPy.
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux* pp*"
+
+[tool.cibuildwheel.linux]
+# libgomp is bundled in the manylinux images; auditwheel repairs the .so refs.
+before-build = "true"
+
+[tool.cibuildwheel.macos]
+# Install llvm-openmp from conda-forge, which is built with a macOS deployment
+# target that matches what cibuildwheel targets (11.0 arm64 / 10.13 x86_64),
+# avoiding delocate's version-mismatch rejection of Homebrew's libomp.
+# The idempotent guard means only the first wheel build installs miniforge.
+before-build = """
+[ -d /tmp/miniforge3 ] || {
+    ARCH=$(uname -m)
+    curl -fsSL "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-${ARCH}.sh" -o /tmp/miniforge.sh
+    bash /tmp/miniforge.sh -b -p /tmp/miniforge3
+    /tmp/miniforge3/bin/conda install -y -c conda-forge llvm-openmp
+    rm -f /tmp/miniforge.sh
+}
+"""
+environment = {LIBOMP_PREFIX = "/tmp/miniforge3"}
+
+[tool.cibuildwheel.windows]
+# MSVC ships with OpenMP; no extra setup needed.

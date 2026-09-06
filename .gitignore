@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+*.pyd
 
 # Distribution / packaging
 .Python
@@ -171,3 +172,7 @@ docs/locale/zh_CN/LC_MESSAGES/api/
 
 # internal roadmap — tracked in GitHub Issues/Projects, not the repo
 /todo_list.md
+
+# generated simulation output
+/sim_data.json
+usage/26wheel_fk_correctness/animations/

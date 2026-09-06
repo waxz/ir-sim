@@ -1,0 +1,227 @@
+name: Build & Verify Wheels
+
+# Triggers:
+#   • Every push/PR to main  → build + verify (no publish)
+#   • Push of a v* tag       → build + verify + publish to PyPI
+#   • Manual dispatch        → build + verify (no publish)
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Job 1 ─────────────────────────────────────────────────────────────────
+# Build the sdist (source distribution) on Ubuntu.
+# ──────────────────────────────────────────────────────────────────────────
+jobs:
+  build_sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build backend
+        run: pip install --upgrade build
+
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - name: Show produced artefacts
+        run: ls -lh dist/
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+# ── Job 2 ─────────────────────────────────────────────────────────────────
+# Build platform-specific wheels via cibuildwheel.
+# The optional C+OpenMP extension is compiled on each platform.
+#   • Linux   – manylinux_2_28 image; libgomp is pre-installed.
+#   • macOS   – brew install libomp; clang -Xpreprocessor -fopenmp.
+#   • Windows – MSVC; /openmp flag.
+# ──────────────────────────────────────────────────────────────────────────
+  build_wheels:
+    name: Build wheels / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23.0
+        # Configuration is read from [tool.cibuildwheel] in pyproject.toml.
+
+      - name: Show produced wheels
+        shell: bash
+        run: ls -lh wheelhouse/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheels-${{ matrix.os }}
+          path: wheelhouse/
+          if-no-files-found: error
+          retention-days: 30
+
+# ── Job 3 ─────────────────────────────────────────────────────────────────
+# Download the wheels and install on each platform × Python combination.
+# Runs a smoke test to confirm the installed package is importable and
+# the core simulation loop works end-to-end.
+# ──────────────────────────────────────────────────────────────────────────
+  verify:
+    name: Verify / ${{ matrix.os }} / py${{ matrix.python-version }}
+    needs: [build_sdist, build_wheels]
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-wheels-*
+          path: dist/
+          merge-multiple: true
+
+      # Let pip pick the wheel that matches the current platform/Python version.
+      - name: Install wheel
+        run: pip install --find-links dist/ ir-sim
+
+      # ── Smoke test: import and run a minimal simulation step ─────────────
+      - name: Smoke test (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run -s "-screen 0 1024x768x24" python - <<'EOF'
+          import irsim, tempfile, os, yaml
+
+          cfg = {
+              "world": {
+                  "height": 10, "width": 10, "step_time": 0.1,
+                  "sample_time": 0.1, "offset": [-5, -5],
+                  "collision_mode": "unobstructed", "control_mode": "auto",
+              },
+              "robot": {
+                  "kinematics": {"name": "diff"},
+                  "shape": [{"name": "circle", "radius": 0.2}],
+                  "state": [-3.0, 0.0, 0.0],
+                  "goal": [3.0, 0.0, 0.0],
+                  "behavior": {"name": "dash"},
+                  "vel_min": [-1, -1], "vel_max": [1, 1],
+              },
+          }
+          fd, path = tempfile.mkstemp(suffix=".yaml")
+          with os.fdopen(fd, "w") as f:
+              yaml.safe_dump(cfg, f)
+          env = irsim.make(path, save_ani=False, display=False)
+          for _ in range(5):
+              env.step()
+          env.end(suppress_summary=True)
+          os.unlink(path)
+          print("Smoke test passed.")
+          EOF
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        env:
+          MPLBACKEND: Agg
+        shell: python
+        run: |
+          import irsim, tempfile, os, yaml
+
+          cfg = {
+              "world": {
+                  "height": 10, "width": 10, "step_time": 0.1,
+                  "sample_time": 0.1, "offset": [-5, -5],
+                  "collision_mode": "unobstructed", "control_mode": "auto",
+              },
+              "robot": {
+                  "kinematics": {"name": "diff"},
+                  "shape": [{"name": "circle", "radius": 0.2}],
+                  "state": [-3.0, 0.0, 0.0],
+                  "goal": [3.0, 0.0, 0.0],
+                  "behavior": {"name": "dash"},
+                  "vel_min": [-1, -1], "vel_max": [1, 1],
+              },
+          }
+          fd, path = tempfile.mkstemp(suffix=".yaml")
+          with os.fdopen(fd, "w") as f:
+              yaml.safe_dump(cfg, f)
+          env = irsim.make(path, save_ani=False, display=False)
+          for _ in range(5):
+              env.step()
+          env.end(suppress_summary=True)
+          os.unlink(path)
+          print("Smoke test passed.")
+
+# ── Job 4 ─────────────────────────────────────────────────────────────────
+# Publish to PyPI only when a version tag is pushed and all verify jobs pass.
+# Uploads both the sdist and all platform wheels.
+# Uses OIDC Trusted Publishing — no API token needed; configure the
+# trusted publisher in the PyPI project settings:
+#   Owner: hanruihua  Repo: ir-sim  Workflow: build-wheels.yml
+# ──────────────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: pypi          # optional: gate behind a GitHub Environment with reviewers
+
+    permissions:
+      id-token: write          # required for OIDC trusted publishing
+
+    steps:
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/
+
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-wheels-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Show distribution artefacts
+        run: ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No password/token needed — OIDC handles authentication.
+        # To fall back to an API token, uncomment and add PYPI_API_TOKEN secret:
+        # with:
+        #   password: ${{ secrets.PYPI_API_TOKEN }}

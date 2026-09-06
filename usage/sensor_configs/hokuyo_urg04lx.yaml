@@ -1,0 +1,62 @@
+# Hokuyo URG-04LX-UG01 — 240 deg FoV, 10 Hz, 4 m, 0.36 deg resolution
+world:
+  height: 8
+  width: 8
+  step_time: 0.100   # 10 Hz
+  sample_time: 0.100
+  collision_mode: 'stop'
+  control_mode: 'auto'
+
+robot:
+  - kinematics: {name: 'diff'}
+    shape: {name: 'circle', radius: 0.15}
+    state: [1, 1, 0]
+    goal: [6, 6, 0]
+    behavior: {name: 'dash'}
+    sensors:
+      - name: 'lidar2d'
+        range_min: 0.06      # 6 cm dead zone
+        range_max: 4.0       # 4 m (5.6 m for white card — use conservative)
+        angle_range: 4.1888  # 240 deg (4*pi/3)
+        number: 667          # 0.36 deg resolution over 240 deg
+        noise: True
+        std: 0.01            # 10 mm — high-precision sensor
+        angle_std: 0.005     # ~0.3 deg
+        offset: [0, 0, 0]
+        plot:
+          alpha: 0.4
+
+obstacle:
+  # Perimeter boundary wall
+  - shape: {name: 'linestring', vertices: [[0.2, 0.2], [7.8, 0.2], [7.8, 7.8], [0.2, 7.8], [0.2, 0.2]]}
+    state: [0, 0, 0]
+  # Room dividers — horizontal wall at y=4 with gap x=3..5
+  - shape: {name: 'linestring', vertices: [[0.2, 4], [3, 4]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[5, 4], [7.8, 4]]}
+    state: [0, 0, 0]
+  # Room dividers — vertical wall at x=4 with gap y=3..5
+  - shape: {name: 'linestring', vertices: [[4, 0.2], [4, 3]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[4, 5], [4, 7.8]]}
+    state: [0, 0, 0]
+  # Rectangles — compact furniture and equipment
+  - shape: {name: 'rectangle', length: 0.8, width: 0.5}
+    state: [2, 2, 0.3]
+  - shape: {name: 'rectangle', length: 1.0, width: 0.4}
+    state: [6, 2, 0]
+  - shape: {name: 'rectangle', length: 0.8, width: 0.6}
+    state: [2, 6.5, 0.5]
+  - shape: {name: 'rectangle', length: 1.0, width: 0.4}
+    state: [5.5, 6.5, 0]
+  # Circles — pillars and small cylindrical obstacles
+  - shape: {name: 'circle', radius: 0.3}
+    state: [2.5, 5.5, 0]
+  - shape: {name: 'circle', radius: 0.35}
+    state: [5.5, 2.5, 0]
+  - shape: {name: 'circle', radius: 0.3}
+    state: [6.5, 5.5, 0]
+  - shape: {name: 'circle', radius: 0.4}
+    state: [3.5, 3.5, 0]
+  - shape: {name: 'circle', radius: 0.25}
+    state: [4.5, 6.8, 0]

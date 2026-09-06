@@ -8,7 +8,8 @@ This package contains:
 """
 
 from .fmcw_lidar2d import FMCWLidar2D
+from .imu import IMU
 from .lidar2d import Lidar2D
 from .sensor_factory import SensorFactory
 
-__all__ = ["FMCWLidar2D", "Lidar2D", "SensorFactory"]
+__all__ = ["IMU", "FMCWLidar2D", "Lidar2D", "SensorFactory"]

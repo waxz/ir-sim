@@ -1,0 +1,73 @@
+# Slamtec RPLiDAR S2 — 360 deg, 10 Hz, 30 m, 0.30 deg resolution
+world:
+  height: 40
+  width: 40
+  step_time: 0.100   # 10 Hz scan rate
+  sample_time: 0.100
+  collision_mode: 'stop'
+  control_mode: 'auto'
+
+robot:
+  - kinematics: {name: 'diff'}
+    shape: {name: 'circle', radius: 0.2}
+    state: [1, 1, 0]
+    goal: [38, 38, 0]
+    behavior: {name: 'dash'}
+    sensors:
+      - name: 'lidar2d'
+        range_min: 0.05      # 5 cm dead zone
+        range_max: 30.0      # 30 m max range
+        angle_range: 6.2832  # 360 deg
+        number: 1200         # 0.30 deg angular resolution
+        noise: True
+        std: 0.02            # 20 mm range noise
+        angle_std: 0.009     # ~0.5 deg angular noise (placeholder)
+        offset: [0, 0, 0]
+        plot:
+          alpha: 0.25
+
+obstacle:
+  # Perimeter boundary wall
+  - shape: {name: 'linestring', vertices: [[0.3, 0.3], [39.7, 0.3], [39.7, 39.7], [0.3, 39.7], [0.3, 0.3]]}
+    state: [0, 0, 0]
+  # Room dividers — horizontal wall at y=20 with gap x=16..22
+  - shape: {name: 'linestring', vertices: [[0.3, 20], [16, 20]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[22, 20], [39.7, 20]]}
+    state: [0, 0, 0]
+  # Room dividers — vertical wall at x=20 with gap y=14..24
+  - shape: {name: 'linestring', vertices: [[20, 0.3], [20, 14]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[20, 24], [20, 39.7]]}
+    state: [0, 0, 0]
+  # Inner partial walls for sub-rooms
+  - shape: {name: 'linestring', vertices: [[8, 0.3], [8, 14]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[30, 26], [30, 39.7]]}
+    state: [0, 0, 0]
+  # Rectangles — shelving units and machinery
+  - shape: {name: 'rectangle', length: 4.0, width: 1.5}
+    state: [5, 5, 0]
+  - shape: {name: 'rectangle', length: 5.0, width: 1.0}
+    state: [14, 9, 0.5]
+  - shape: {name: 'rectangle', length: 2.5, width: 3.0}
+    state: [5, 28, 0]
+  - shape: {name: 'rectangle', length: 3.5, width: 2.0}
+    state: [26, 10, 0.7]
+  - shape: {name: 'rectangle', length: 4.5, width: 1.5}
+    state: [35, 8, 0]
+  - shape: {name: 'rectangle', length: 3.0, width: 1.5}
+    state: [26, 33, 0]
+  - shape: {name: 'rectangle', length: 2.5, width: 2.5}
+    state: [36, 33, 0.3]
+  # Circles — pillars and cylindrical tanks
+  - shape: {name: 'circle', radius: 0.8}
+    state: [8, 16, 0]
+  - shape: {name: 'circle', radius: 1.2}
+    state: [28, 18, 0]
+  - shape: {name: 'circle', radius: 1.0}
+    state: [12, 30, 0]
+  - shape: {name: 'circle', radius: 0.9}
+    state: [36, 26, 0]
+  - shape: {name: 'circle', radius: 0.7}
+    state: [22, 5, 0]
