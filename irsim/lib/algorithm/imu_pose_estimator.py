@@ -58,7 +58,18 @@ class IMUPoseEstimatorBase:
         self.history_pos: list[np.ndarray] = [self.pos.copy()]
         self.history_theta: list[float] = [self.theta]
 
-    def update(self, omega: float, accel_body: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _extract_omega(omega) -> float:
+        """Extract scalar ωz from a scalar or 3-D angular-velocity vector."""
+        arr = np.asarray(omega, dtype=float).ravel()
+        return float(arr[-1]) if len(arr) > 1 else float(arr[0])
+
+    @staticmethod
+    def _extract_accel(accel_body: np.ndarray) -> np.ndarray:
+        """Extract 2-D body-frame [ax, ay] from a 2-D or 3-D array."""
+        return np.asarray(accel_body, dtype=float).ravel()[:2]
+
+    def update(self, omega, accel_body: np.ndarray) -> np.ndarray:
         raise NotImplementedError
 
     def reset(self, initial_state: np.ndarray | list) -> None:
@@ -128,9 +139,10 @@ class EulerIntegrator(IMUPoseEstimatorBase):
 
     name = "Euler"
 
-    def update(self, omega: float, accel_body: np.ndarray) -> np.ndarray:
+    def update(self, omega, accel_body: np.ndarray) -> np.ndarray:
         dt = self.dt
-        ab = np.asarray(accel_body, dtype=float).ravel()[:2]
+        omega = self._extract_omega(omega)
+        ab = self._extract_accel(accel_body)
 
         # Rotate at start-of-step heading
         accel_world = self._rot2d(self.theta) @ ab
@@ -170,9 +182,10 @@ class MidpointIntegrator(IMUPoseEstimatorBase):
 
     name = "Midpoint"
 
-    def update(self, omega: float, accel_body: np.ndarray) -> np.ndarray:
+    def update(self, omega, accel_body: np.ndarray) -> np.ndarray:
         dt = self.dt
-        ab = np.asarray(accel_body, dtype=float).ravel()[:2]
+        omega = self._extract_omega(omega)
+        ab = self._extract_accel(accel_body)
 
         theta_mid = self.theta + 0.5 * omega * dt
         self.theta += omega * dt
@@ -215,9 +228,10 @@ class RK4Integrator(IMUPoseEstimatorBase):
 
     name = "RK4"
 
-    def update(self, omega: float, accel_body: np.ndarray) -> np.ndarray:
+    def update(self, omega, accel_body: np.ndarray) -> np.ndarray:
         dt = self.dt
-        ab = np.asarray(accel_body, dtype=float).ravel()[:2]
+        omega = self._extract_omega(omega)
+        ab = self._extract_accel(accel_body)
 
         x = np.array([self.pos[0], self.pos[1], self.vel[0], self.vel[1], self.theta])
 
@@ -285,9 +299,10 @@ class StrapdownIntegrator(IMUPoseEstimatorBase):
         """2-D 'cross product': scalar phi x [ax, ay] = phi*[-ay, ax]."""
         return phi * np.array([-alpha[1], alpha[0]])
 
-    def update(self, omega: float, accel_body: np.ndarray) -> np.ndarray:
+    def update(self, omega, accel_body: np.ndarray) -> np.ndarray:
         dt = self.dt
-        ab = np.asarray(accel_body, dtype=float).ravel()[:2]
+        omega = self._extract_omega(omega)
+        ab = self._extract_accel(accel_body)
 
         alpha = ab * dt  # body-frame velocity increment this step
         phi = omega * dt  # rotation increment this step

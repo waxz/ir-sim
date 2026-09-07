@@ -62,7 +62,7 @@ def test_gyro_noise_level():
     omegas = []
     for s in stationary[1:]:
         imu.step(s)
-        omegas.append(imu.angular_velocity)
+        omegas.append(imu.angular_velocity[2])  # ωz axis
 
     sigma_measured = float(np.std(omegas))
     assert abs(sigma_measured - sigma_expected) / sigma_expected < 0.20, (
@@ -125,7 +125,7 @@ def test_gyro_bias_drift():
     biases = []
     for s in stationary[1:]:
         imu.step(s)
-        biases.append(imu.gyro_bias)
+        biases.append(imu.gyro_bias[2])  # ωz axis
 
     biases = np.array(biases)
     # Theoretical RMS after k steps: K_g * sqrt(k * dt)
@@ -166,7 +166,7 @@ def test_heading_integration_noisefree():
     integrated_theta = 0.0
     for s in states[1:]:
         imu.step(s)
-        integrated_theta += imu.angular_velocity * dt
+        integrated_theta += imu.angular_velocity[2] * dt  # ωz axis
 
     expected_theta = omega_true * n_steps * dt
     assert abs(integrated_theta - expected_theta) < 1e-6, (
@@ -209,10 +209,10 @@ def test_dead_reckoning_drift_grows():
 
     for i, s in enumerate(states[1:], start=1):
         imu.step(s)
-        theta_dr += imu.angular_velocity * dt
+        theta_dr += imu.angular_velocity[2] * dt  # ωz
         c, s_t = np.cos(theta_dr), np.sin(theta_dr)
         R = np.array([[c, -s_t], [s_t, c]])
-        accel_world = R @ imu.linear_acceleration
+        accel_world = R @ imu.linear_acceleration[:2]  # [ax, ay] only
         vel_dr += accel_world * dt
         pos_dr += vel_dr * dt
 
@@ -264,7 +264,7 @@ def test_noise_disabled_returns_ground_truth():
     imu = IMU(states[0], noise=False, step_time=dt)
     imu.step(states[1])
     imu.step(states[2])
-    assert abs(imu.angular_velocity - omega) < 1e-9
+    assert abs(imu.angular_velocity[2] - omega) < 1e-9  # ωz axis
 
 
 # ---------------------------------------------------------------------------

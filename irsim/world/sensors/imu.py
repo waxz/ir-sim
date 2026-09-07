@@ -1,13 +1,29 @@
-"""Simulated IMU sensor with IEEE 517-style noise model.
+"""Simulated IMU sensor with IEEE 517-style and Gaussian noise models.
 
-Implements white noise (angle/velocity random walk) and bias random walk
-on both gyroscope and accelerometer axes, consistent with the Moussaid-Helbing
-2009 parameterisation used elsewhere in IR-SIM.
+Implements two noise models:
+
+* ``"ieee517"`` (default) — white noise (angle/velocity random walk) and
+  bias random walk on both gyroscope and accelerometer axes, consistent with
+  the IEEE 517 Inertial Sensor Terminology Standard.
+* ``"gaussian"`` — simple per-axis Gaussian noise without bias drift;
+  useful for quick experimentation or when bias dynamics are not needed.
+
+Both models produce 3-DOF outputs:
+
+* ``angular_velocity`` — np.ndarray shape (3,): [ωx, ωy, ωz] (rad/s).
+* ``linear_acceleration`` — np.ndarray shape (3,): [ax, ay, az] (m/s²),
+  where az includes the static gravity component (+g ≈ 9.807 m/s² for a
+  level ground robot).
+
+For a 2-D ground-plane robot the true ωx = ωy = 0 and az = +g, so the
+out-of-plane axes carry only sensor noise.  The 2-D pose estimators in
+:mod:`irsim.lib.algorithm.imu_pose_estimator` automatically extract the
+relevant sub-components (ωz and [ax, ay]).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import numpy as np
 
@@ -16,15 +32,22 @@ from irsim.util.random import rng
 if TYPE_CHECKING:
     from irsim.world.object_base import ObjectBase
 
+_G: float = 9.80665  # standard gravity (m/s²)
+
 
 class IMU:
-    """Simulated 2-D IMU sensor (gyroscope + accelerometer).
+    """Simulated 3-D IMU sensor (gyroscope + accelerometer).
 
     Derives ground-truth angular velocity and linear acceleration from the
     parent object's state history using finite differences, then corrupts
-    the signal with white noise and a slowly-drifting bias (random walk).
+    the signal with a configurable noise model.
 
-    Default parameters match a consumer-grade MEMS IMU (e.g. MPU-6050).
+    For a 2-D planar robot the true angular-velocity vector is
+    [0, 0, ωz] and the true accelerometer vector is [ax_body, ay_body, +g].
+    Out-of-plane gyro axes (ωx, ωy) are zero plus noise; the gravity axis
+    (az) measures the static +g with additive sensor noise.
+
+    Default parameters match a consumer-grade MEMS IMU (MPU-6050).
 
     Args:
         state (np.ndarray): Initial [x, y, theta] state of the parent object.
@@ -32,24 +55,33 @@ class IMU:
         gyro_noise_std (float): Gyroscope white-noise density (rad/s/√Hz).
         accel_noise_std (float): Accelerometer white-noise density (m/s²/√Hz).
         gyro_bias_walk_std (float): Gyroscope bias random-walk rate (rad/s/√s).
-        accel_bias_walk_std (float): Accelerometer bias random-walk rate (m/s²/√s).
+            Ignored when ``noise_model="gaussian"``.
+        accel_bias_walk_std (float): Accelerometer bias random-walk rate
+            (m/s²/√s).  Ignored when ``noise_model="gaussian"``.
         step_time (float): Simulation step time in seconds.
         noise (bool): Enable noise and bias. Set False for ground-truth output.
+        noise_model (str): ``"ieee517"`` (white noise + bias random walk) or
+            ``"gaussian"`` (simple per-axis Gaussian, no drift).
+        profile (str | None): Named sensor profile from :attr:`PROFILES`.
+            Overrides explicit noise parameters when provided.
         shock_prob (float): Per-step probability of an impulsive shock event
-            (0.0 = none). Models wheel bumps on uneven terrain or collisions.
-        shock_accel_std (float): Standard deviation of the impulsive acceleration
-            spike (m/s²) when a shock event fires.
-        shock_gyro_std (float): Standard deviation of the impulsive angular-rate
-            spike (rad/s) when a shock event fires.
+            (0.0 = none).  Models wheel bumps on uneven terrain or collisions.
+        shock_accel_std (float): Standard deviation of the impulsive
+            acceleration spike (m/s²) when a shock event fires.
+        shock_gyro_std (float): Standard deviation of the impulsive
+            angular-rate spike (rad/s) when a shock event fires.
+        gravity (float): Gravity constant (m/s²) added to the az measurement.
+            Default 9.80665 m/s².
         **kwargs: Ignored extra keyword arguments passed by SensorFactory.
 
     Attr:
         sensor_type (str): ``"imu"``.
-        angular_velocity (float): Latest gyroscope measurement (rad/s).
+        angular_velocity (np.ndarray): Latest gyroscope measurement,
+            shape (3,): [ωx, ωy, ωz] (rad/s).
         linear_acceleration (np.ndarray): Latest accelerometer measurement,
-            shape (2,), in body frame (m/s²).
-        gyro_bias (float): Current gyroscope bias estimate (rad/s).
-        accel_bias (np.ndarray): Current accelerometer bias, shape (2,) (m/s²).
+            shape (3,): [ax, ay, az] (m/s²), body frame, az includes gravity.
+        gyro_bias (np.ndarray): Current gyroscope bias, shape (3,) (rad/s).
+        accel_bias (np.ndarray): Current accelerometer bias, shape (3,) (m/s²).
         parent (ObjectBase | None): Owning simulation object; set externally.
     """
 
@@ -109,16 +141,25 @@ class IMU:
         accel_bias_walk_std: float = 1.96e-4,
         step_time: float = 0.001,
         noise: bool = True,
+        noise_model: Literal["ieee517", "gaussian"] = "ieee517",
         profile: str | None = None,
         shock_prob: float = 0.0,
         shock_accel_std: float = 5.0,
         shock_gyro_std: float = 0.5,
+        gravity: float = _G,
         **kwargs,
     ) -> None:
         self.sensor_type = "imu"
         self.obj_id = obj_id
         self.noise = noise
         self.step_time = step_time
+        self.gravity = float(gravity)
+
+        if noise_model not in ("ieee517", "gaussian"):
+            raise ValueError(
+                f"Unknown noise_model '{noise_model}'. Use 'ieee517' or 'gaussian'."
+            )
+        self.noise_model: str = noise_model
 
         # Apply named profile if given (overrides explicit params)
         if profile is not None:
@@ -135,7 +176,7 @@ class IMU:
         # Noise spectral densities
         self._N_g = gyro_noise_std
         self._N_a = accel_noise_std
-        # Bias random-walk rate
+        # Bias random-walk rate (used by ieee517 model only)
         self._K_g = gyro_bias_walk_std
         self._K_a = accel_bias_walk_std
         # Impulsive shock model (mobile robot bumping on uneven terrain)
@@ -143,9 +184,9 @@ class IMU:
         self._shock_accel_std = float(shock_accel_std)
         self._shock_gyro_std = float(shock_gyro_std)
 
-        # Running bias state
-        self.gyro_bias: float = 0.0
-        self.accel_bias: np.ndarray = np.zeros(2)
+        # Running bias state — 3-D (one per axis)
+        self.gyro_bias: np.ndarray = np.zeros(3)
+        self.accel_bias: np.ndarray = np.zeros(3)
 
         # Previous-step state for finite differences
         if state is not None:
@@ -157,9 +198,9 @@ class IMU:
             self._prev_theta = 0.0
         self._prev_vel_world: np.ndarray = np.zeros(2)
 
-        # Outputs (initialised to zero)
-        self.angular_velocity: float = 0.0
-        self.linear_acceleration: np.ndarray = np.zeros(2)
+        # Outputs — 3-D: [ωx, ωy, ωz] and [ax, ay, az]
+        self.angular_velocity: np.ndarray = np.zeros(3)
+        self.linear_acceleration: np.ndarray = np.array([0.0, 0.0, self.gravity])
 
         # Visualisation / compatibility stubs
         self.parent: ObjectBase | None = None
@@ -183,37 +224,46 @@ class IMU:
         dt = self.step_time
 
         # --- Ground-truth signals ---
-        omega_true = (theta - self._prev_theta) / dt
+        # Gyro: for a 2-D ground robot ωx_true = ωy_true = 0, ωz_true = dθ/dt
+        omega_z_true = (theta - self._prev_theta) / dt
+        omega_true = np.array([0.0, 0.0, omega_z_true])
 
+        # Accel: derive world-frame acceleration from position finite differences
         vel_world = (pos - self._prev_pos) / dt
         dv_world = vel_world - self._prev_vel_world
-        accel_world = dv_world / dt
+        accel_world_2d = dv_world / dt
 
-        # Rotate world-frame acceleration to body frame
+        # Rotate world-frame 2-D accel to body frame
         c, s_theta = np.cos(theta), np.sin(theta)
         R_inv = np.array([[c, s_theta], [-s_theta, c]])  # R(-theta)
-        accel_body = R_inv @ accel_world
+        accel_body_2d = R_inv @ accel_world_2d
 
-        # --- Advance bias random walk ---
+        # az = +g for a level robot (gravity acts on the accelerometer)
+        accel_true = np.array([accel_body_2d[0], accel_body_2d[1], self.gravity])
+
+        # --- Apply noise model ---
         if self.noise:
-            self.gyro_bias += self._K_g * np.sqrt(dt) * float(rng.standard_normal())
-            self.accel_bias += self._K_a * np.sqrt(dt) * rng.standard_normal(2)
-
-            # --- Add white noise ---
             sigma_g = self._N_g / np.sqrt(dt)
             sigma_a = self._N_a / np.sqrt(dt)
-            omega_meas = (
-                omega_true + self.gyro_bias + sigma_g * float(rng.standard_normal())
-            )
-            accel_meas = accel_body + self.accel_bias + sigma_a * rng.standard_normal(2)
+
+            if self.noise_model == "ieee517":
+                # Advance bias random walk (all 3 axes)
+                self.gyro_bias += self._K_g * np.sqrt(dt) * rng.standard_normal(3)
+                self.accel_bias += self._K_a * np.sqrt(dt) * rng.standard_normal(3)
+                # White noise + bias
+                omega_meas = omega_true + self.gyro_bias + sigma_g * rng.standard_normal(3)
+                accel_meas = accel_true + self.accel_bias + sigma_a * rng.standard_normal(3)
+            else:  # gaussian — simple per-axis Gaussian, no drift
+                omega_meas = omega_true + sigma_g * rng.standard_normal(3)
+                accel_meas = accel_true + sigma_a * rng.standard_normal(3)
 
             # Impulsive shock (bump / collision)
             if self._shock_prob > 0.0 and float(rng.random()) < self._shock_prob:
-                accel_meas += self._shock_accel_std * rng.standard_normal(2)
-                omega_meas += self._shock_gyro_std * float(rng.standard_normal())
+                accel_meas += self._shock_accel_std * rng.standard_normal(3)
+                omega_meas += self._shock_gyro_std * rng.standard_normal(3)
         else:
-            omega_meas = omega_true
-            accel_meas = accel_body
+            omega_meas = omega_true.copy()
+            accel_meas = accel_true.copy()
 
         # Store outputs
         self.angular_velocity = omega_meas
@@ -228,10 +278,11 @@ class IMU:
         """Return the most recent IMU reading as a dictionary.
 
         Returns:
-            dict: Keys ``angular_velocity`` (float, rad/s) and
-            ``linear_acceleration`` (np.ndarray shape (2,), m/s²).
+            dict: Keys ``angular_velocity`` (np.ndarray shape (3,), rad/s) and
+            ``linear_acceleration`` (np.ndarray shape (3,), m/s², body frame,
+            az includes gravity).
         """
         return {
-            "angular_velocity": self.angular_velocity,
+            "angular_velocity": self.angular_velocity.copy(),
             "linear_acceleration": self.linear_acceleration.copy(),
         }
