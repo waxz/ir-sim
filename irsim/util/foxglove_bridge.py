@@ -168,6 +168,76 @@ _SCHEMAS: dict[str, str] = {
             },
         }
     ),
+    "/irsim/imu": json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "foxglove.Imu",
+            "type": "object",
+            "$defs": _DEFS,
+            "properties": {
+                "timestamp": {"$ref": "#/$defs/Time"},
+                "frame_id": {"type": "string"},
+                "linear_acceleration": {"$ref": "#/$defs/Vector3"},
+                "angular_velocity": {"$ref": "#/$defs/Vector3"},
+                "linear_acceleration_covariance": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                },
+                "angular_velocity_covariance": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                },
+            },
+        }
+    ),
+    "/irsim/encoder": json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "irsim.Encoder",
+            "type": "object",
+            "$defs": {"Time": _TIME_DEF},
+            "properties": {
+                "timestamp": {"$ref": "#/$defs/Time"},
+                "wheels": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "theta_enc": {"type": "number"},
+                            "ticks": {"type": "integer"},
+                            "omega": {"type": "number"},
+                        },
+                    },
+                },
+            },
+        }
+    ),
+    "/irsim/motor": json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "irsim.Motor",
+            "type": "object",
+            "$defs": {"Time": _TIME_DEF},
+            "properties": {
+                "timestamp": {"$ref": "#/$defs/Time"},
+                "wheels": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "omega_cmd": {"type": "number"},
+                            "omega_actual": {"type": "number"},
+                            "motor_omega": {"type": "number"},
+                            "delta_cmd": {"type": "number"},
+                            "delta_actual": {"type": "number"},
+                        },
+                    },
+                },
+            },
+        }
+    ),
 }
 
 _SCHEMA_NAMES = {
@@ -175,6 +245,9 @@ _SCHEMA_NAMES = {
     "/irsim/lidar3d": "foxglove.PointCloud",
     "/irsim/pose": "foxglove.PoseInFrame",
     "/irsim/metrics": "irsim.Metrics",
+    "/irsim/imu": "foxglove.Imu",
+    "/irsim/encoder": "irsim.Encoder",
+    "/irsim/motor": "irsim.Motor",
 }
 
 # PackedElementField numeric type: 7 = FLOAT32
@@ -462,3 +535,128 @@ class FoxgloveBridge:
             "fps": round(self._fps, 1),
         }
         self._queue("/irsim/metrics", _encode(msg))
+
+    def update_imu(
+        self,
+        angular_velocity: np.ndarray,
+        linear_acceleration: np.ndarray,
+        frame_id: str = "imu",
+    ) -> None:
+        """
+        Publish IMU measurements.
+
+        Parameters
+        ----------
+        angular_velocity : array-like, shape (3,) — [ωx, ωy, ωz] in rad/s
+        linear_acceleration : array-like, shape (3,) — [ax, ay, az] in m/s²
+            (az includes static gravity ≈ +9.807 m/s² for a level robot)
+        frame_id : sensor frame identifier
+        """
+        ts_ns = time.time_ns()
+        av = np.asarray(angular_velocity).ravel()
+        la = np.asarray(linear_acceleration).ravel()
+        msg = {
+            "timestamp": _ts(ts_ns),
+            "frame_id": frame_id,
+            "angular_velocity": {
+                "x": float(av[0]),
+                "y": float(av[1]),
+                "z": float(av[2]),
+            },
+            "linear_acceleration": {
+                "x": float(la[0]),
+                "y": float(la[1]),
+                "z": float(la[2]),
+            },
+            "angular_velocity_covariance": [],
+            "linear_acceleration_covariance": [],
+        }
+        self._queue("/irsim/imu", _encode(msg))
+
+    def update_encoder(
+        self,
+        readings: dict,
+    ) -> None:
+        """
+        Publish wheel encoder readings.
+
+        Parameters
+        ----------
+        readings : dict
+            Keyed by wheel name.  Each value is a dict with any subset of:
+            ``{"theta_enc": float, "ticks": int, "omega_actual": float}``.
+            Compatible with ``ObjectBase.encoder_readings`` and
+            ``WheelLayout.get_encoder_readings()``.
+
+        Example
+        -------
+        ::
+
+            bridge.update_encoder(robot.encoder_readings)
+            # or manually:
+            bridge.update_encoder({
+                "left":  {"theta_enc": 12.3, "ticks": 1960, "omega_actual": 8.1},
+                "right": {"theta_enc": 12.1, "ticks": 1927, "omega_actual": 8.0},
+            })
+        """
+        ts_ns = time.time_ns()
+        wheels = [
+            {
+                "name": name,
+                "theta_enc": float(r.get("theta_enc", 0.0)),
+                "ticks": int(r.get("ticks", 0)),
+                "omega": float(r.get("omega_actual", r.get("omega", 0.0))),
+            }
+            for name, r in readings.items()
+        ]
+        msg = {"timestamp": _ts(ts_ns), "wheels": wheels}
+        self._queue("/irsim/encoder", _encode(msg))
+
+    def update_motor(
+        self,
+        wheel_states: dict,
+    ) -> None:
+        """
+        Publish motor telemetry.
+
+        Parameters
+        ----------
+        wheel_states : dict
+            Keyed by wheel name.  Each value may be a ``WheelState`` dataclass
+            instance or a plain dict with any subset of:
+            ``{"omega_cmd", "omega_actual", "motor_omega",
+               "delta_cmd", "delta_actual"}``.
+            Compatible with ``WheelLayout.get_wheel_states()`` and
+            ``ObjectBase.wheel_states``.
+
+        Example
+        -------
+        ::
+
+            bridge.update_motor(robot.wheel_states)
+            # or manually:
+            bridge.update_motor({
+                "left":  {"omega_cmd": 8.2, "omega_actual": 8.1, "motor_omega": 372.6},
+                "right": {"omega_cmd": 8.2, "omega_actual": 8.0, "motor_omega": 368.0},
+            })
+        """
+        ts_ns = time.time_ns()
+
+        def _get(w: Any, key: str, default: float = 0.0) -> float:
+            if isinstance(w, dict):
+                return float(w.get(key, default))
+            return float(getattr(w, key, default))
+
+        wheels = [
+            {
+                "name": name,
+                "omega_cmd": _get(w, "omega_cmd"),
+                "omega_actual": _get(w, "omega_actual"),
+                "motor_omega": _get(w, "motor_omega"),
+                "delta_cmd": _get(w, "delta_cmd"),
+                "delta_actual": _get(w, "delta_actual"),
+            }
+            for name, w in wheel_states.items()
+        ]
+        msg = {"timestamp": _ts(ts_ns), "wheels": wheels}
+        self._queue("/irsim/motor", _encode(msg))
