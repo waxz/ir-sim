@@ -211,8 +211,8 @@ for step in range(N_STEPS):
 
     # ── Encoder + Motor ───────────────────────────────────────────────────
     encoder_data, motor_data = synthetic_wheels(v_body, OMEGA_BODY, DT)
-    bridge.update_encoder(encoder_data)
-    bridge.update_motor(motor_data)
+    bridge.update_encoder(encoder_data, robot_id=0, robot_name="diff_bot")
+    bridge.update_motor(motor_data, robot_id=0, robot_name="diff_bot")
 
     # ── 2D LiDAR ──────────────────────────────────────────────────────────
     t0 = time.perf_counter()

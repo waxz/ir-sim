@@ -198,6 +198,8 @@ _SCHEMAS: dict[str, str] = {
             "$defs": {"Time": _TIME_DEF},
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
+                "robot_id": {"type": "integer"},
+                "robot_name": {"type": "string"},
                 "wheels": {
                     "type": "array",
                     "items": {
@@ -221,6 +223,8 @@ _SCHEMAS: dict[str, str] = {
             "$defs": {"Time": _TIME_DEF},
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
+                "robot_id": {"type": "integer"},
+                "robot_name": {"type": "string"},
                 "wheels": {
                     "type": "array",
                     "items": {
@@ -576,6 +580,8 @@ class FoxgloveBridge:
     def update_encoder(
         self,
         readings: dict,
+        robot_id: int = 0,
+        robot_name: str = "robot",
     ) -> None:
         """
         Publish wheel encoder readings.
@@ -587,17 +593,17 @@ class FoxgloveBridge:
             ``{"theta_enc": float, "ticks": int, "omega_actual": float}``.
             Compatible with ``ObjectBase.encoder_readings`` and
             ``WheelLayout.get_encoder_readings()``.
+        robot_id : int
+            Unique integer ID of the robot (matches ``ObjectBase._id``).
+        robot_name : str
+            Human-readable label (e.g. ``"robot_0"``).
 
         Example
         -------
         ::
 
-            bridge.update_encoder(robot.encoder_readings)
-            # or manually:
-            bridge.update_encoder({
-                "left":  {"theta_enc": 12.3, "ticks": 1960, "omega_actual": 8.1},
-                "right": {"theta_enc": 12.1, "ticks": 1927, "omega_actual": 8.0},
-            })
+            bridge.update_encoder(robot.encoder_readings,
+                                  robot_id=robot._id, robot_name="diff_bot")
         """
         ts_ns = time.time_ns()
         wheels = [
@@ -609,12 +615,19 @@ class FoxgloveBridge:
             }
             for name, r in readings.items()
         ]
-        msg = {"timestamp": _ts(ts_ns), "wheels": wheels}
+        msg = {
+            "timestamp": _ts(ts_ns),
+            "robot_id": int(robot_id),
+            "robot_name": str(robot_name),
+            "wheels": wheels,
+        }
         self._queue("/irsim/encoder", _encode(msg))
 
     def update_motor(
         self,
         wheel_states: dict,
+        robot_id: int = 0,
+        robot_name: str = "robot",
     ) -> None:
         """
         Publish motor telemetry.
@@ -628,17 +641,17 @@ class FoxgloveBridge:
                "delta_cmd", "delta_actual"}``.
             Compatible with ``WheelLayout.get_wheel_states()`` and
             ``ObjectBase.wheel_states``.
+        robot_id : int
+            Unique integer ID of the robot (matches ``ObjectBase._id``).
+        robot_name : str
+            Human-readable label (e.g. ``"robot_0"``).
 
         Example
         -------
         ::
 
-            bridge.update_motor(robot.wheel_states)
-            # or manually:
-            bridge.update_motor({
-                "left":  {"omega_cmd": 8.2, "omega_actual": 8.1, "motor_omega": 372.6},
-                "right": {"omega_cmd": 8.2, "omega_actual": 8.0, "motor_omega": 368.0},
-            })
+            bridge.update_motor(robot.wheel_states,
+                                robot_id=robot._id, robot_name="diff_bot")
         """
         ts_ns = time.time_ns()
 
@@ -658,5 +671,10 @@ class FoxgloveBridge:
             }
             for name, w in wheel_states.items()
         ]
-        msg = {"timestamp": _ts(ts_ns), "wheels": wheels}
+        msg = {
+            "timestamp": _ts(ts_ns),
+            "robot_id": int(robot_id),
+            "robot_name": str(robot_name),
+            "wheels": wheels,
+        }
         self._queue("/irsim/motor", _encode(msg))
