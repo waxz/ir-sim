@@ -218,12 +218,20 @@ def _empty_segments() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 def _gather_obstacle_edges(
     lidar_geometry,
     detected_objects,
+    scan_envelope=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Flatten detected-object boundaries into line segments.
 
     The caller has already selected detectable scene objects. Map objects keep
     their internal spatial query here so only map lines touched by the scan are
     expanded. Owner indices refer to ``detected_objects``.
+
+    Args:
+        lidar_geometry: Max-range beams as a Shapely multiline geometry.
+        detected_objects: Objects selected by the sensor's scene query.
+        scan_envelope: Optional pre-built disk geometry (``Point(origin).buffer(max_range)``)
+            used for map queries instead of the full multiline. Querying with a
+            disk is significantly faster than querying with 1500 beam lines.
 
     Returns:
         tuple[np.ndarray, np.ndarray, np.ndarray]: Segment starts, segment ends,
@@ -233,7 +241,8 @@ def _gather_obstacle_edges(
     starts, ends, owners = [], [], []
     for object_index, obj in enumerate(detected_objects):
         if obj.shape == "map":
-            hits = obj.geometry_tree.query(lidar_geometry, predicate="intersects")
+            query_geom = scan_envelope if scan_envelope is not None else lidar_geometry
+            hits = obj.geometry_tree.query(query_geom, predicate="intersects")
             geometries = [obj.linestrings[index] for index in hits]
         elif lidar_geometry.intersects(obj._geometry):
             geometries = [obj._geometry]
@@ -354,9 +363,11 @@ def cast_rays(
     """
     shapely.prepare(lidar_geometry)
     origin, directions = _ray_parameters(lidar_geometry, max_range)
+    scan_envelope = shapely.buffer(shapely.points(origin), max_range)
     segment_start, segment_end, segment_owner = _gather_obstacle_edges(
         lidar_geometry,
         detected_objects,
+        scan_envelope=scan_envelope,
     )
     ranges, hit_segments = cast_ray_segments(
         origin,

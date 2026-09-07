@@ -4,12 +4,19 @@ from typing import TYPE_CHECKING
 import matplotlib.transforms as mtransforms
 import numpy as np
 import shapely
+import shapely as _shapely
 from matplotlib.collections import LineCollection
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from shapely import MultiLineString
 
-from irsim.lib.algorithm.ray_casting_2d import cast_rays
+from irsim.lib.algorithm.ray_casting_2d import (
+    _empty_segments,
+    _ray_parameters,
+    boundary_segments,
+    cast_ray_segments,
+    cast_rays,
+)
 from irsim.util.random import rng
 from irsim.util.util import (
     ClipTo2Pi,
@@ -140,6 +147,24 @@ class Lidar2D:
         self.plot_line_list = []
         self.plot_text_list = []
 
+        # Map segment cache: static map geometry is re-queried only when the
+        # sensor moves more than ``_map_cache_thresh`` metres from the position
+        # at which it was last computed.  Dynamic obstacles are always re-queried
+        # every step.  Set thresh to 0 to disable caching entirely.
+        self._map_seg_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._map_cache_origin: np.ndarray = np.full(2, np.inf)
+        self._map_cache_thresh: float = range_max * 0.05
+
+        try:
+            from irsim.lib.algorithm.ray_casting_2d_omp import (
+                cast_ray_segments_omp,
+                is_omp_available,
+            )
+
+            self._omp_cast = cast_ray_segments_omp if is_omp_available() else None
+        except ImportError:
+            self._omp_cast = None
+
     @property
     def _env_param(self):
         """Access env_param via parent's env instance if available."""
@@ -187,6 +212,9 @@ class Lidar2D:
         ``difference`` result to floating-point precision when the sensor origin
         is in free space, while avoiding the expensive GEOS overlay.
 
+        Static map geometry is gathered with a fast disk query and cached by
+        sensor position; dynamic obstacles are re-queried every step.
+
         Args:
             state (np.ndarray): New state of the sensor.
         """
@@ -195,10 +223,9 @@ class Lidar2D:
         lidar_geometry = self._world_geometry(state)
         detected_objects = self._get_detected_objects(lidar_geometry)
 
-        ranges, hit_object_indices, origin, directions = cast_rays(
+        ranges, hit_object_indices, origin, directions = self._cast_rays_cached(
             lidar_geometry,
             detected_objects,
-            self.range_max,
         )
 
         if self.noise:
@@ -210,6 +237,112 @@ class Lidar2D:
 
         if self.has_velocity:
             self._assign_velocities(hit_object_indices, detected_objects)
+
+    def _cast_rays_cached(
+        self,
+        lidar_geometry,
+        detected_objects: list,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Ray-cast with disk-based map query and positional segment cache.
+
+        Separates static map objects from dynamic obstacles so that the
+        expensive spatial-tree query over map walls runs only when the sensor
+        has moved more than ``_map_cache_thresh`` metres.  Dynamic obstacle
+        segments are always recomputed.  Falls back to the plain ``cast_rays``
+        path when no map objects are present so the common obstacle-only case
+        carries no overhead.
+        """
+        # Partition detected objects into static (map) and dynamic
+        map_objs: list[tuple[int, object]] = []
+        dyn_objs: list[tuple[int, object]] = []
+        for i, obj in enumerate(detected_objects):
+            if getattr(obj, "shape", None) == "map":
+                map_objs.append((i, obj))
+            else:
+                dyn_objs.append((i, obj))
+
+        # Fast path: no map objects → standard pipeline (already fast)
+        if not map_objs:
+            return cast_rays(lidar_geometry, detected_objects, self.range_max)
+
+        _shapely.prepare(lidar_geometry)
+        origin, directions = _ray_parameters(lidar_geometry, self.range_max)
+        origin_2d = origin[:2]
+
+        # ── Map segments: use positional cache ───────────────────────────────
+        cache_hit = (
+            self._map_seg_cache is not None
+            and np.linalg.norm(origin_2d - self._map_cache_origin)
+            <= self._map_cache_thresh
+        )
+        if cache_hit:
+            map_ss, map_se, map_owners = self._map_seg_cache  # type: ignore[misc]
+        else:
+            disk = _shapely.buffer(_shapely.points(origin_2d), self.range_max)
+            ss_list, se_list, ow_list = [], [], []
+            for obj_idx, obj in map_objs:
+                hits = obj.geometry_tree.query(disk, predicate="intersects")
+                if len(hits) == 0:
+                    continue
+                geoms = [obj.linestrings[h] for h in hits]
+                s, e = boundary_segments(geoms)
+                if len(s):
+                    ss_list.append(s)
+                    se_list.append(e)
+                    ow_list.append(np.full(len(s), obj_idx, dtype=int))
+            if ss_list:
+                map_ss = np.concatenate(ss_list)
+                map_se = np.concatenate(se_list)
+                map_owners = np.concatenate(ow_list)
+            else:
+                map_ss, map_se, map_owners = _empty_segments()
+            self._map_seg_cache = (map_ss, map_se, map_owners)
+            self._map_cache_origin = origin_2d.copy()
+
+        # ── Dynamic segments: always fresh ───────────────────────────────────
+        dyn_ss_list, dyn_se_list, dyn_ow_list = [], [], []
+        for obj_idx, obj in dyn_objs:
+            if not lidar_geometry.intersects(obj._geometry):
+                continue
+            s, e = boundary_segments([obj._geometry])
+            if len(s):
+                dyn_ss_list.append(s)
+                dyn_se_list.append(e)
+                dyn_ow_list.append(np.full(len(s), obj_idx, dtype=int))
+        if dyn_ss_list:
+            dyn_ss = np.concatenate(dyn_ss_list)
+            dyn_se = np.concatenate(dyn_se_list)
+            dyn_owners = np.concatenate(dyn_ow_list)
+        else:
+            dyn_ss, dyn_se, dyn_owners = _empty_segments()
+
+        # ── Merge ────────────────────────────────────────────────────────────
+        parts_s = [a for a in (map_ss, dyn_ss) if len(a)]
+        parts_e = [a for a in (map_se, dyn_se) if len(a)]
+        parts_o = [a for a in (map_owners, dyn_owners) if len(a)]
+        if parts_s:
+            seg_start = np.concatenate(parts_s)
+            seg_end = np.concatenate(parts_e)
+            seg_owner = np.concatenate(parts_o)
+        else:
+            seg_start, seg_end, seg_owner = _empty_segments()
+
+        # ── Cast (prefer OMP kernel) ──────────────────────────────────────────
+        if self._omp_cast is not None:
+            ranges, hit_segs = self._omp_cast(
+                origin, directions, seg_start, seg_end, self.range_max
+            )
+        else:
+            ranges, hit_segs = cast_ray_segments(
+                origin, directions, seg_start, seg_end, self.range_max
+            )
+
+        hit_object_indices = np.full(len(directions), -1, dtype=int)
+        has_hit = hit_segs >= 0
+        if has_hit.any() and len(seg_owner):
+            hit_object_indices[has_hit] = seg_owner[hit_segs[has_hit]]
+
+        return ranges, hit_object_indices, origin, directions
 
     def _get_detected_objects(self, lidar_geometry) -> list:
         """Select objects that may produce a return for this lidar geometry.
