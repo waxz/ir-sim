@@ -1,11 +1,11 @@
 """
 Foxglove Studio WebSocket bridge for IR-SIM.
 
-Streams sensor frames and performance metrics to Foxglove Studio
-at a configurable rate without blocking the simulation loop.
+Bidirectional: streams sensor telemetry to Foxglove Studio and receives
+remote-operation commands back from it, all over a single WebSocket server.
 
-Channels published
-------------------
+Channels published (sim → Studio)
+----------------------------------
 /irsim/lidar2d     foxglove.LaserScan   — 2D horizontal scan (per robot x sensor)
 /irsim/lidar3d     foxglove.PointCloud  — 3D spinning LiDAR  (per robot x sensor)
 /irsim/pose        foxglove.PoseInFrame — robot pose (per robot)
@@ -13,6 +13,17 @@ Channels published
 /irsim/encoder     irsim.Encoder        — wheel encoders      (per robot x sensor)
 /irsim/motor       irsim.Motor          — motor telemetry     (per robot x sensor)
 /irsim/metrics     irsim.Metrics        — timing and CPU
+
+Client channels received (Studio → sim)
+-----------------------------------------
+/irsim/cmd_vel     irsim.CmdVel  — velocity command  {"linear": float, "angular": float}
+/irsim/cmd_pose    irsim.CmdPose — goal pose         {"x", "y", "theta", "robot_id"}
+<any topic>        any schema    — get_latest(topic) returns raw decoded dict
+
+Services (Studio → sim, request/response)
+------------------------------------------
+/irsim/control     irsim.Control — {"command": "pause"|"resume"|"reset"}
+                                   response: {"ok": bool, "message": str}
 
 Multiple robots and multiple sensors per robot are supported on every channel.
 The bridge keeps the latest frame for each (robot_id, sensor_name) pair and
@@ -25,27 +36,21 @@ Usage::
     bridge = FoxgloveBridge(port=8765, publish_hz=10.0)
     bridge.start()
 
-    # inside the sim loop — per-robot, per-sensor calls:
-    bridge.update_lidar2d(ranges, origin_xyz,
-                          robot_id=r._id, robot_name="robot_0",
-                          sensor_name="lidar_front")
-    bridge.update_lidar3d(points_xyz, origin_xyz,
-                          robot_id=r._id, robot_name="robot_0",
-                          sensor_name="vlp16_top")
-    bridge.update_pose(x, y, theta,
-                       robot_id=r._id, robot_name="robot_0")
-    bridge.update_imu(omega_meas, accel_meas,
-                      robot_id=r._id, robot_name="robot_0",
-                      sensor_name="imu_0")
-    bridge.update_encoder(readings,
-                          robot_id=r._id, robot_name="robot_0",
-                          sensor_name="encoder_0")
-    bridge.update_motor(wheel_states,
-                        robot_id=r._id, robot_name="robot_0",
-                        sensor_name="motor_0")
-    bridge.update_metrics(scan_2d_ms=1.2, scan_3d_ms=39.0, cpu_pct=5.0, step=100)
+    # Publish telemetry (sim → Studio)
+    bridge.update_pose(x, y, theta, robot_id=r._id, robot_name="robot_0")
+    bridge.update_lidar2d(ranges, origin_xyz, robot_id=r._id, sensor_name="lidar_front")
+
+    # Receive remote-operation commands (Studio → sim) — non-blocking poll
+    cmd = bridge.pop_cmd_vel()           # {"linear": float, "angular": float} or None
+    goal = bridge.pop_cmd_pose()         # {"x", "y", "theta", "robot_id"} or None
+    msg = bridge.get_latest("/my/topic") # raw dict or None
+
+    if bridge.is_paused():               # True while Studio sent "pause"
+        continue
 
     # Open Foxglove Studio → Connect → ws://localhost:8765
+    # Publish panel: topic=/irsim/cmd_vel  {"linear":{"x":0.5},"angular":{"z":0.3}}
+    # Service Call panel: /irsim/control   {"command":"pause"}
 
 Requires::
 
@@ -67,10 +72,16 @@ import numpy as np
 
 try:
     from foxglove_websocket.server import FoxgloveServer as _FoxgloveServer
+    from foxglove_websocket.server import (
+        FoxgloveServerListener as _FoxgloveServerListener,
+    )
+    from foxglove_websocket.types import ClientChannelId as _ClientChannelId
 
     _HAS_FG = True
 except ImportError:  # pragma: no cover
     _HAS_FG = False
+    _FoxgloveServerListener = object  # type: ignore[assignment,misc]
+    _ClientChannelId = int  # type: ignore[assignment,misc]
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +304,83 @@ _PC_FIELDS = [
 ]
 _PC_STRIDE = 12  # 3 x float32
 
+# ---------------------------------------------------------------------------
+# Service schemas (Studio → sim)
+# ---------------------------------------------------------------------------
+
+_SVC_CONTROL_REQ = json.dumps(
+    {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "irsim.ControlRequest",
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "enum": ["pause", "resume", "reset"]},
+        },
+        "required": ["command"],
+    }
+)
+_SVC_CONTROL_RESP = json.dumps(
+    {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "irsim.ControlResponse",
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "message": {"type": "string"},
+        },
+    }
+)
+
+# Client-channel schemas (documented here; the client declares them)
+_CLIENT_SCHEMAS = {
+    "/irsim/cmd_vel": json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "irsim.CmdVel",
+            "type": "object",
+            "description": "Velocity command from Foxglove Studio to IR-SIM.",
+            "properties": {
+                "robot_id": {"type": "integer", "default": 0},
+                "linear": {
+                    "oneOf": [
+                        {"type": "number"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "number"},
+                                "y": {"type": "number"},
+                            },
+                        },
+                    ]
+                },
+                "angular": {
+                    "oneOf": [
+                        {"type": "number"},
+                        {
+                            "type": "object",
+                            "properties": {"z": {"type": "number"}},
+                        },
+                    ]
+                },
+            },
+        }
+    ),
+    "/irsim/cmd_pose": json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "irsim.CmdPose",
+            "type": "object",
+            "description": "Goal pose command from Foxglove Studio to IR-SIM.",
+            "properties": {
+                "robot_id": {"type": "integer", "default": 0},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "theta": {"type": "number"},
+            },
+        }
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -313,6 +401,64 @@ def _pose(x: float = 0.0, y: float = 0.0, z: float = 0.0, yaw: float = 0.0) -> d
 
 def _encode(msg: Any) -> bytes:
     return json.dumps(msg).encode()
+
+
+# ---------------------------------------------------------------------------
+# Listener — receives messages and service calls from Foxglove Studio
+# ---------------------------------------------------------------------------
+
+
+class _BridgeListener(_FoxgloveServerListener):
+    """Routes incoming client messages and service calls into the bridge RX buffer."""
+
+    def __init__(self, bridge: FoxgloveBridge) -> None:
+        self._bridge = bridge
+        # Map assigned channel_id → topic string (filled in on_client_advertise)
+        self._ch_map: dict[int, str] = {}
+
+    async def on_client_advertise(self, server: Any, channel: Any) -> None:
+        self._ch_map[channel["id"]] = channel["topic"]
+
+    async def on_client_unadvertise(self, server: Any, channel_id: int) -> None:
+        self._ch_map.pop(channel_id, None)
+
+    async def on_client_message(
+        self, server: Any, channel_id: int, payload: bytes
+    ) -> None:
+        topic = self._ch_map.get(channel_id)
+        if topic is None:
+            return
+        with contextlib.suppress(Exception):
+            msg = json.loads(payload)
+            with self._bridge._rx_lock:
+                self._bridge._rx_buf[topic] = (time.time(), msg)
+
+    async def on_service_request(
+        self,
+        server: Any,
+        service_id: int,
+        call_id: str,
+        encoding: str,
+        payload: bytes,
+    ) -> bytes:
+        svc_name = self._bridge._svc_map.get(service_id, "")
+        if svc_name == "/irsim/control":
+            with contextlib.suppress(Exception):
+                req = json.loads(payload)
+                cmd = str(req.get("command", "")).lower()
+                if cmd == "pause":
+                    self._bridge._paused = True
+                    return _encode({"ok": True, "message": "paused"})
+                if cmd == "resume":
+                    self._bridge._paused = False
+                    return _encode({"ok": True, "message": "resumed"})
+                if cmd == "reset":
+                    self._bridge._paused = False
+                    with self._bridge._rx_lock:
+                        self._bridge._rx_buf.clear()
+                    return _encode({"ok": True, "message": "reset"})
+                return _encode({"ok": False, "message": f"unknown command: {cmd}"})
+        return _encode({"ok": False, "message": "unknown service"})
 
 
 # ---------------------------------------------------------------------------
@@ -357,12 +503,18 @@ class FoxgloveBridge:
         self._port = port
         self._period = 1.0 / max(publish_hz, 0.1)
 
-        # Shared state: main thread writes, bg thread reads.
+        # TX: main thread writes, bg thread reads.
         # Key = (topic, sub_key) where sub_key = "{robot_id}:{sensor_name}"
         # so each (robot, sensor) pair gets its own slot.
         self._lock = threading.Lock()
         self._pending: dict[tuple[str, str], tuple[int, bytes]] = {}
         self._last_sent: dict[tuple[str, str], float] = {}
+
+        # RX: bg thread writes (from Studio), main thread reads (sim loop polls).
+        self._rx_lock = threading.Lock()
+        self._rx_buf: dict[str, tuple[float, Any]] = {}  # topic → (ts, msg)
+        self._paused = False  # set by /irsim/control service
+        self._svc_map: dict[int, str] = {}  # service_id → service name
 
         # Performance counters (updated by update_metrics)
         self._step = 0
@@ -402,9 +554,13 @@ class FoxgloveBridge:
 
     async def _serve(self) -> None:
         server = _FoxgloveServer(self._host, self._port, "IR-SIM")
+
+        # Attach listener before start() so no events are missed
+        server.set_listener(_BridgeListener(self))
         server.start()
         self._server = server
 
+        # Register TX channels (sim → Studio)
         chan_ids: dict[str, int] = {}
         for topic, schema in _SCHEMAS.items():
             cid = await server.add_channel(
@@ -416,6 +572,27 @@ class FoxgloveBridge:
                 }
             )
             chan_ids[topic] = cid
+
+        # Register /irsim/control service (Studio → sim)
+        svc_id = await server.add_service(
+            {
+                "name": "/irsim/control",
+                "type": "irsim.Control",
+                "request": {
+                    "encoding": "json",
+                    "schemaName": "irsim.ControlRequest",
+                    "schemaEncoding": "jsonschema",
+                    "schema": _SVC_CONTROL_REQ,
+                },
+                "response": {
+                    "encoding": "json",
+                    "schemaName": "irsim.ControlResponse",
+                    "schemaEncoding": "jsonschema",
+                    "schema": _SVC_CONTROL_RESP,
+                },
+            }
+        )
+        self._svc_map[svc_id] = "/irsim/control"
 
         self._ready.set()
 
@@ -763,3 +940,85 @@ class FoxgloveBridge:
             "wheels": wheels,
         }
         self._queue("/irsim/motor", _encode(msg), self._sub(robot_id, sensor_name))
+
+    # ------------------------------------------------------------------
+    # Remote-operation receive methods — poll from the sim loop
+    # ------------------------------------------------------------------
+
+    def get_latest(self, topic: str) -> dict | None:
+        """
+        Return and consume the latest message received on *topic*, or ``None``.
+
+        Thread-safe; non-blocking.  The message is removed from the buffer so
+        the next call returns ``None`` until a new message arrives.
+
+        Parameters
+        ----------
+        topic : str
+            Any topic the Foxglove Studio "Publish" panel has sent to this
+            bridge, e.g. ``"/irsim/cmd_vel"`` or ``"/irsim/cmd_pose"``.
+        """
+        with self._rx_lock:
+            entry = self._rx_buf.pop(topic, None)
+        return None if entry is None else entry[1]
+
+    def pop_cmd_vel(self, robot_id: int = 0) -> dict | None:
+        """
+        Return the latest velocity command for *robot_id* and clear it.
+
+        The Foxglove Studio "Publish" panel should publish on ``/irsim/cmd_vel``
+        with schema ``irsim.CmdVel``::
+
+            {"robot_id": 0, "linear": {"x": 0.5}, "angular": {"z": 0.3}}
+
+        Returns a normalised dict ``{"linear": float, "angular": float, "robot_id": int}``
+        or ``None`` if no command has arrived since the last call.
+        """
+        msg = self.get_latest("/irsim/cmd_vel")
+        if msg is None:
+            return None
+        # Accept both flat scalars and nested {"x":…} / {"z":…} objects
+        lin = msg.get("linear", 0.0)
+        ang = msg.get("angular", 0.0)
+        return {
+            "robot_id": int(msg.get("robot_id", robot_id)),
+            "linear": float(lin["x"] if isinstance(lin, dict) else lin),
+            "angular": float(ang["z"] if isinstance(ang, dict) else ang),
+        }
+
+    def pop_cmd_pose(self) -> dict | None:
+        """
+        Return the latest goal-pose command and clear it.
+
+        The Foxglove Studio "Publish" panel should publish on ``/irsim/cmd_pose``
+        with schema ``irsim.CmdPose``::
+
+            {"robot_id": 0, "x": 5.0, "y": 3.0, "theta": 1.57}
+
+        Returns the raw decoded dict or ``None`` if no command has arrived.
+        """
+        return self.get_latest("/irsim/cmd_pose")
+
+    def is_paused(self) -> bool:
+        """
+        Return ``True`` while Foxglove Studio has paused the simulation.
+
+        Set by the ``/irsim/control`` service (``{"command": "pause"}``).
+        Cleared by ``{"command": "resume"}`` or ``{"command": "reset"}``.
+        Can also be toggled from the sim side via :meth:`set_paused`.
+        """
+        return self._paused
+
+    def set_paused(self, paused: bool) -> None:
+        """Override the pause state from the simulation side."""
+        self._paused = paused
+
+    @property
+    def client_schemas(self) -> dict[str, str]:
+        """
+        JSON schemas for the client channels this bridge expects to receive.
+
+        Keys are topic names; values are JSON Schema strings.  Useful for
+        documentation or for generating a Foxglove panel config.
+        """
+        return dict(_CLIENT_SCHEMAS)

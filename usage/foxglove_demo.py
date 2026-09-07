@@ -273,6 +273,37 @@ for step in range(N_STEPS):
         step=step,
     )
 
+    # ── Remote operation (Studio → sim) ───────────────────────────────────
+    # Pause/resume from Foxglove Studio "Service Call" panel:
+    #   Service: /irsim/control   Body: {"command": "pause"}
+    if bridge.is_paused():
+        # In a real sim loop: skip env.step() while paused
+        print(f"  [step {step}] paused — waiting for resume …", end="\r")
+        time.sleep(DT)
+        continue
+
+    # Velocity override from Foxglove Studio "Publish" panel:
+    #   Topic: /irsim/cmd_vel   Schema: irsim.CmdVel
+    #   Body: {"linear": {"x": 1.0}, "angular": {"z": 0.5}}
+    cmd = bridge.pop_cmd_vel()
+    if cmd is not None:
+        # In a real sim loop: pass cmd["linear"] / cmd["angular"] to the robot
+        print(
+            f"  [step {step}] remote cmd_vel:"
+            f" v={cmd['linear']:.2f} m/s  w={cmd['angular']:.2f} rad/s"
+        )
+
+    # Goal pose from Foxglove Studio "Publish" panel:
+    #   Topic: /irsim/cmd_pose  Schema: irsim.CmdPose
+    #   Body: {"robot_id": 0, "x": 5.0, "y": 3.0, "theta": 1.57}
+    goal = bridge.pop_cmd_pose()
+    if goal is not None:
+        print(
+            f"  [step {step}] remote goal:"
+            f" ({goal.get('x', 0):.1f}, {goal.get('y', 0):.1f})"
+            f"  θ={goal.get('theta', 0):.2f}"
+        )
+
     time.sleep(DT)
 
 bridge.stop()
