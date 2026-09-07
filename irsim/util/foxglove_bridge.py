@@ -6,10 +6,17 @@ at a configurable rate without blocking the simulation loop.
 
 Channels published
 ------------------
-/irsim/lidar2d     foxglove.LaserScan  — 2D horizontal scan
-/irsim/lidar3d     foxglove.PointCloud — 3D spinning LiDAR
-/irsim/pose        foxglove.PoseInFrame — robot pose (x, y, theta)
-/irsim/metrics     irsim.Metrics       — timing and CPU
+/irsim/lidar2d     foxglove.LaserScan   — 2D horizontal scan (per robot x sensor)
+/irsim/lidar3d     foxglove.PointCloud  — 3D spinning LiDAR  (per robot x sensor)
+/irsim/pose        foxglove.PoseInFrame — robot pose (per robot)
+/irsim/imu         foxglove.Imu         — IMU measurements    (per robot x sensor)
+/irsim/encoder     irsim.Encoder        — wheel encoders      (per robot x sensor)
+/irsim/motor       irsim.Motor          — motor telemetry     (per robot x sensor)
+/irsim/metrics     irsim.Metrics        — timing and CPU
+
+Multiple robots and multiple sensors per robot are supported on every channel.
+The bridge keeps the latest frame for each (robot_id, sensor_name) pair and
+publishes it at most ``publish_hz`` times per second.
 
 Usage::
 
@@ -18,10 +25,24 @@ Usage::
     bridge = FoxgloveBridge(port=8765, publish_hz=10.0)
     bridge.start()
 
-    # inside the sim loop — call as often as you like, bridge rate-limits:
-    bridge.update_lidar2d(ranges, origin_xyz, angle_min=-pi, angle_max=pi)
-    bridge.update_lidar3d(points_xyz, origin_xyz)   # (N,3) ndarray
-    bridge.update_pose(x, y, theta)
+    # inside the sim loop — per-robot, per-sensor calls:
+    bridge.update_lidar2d(ranges, origin_xyz,
+                          robot_id=r._id, robot_name="robot_0",
+                          sensor_name="lidar_front")
+    bridge.update_lidar3d(points_xyz, origin_xyz,
+                          robot_id=r._id, robot_name="robot_0",
+                          sensor_name="vlp16_top")
+    bridge.update_pose(x, y, theta,
+                       robot_id=r._id, robot_name="robot_0")
+    bridge.update_imu(omega_meas, accel_meas,
+                      robot_id=r._id, robot_name="robot_0",
+                      sensor_name="imu_0")
+    bridge.update_encoder(readings,
+                          robot_id=r._id, robot_name="robot_0",
+                          sensor_name="encoder_0")
+    bridge.update_motor(wheel_states,
+                        robot_id=r._id, robot_name="robot_0",
+                        sensor_name="motor_0")
     bridge.update_metrics(scan_2d_ms=1.2, scan_3d_ms=39.0, cpu_pct=5.0, step=100)
 
     # Open Foxglove Studio → Connect → ws://localhost:8765
@@ -94,6 +115,13 @@ _DEFS = {
     "Pose": _POSE_DEF,
 }
 
+# Identity fields shared by every per-robot/per-sensor schema
+_ID_PROPS = {
+    "robot_id": {"type": "integer"},
+    "robot_name": {"type": "string"},
+    "sensor_name": {"type": "string"},
+}
+
 _SCHEMAS: dict[str, str] = {
     "/irsim/lidar2d": json.dumps(
         {
@@ -104,6 +132,7 @@ _SCHEMAS: dict[str, str] = {
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
                 "frame_id": {"type": "string"},
+                **_ID_PROPS,
                 "pose": {"$ref": "#/$defs/Pose"},
                 "start_angle": {"type": "number"},
                 "end_angle": {"type": "number"},
@@ -121,6 +150,7 @@ _SCHEMAS: dict[str, str] = {
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
                 "frame_id": {"type": "string"},
+                **_ID_PROPS,
                 "pose": {"$ref": "#/$defs/Pose"},
                 "point_stride": {"type": "integer"},
                 "fields": {
@@ -147,6 +177,8 @@ _SCHEMAS: dict[str, str] = {
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
                 "frame_id": {"type": "string"},
+                "robot_id": {"type": "integer"},
+                "robot_name": {"type": "string"},
                 "pose": {"$ref": "#/$defs/Pose"},
             },
         }
@@ -177,6 +209,7 @@ _SCHEMAS: dict[str, str] = {
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
                 "frame_id": {"type": "string"},
+                **_ID_PROPS,
                 "linear_acceleration": {"$ref": "#/$defs/Vector3"},
                 "angular_velocity": {"$ref": "#/$defs/Vector3"},
                 "linear_acceleration_covariance": {
@@ -198,8 +231,7 @@ _SCHEMAS: dict[str, str] = {
             "$defs": {"Time": _TIME_DEF},
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
-                "robot_id": {"type": "integer"},
-                "robot_name": {"type": "string"},
+                **_ID_PROPS,
                 "wheels": {
                     "type": "array",
                     "items": {
@@ -223,8 +255,7 @@ _SCHEMAS: dict[str, str] = {
             "$defs": {"Time": _TIME_DEF},
             "properties": {
                 "timestamp": {"$ref": "#/$defs/Time"},
-                "robot_id": {"type": "integer"},
-                "robot_name": {"type": "string"},
+                **_ID_PROPS,
                 "wheels": {
                     "type": "array",
                     "items": {
@@ -295,7 +326,11 @@ class FoxgloveBridge:
 
     Runs a background async server thread.  Call ``update_*`` from the sim
     loop at any rate; the bridge publishes at most ``publish_hz`` times per
-    second.
+    second per (robot, sensor) pair.
+
+    Multiple robots and multiple sensors per robot are fully supported —
+    each ``(robot_id, sensor_name)`` pair gets its own pending slot so no
+    sensor overwrites another.
 
     Parameters
     ----------
@@ -304,7 +339,7 @@ class FoxgloveBridge:
     port : int
         WebSocket port (default ``8765``).
     publish_hz : float
-        Maximum publish rate for each channel (default ``10.0``).
+        Maximum publish rate per channel slot (default ``10.0``).
     """
 
     def __init__(
@@ -322,10 +357,12 @@ class FoxgloveBridge:
         self._port = port
         self._period = 1.0 / max(publish_hz, 0.1)
 
-        # Shared state: main thread writes, bg thread reads
+        # Shared state: main thread writes, bg thread reads.
+        # Key = (topic, sub_key) where sub_key = "{robot_id}:{sensor_name}"
+        # so each (robot, sensor) pair gets its own slot.
         self._lock = threading.Lock()
-        self._pending: dict[str, tuple[int, bytes]] = {}  # topic → (ts_ns, payload)
-        self._last_sent: dict[str, float] = {}
+        self._pending: dict[tuple[str, str], tuple[int, bytes]] = {}
+        self._last_sent: dict[tuple[str, str], float] = {}
 
         # Performance counters (updated by update_metrics)
         self._step = 0
@@ -382,7 +419,7 @@ class FoxgloveBridge:
 
         self._ready.set()
 
-        # Drain loop: flush the latest pending message for each channel
+        # Drain loop: flush the latest pending frame for each (topic, sub_key) slot
         while True:
             await asyncio.sleep(self._period)
             now = time.perf_counter()
@@ -390,12 +427,12 @@ class FoxgloveBridge:
                 snapshot = dict(self._pending)
                 self._pending.clear()
 
-            for topic, (ts_ns, payload) in snapshot.items():
-                last = self._last_sent.get(topic, 0.0)
+            for (topic, sub_key), (ts_ns, payload) in snapshot.items():
+                last = self._last_sent.get((topic, sub_key), 0.0)
                 if now - last >= self._period * 0.9 and topic in chan_ids:
                     with contextlib.suppress(Exception):
                         await server.send_message(chan_ids[topic], ts_ns, payload)
-                    self._last_sent[topic] = now
+                    self._last_sent[(topic, sub_key)] = now
 
         await server.wait_closed()
 
@@ -403,11 +440,15 @@ class FoxgloveBridge:
     # Queue helpers (called from main thread)
     # ------------------------------------------------------------------
 
-    def _queue(self, topic: str, payload: bytes) -> None:
-        """Store latest payload; overwrites previous unsent frame."""
+    def _queue(self, topic: str, payload: bytes, sub_key: str = "") -> None:
+        """Store latest payload for (topic, sub_key); overwrites previous unsent frame."""
         ts_ns = time.time_ns()
         with self._lock:
-            self._pending[topic] = (ts_ns, payload)
+            self._pending[(topic, sub_key)] = (ts_ns, payload)
+
+    @staticmethod
+    def _sub(robot_id: int, sensor_name: str) -> str:
+        return f"{robot_id}:{sensor_name}"
 
     # ------------------------------------------------------------------
     # Public update methods — call from the sim loop
@@ -420,15 +461,22 @@ class FoxgloveBridge:
         angle_min: float = -math.pi,
         angle_max: float = math.pi,
         frame_id: str = "lidar2d",
+        robot_id: int = 0,
+        robot_name: str = "robot",
+        sensor_name: str = "lidar2d_0",
     ) -> None:
         """
         Publish a 2D laser scan.
 
         Parameters
         ----------
-        ranges : (N,) float array — measured ranges in metres (inf / nan for no return)
+        ranges : (N,) float array — measured ranges in metres (inf/nan → 0)
         origin_xyz : [x, y, z] sensor origin in world frame
         angle_min / angle_max : scan arc in radians
+        frame_id : coordinate frame for Foxglove rendering (e.g. ``"map"``)
+        robot_id : unique integer ID of the robot
+        robot_name : human-readable robot label
+        sensor_name : per-robot sensor identifier (e.g. ``"lidar_front"``)
         """
         ts_ns = time.time_ns()
         ox, oy, oz = (
@@ -439,19 +487,25 @@ class FoxgloveBridge:
         msg = {
             "timestamp": _ts(ts_ns),
             "frame_id": frame_id,
+            "robot_id": int(robot_id),
+            "robot_name": str(robot_name),
+            "sensor_name": str(sensor_name),
             "pose": _pose(ox, oy, oz),
             "start_angle": float(angle_min),
             "end_angle": float(angle_max),
             "ranges": [float(r) if np.isfinite(r) else 0.0 for r in ranges],
             "intensities": [],
         }
-        self._queue("/irsim/lidar2d", _encode(msg))
+        self._queue("/irsim/lidar2d", _encode(msg), self._sub(robot_id, sensor_name))
 
     def update_lidar3d(
         self,
         points_xyz: np.ndarray,
         origin_xyz: list | np.ndarray,
         frame_id: str = "lidar3d",
+        robot_id: int = 0,
+        robot_name: str = "robot",
+        sensor_name: str = "lidar3d_0",
     ) -> None:
         """
         Publish a 3D point cloud.
@@ -460,6 +514,10 @@ class FoxgloveBridge:
         ----------
         points_xyz : (N, 3) float32 array of hit points in world frame
         origin_xyz : [x, y, z] sensor origin
+        frame_id : coordinate frame for Foxglove rendering
+        robot_id : unique integer ID of the robot
+        robot_name : human-readable robot label
+        sensor_name : per-robot sensor identifier (e.g. ``"vlp16_top"``)
         """
         ts_ns = time.time_ns()
         pts = np.asarray(points_xyz, dtype=np.float32)
@@ -475,12 +533,15 @@ class FoxgloveBridge:
         msg = {
             "timestamp": _ts(ts_ns),
             "frame_id": frame_id,
+            "robot_id": int(robot_id),
+            "robot_name": str(robot_name),
+            "sensor_name": str(sensor_name),
             "pose": _pose(ox, oy, oz),
             "point_stride": _PC_STRIDE,
             "fields": _PC_FIELDS,
             "data": data_b64,
         }
-        self._queue("/irsim/lidar3d", _encode(msg))
+        self._queue("/irsim/lidar3d", _encode(msg), self._sub(robot_id, sensor_name))
 
     def update_pose(
         self,
@@ -489,15 +550,26 @@ class FoxgloveBridge:
         theta: float,
         z: float = 0.0,
         frame_id: str = "map",
+        robot_id: int = 0,
+        robot_name: str = "robot",
     ) -> None:
-        """Publish robot pose (x, y, theta in radians, optional z)."""
+        """
+        Publish robot pose (x, y, theta in radians, optional z).
+
+        Parameters
+        ----------
+        robot_id : unique integer ID of the robot
+        robot_name : human-readable robot label
+        """
         ts_ns = time.time_ns()
         msg = {
             "timestamp": _ts(ts_ns),
             "frame_id": frame_id,
+            "robot_id": int(robot_id),
+            "robot_name": str(robot_name),
             "pose": _pose(x, y, z, theta),
         }
-        self._queue("/irsim/pose", _encode(msg))
+        self._queue("/irsim/pose", _encode(msg), str(robot_id))
 
     def update_metrics(
         self,
@@ -545,16 +617,22 @@ class FoxgloveBridge:
         angular_velocity: np.ndarray,
         linear_acceleration: np.ndarray,
         frame_id: str = "imu",
+        robot_id: int = 0,
+        robot_name: str = "robot",
+        sensor_name: str = "imu_0",
     ) -> None:
         """
         Publish IMU measurements.
 
         Parameters
         ----------
-        angular_velocity : array-like, shape (3,) — [ωx, ωy, ωz] in rad/s
+        angular_velocity : array-like, shape (3,) — [wx, wy, wz] in rad/s
         linear_acceleration : array-like, shape (3,) — [ax, ay, az] in m/s²
-            (az includes static gravity ≈ +9.807 m/s² for a level robot)
-        frame_id : sensor frame identifier
+            (az includes static gravity ~+9.807 m/s² for a level robot)
+        frame_id : coordinate frame of the sensor
+        robot_id : unique integer ID of the robot
+        robot_name : human-readable robot label
+        sensor_name : per-robot IMU identifier (e.g. ``"imu_front"``)
         """
         ts_ns = time.time_ns()
         av = np.asarray(angular_velocity).ravel()
@@ -562,6 +640,9 @@ class FoxgloveBridge:
         msg = {
             "timestamp": _ts(ts_ns),
             "frame_id": frame_id,
+            "robot_id": int(robot_id),
+            "robot_name": str(robot_name),
+            "sensor_name": str(sensor_name),
             "angular_velocity": {
                 "x": float(av[0]),
                 "y": float(av[1]),
@@ -575,13 +656,14 @@ class FoxgloveBridge:
             "angular_velocity_covariance": [],
             "linear_acceleration_covariance": [],
         }
-        self._queue("/irsim/imu", _encode(msg))
+        self._queue("/irsim/imu", _encode(msg), self._sub(robot_id, sensor_name))
 
     def update_encoder(
         self,
         readings: dict,
         robot_id: int = 0,
         robot_name: str = "robot",
+        sensor_name: str = "encoder_0",
     ) -> None:
         """
         Publish wheel encoder readings.
@@ -593,17 +675,17 @@ class FoxgloveBridge:
             ``{"theta_enc": float, "ticks": int, "omega_actual": float}``.
             Compatible with ``ObjectBase.encoder_readings`` and
             ``WheelLayout.get_encoder_readings()``.
-        robot_id : int
-            Unique integer ID of the robot (matches ``ObjectBase._id``).
-        robot_name : str
-            Human-readable label (e.g. ``"robot_0"``).
+        robot_id : unique integer ID of the robot (matches ``ObjectBase._id``)
+        robot_name : human-readable label (e.g. ``"robot_0"``)
+        sensor_name : per-robot encoder unit identifier (e.g. ``"enc_left_axle"``)
 
         Example
         -------
         ::
 
             bridge.update_encoder(robot.encoder_readings,
-                                  robot_id=robot._id, robot_name="diff_bot")
+                                  robot_id=robot._id, robot_name="diff_bot",
+                                  sensor_name="encoder_0")
         """
         ts_ns = time.time_ns()
         wheels = [
@@ -619,15 +701,17 @@ class FoxgloveBridge:
             "timestamp": _ts(ts_ns),
             "robot_id": int(robot_id),
             "robot_name": str(robot_name),
+            "sensor_name": str(sensor_name),
             "wheels": wheels,
         }
-        self._queue("/irsim/encoder", _encode(msg))
+        self._queue("/irsim/encoder", _encode(msg), self._sub(robot_id, sensor_name))
 
     def update_motor(
         self,
         wheel_states: dict,
         robot_id: int = 0,
         robot_name: str = "robot",
+        sensor_name: str = "motor_0",
     ) -> None:
         """
         Publish motor telemetry.
@@ -641,17 +725,17 @@ class FoxgloveBridge:
                "delta_cmd", "delta_actual"}``.
             Compatible with ``WheelLayout.get_wheel_states()`` and
             ``ObjectBase.wheel_states``.
-        robot_id : int
-            Unique integer ID of the robot (matches ``ObjectBase._id``).
-        robot_name : str
-            Human-readable label (e.g. ``"robot_0"``).
+        robot_id : unique integer ID of the robot (matches ``ObjectBase._id``)
+        robot_name : human-readable label (e.g. ``"robot_0"``)
+        sensor_name : per-robot motor controller identifier (e.g. ``"motor_ctrl_0"``)
 
         Example
         -------
         ::
 
             bridge.update_motor(robot.wheel_states,
-                                robot_id=robot._id, robot_name="diff_bot")
+                                robot_id=robot._id, robot_name="diff_bot",
+                                sensor_name="motor_0")
         """
         ts_ns = time.time_ns()
 
@@ -675,6 +759,7 @@ class FoxgloveBridge:
             "timestamp": _ts(ts_ns),
             "robot_id": int(robot_id),
             "robot_name": str(robot_name),
+            "sensor_name": str(sensor_name),
             "wheels": wheels,
         }
-        self._queue("/irsim/motor", _encode(msg))
+        self._queue("/irsim/motor", _encode(msg), self._sub(robot_id, sensor_name))

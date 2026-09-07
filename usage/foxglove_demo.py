@@ -203,16 +203,22 @@ for step in range(N_STEPS):
     vx = -v_body * math.sin(theta)
     vy = v_body * math.cos(theta)
 
-    bridge.update_pose(x, y, heading)
+    bridge.update_pose(x, y, heading, robot_id=0, robot_name="diff_bot")
 
     # ── IMU ───────────────────────────────────────────────────────────────
     omega_meas, accel_meas = synthetic_imu(x, y, heading, vx, vy, OMEGA_BODY, DT)
-    bridge.update_imu(omega_meas, accel_meas)
+    bridge.update_imu(
+        omega_meas, accel_meas, robot_id=0, robot_name="diff_bot", sensor_name="imu_0"
+    )
 
     # ── Encoder + Motor ───────────────────────────────────────────────────
     encoder_data, motor_data = synthetic_wheels(v_body, OMEGA_BODY, DT)
-    bridge.update_encoder(encoder_data, robot_id=0, robot_name="diff_bot")
-    bridge.update_motor(motor_data, robot_id=0, robot_name="diff_bot")
+    bridge.update_encoder(
+        encoder_data, robot_id=0, robot_name="diff_bot", sensor_name="encoder_0"
+    )
+    bridge.update_motor(
+        motor_data, robot_id=0, robot_name="diff_bot", sensor_name="motor_0"
+    )
 
     # ── 2D LiDAR ──────────────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -221,7 +227,13 @@ for step in range(N_STEPS):
         ranges_2d = raw[:, 3].astype(float)
         scan_2d_ms = (time.perf_counter() - t0) * 1000
         bridge.update_lidar2d(
-            ranges_2d, [x, y, 1.2], angle_min=-math.pi, angle_max=math.pi
+            ranges_2d,
+            [x, y, 1.2],
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            robot_id=0,
+            robot_name="diff_bot",
+            sensor_name="lidar2d_0",
         )
     else:
         n = 720
@@ -229,7 +241,13 @@ for step in range(N_STEPS):
         ranges_2d = np.where(np.abs(angles) < 0.2, 0.0, 5.0 + np.random.randn(n) * 0.05)
         scan_2d_ms = (time.perf_counter() - t0) * 1000
         bridge.update_lidar2d(
-            ranges_2d, [x, y, 1.2], angle_min=-math.pi, angle_max=math.pi
+            ranges_2d,
+            [x, y, 1.2],
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            robot_id=0,
+            robot_name="diff_bot",
+            sensor_name="lidar2d_0",
         )
 
     # ── 3D LiDAR ──────────────────────────────────────────────────────────
@@ -238,7 +256,13 @@ for step in range(N_STEPS):
         t0 = time.perf_counter()
         pts3 = scene.cast_3d_lidar([x, y, 1.5], profile="vlp16", range_max=20.0)
         scan_3d_ms = (time.perf_counter() - t0) * 1000
-        bridge.update_lidar3d(pts3[:, :3], [x, y, 1.5])
+        bridge.update_lidar3d(
+            pts3[:, :3],
+            [x, y, 1.5],
+            robot_id=0,
+            robot_name="diff_bot",
+            sensor_name="vlp16_0",
+        )
 
     # ── Metrics ───────────────────────────────────────────────────────────
     cpu_est = (scan_2d_ms + scan_3d_ms) / (DT * 1000) * 100
