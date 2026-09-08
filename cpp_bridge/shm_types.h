@@ -99,10 +99,11 @@ static inline void irsim_fence(void) {
 
 static inline void irsim_write_state(IrsimStateSlot *slot,
                                       const IrsimState *s) {
-    slot->seq++;
+    slot->seq++;           /* even → odd  (begin write) */
     irsim_fence();
     memcpy((void *)&slot->state, s, sizeof(*s));
     irsim_fence();
+    slot->seq++;           /* odd  → even (write done) */
     slot->seq2 = slot->seq;
 }
 
@@ -121,10 +122,11 @@ static inline int irsim_read_state(const IrsimStateSlot *slot,
 
 static inline void irsim_write_cmd(IrsimCmdSlot *slot,
                                     const IrsimCmd *c) {
-    slot->seq++;
+    slot->seq++;           /* even → odd  (begin write) */
     irsim_fence();
     memcpy((void *)&slot->cmd, c, sizeof(*c));
     irsim_fence();
+    slot->seq++;           /* odd  → even (write done) */
     slot->seq2 = slot->seq;
 }
 

@@ -10,10 +10,13 @@ Layout (384 bytes in a 512-byte segment):
   offset 128  IrsimStateSlot(128 B)  robot state (IR-SIM → C++)
   offset 256  IrsimCmdSlot  (128 B)  velocity cmd (C++ → IR-SIM)
 
-Seqlock: single-writer, wait-free reader.  On x86-64 (TSO), store
-ordering between ctypes field writes is guaranteed by the hardware.
-On AArch64 (Jetson, Pi 5), wrap this module in a short C extension that
-adds dmb barriers, or use mmap.flush() after each write group.
+Seqlock protocol (single writer, wait-free reader):
+  writer: seq++ (even→odd), write data, seq++ (odd→even), seq2 = seq
+  reader: s1 = seq; read; s2 = seq2; valid iff s1==s2 and !(s1&1)
+
+On x86-64 (TSO), store ordering between ctypes field writes is guaranteed
+by the hardware.  On AArch64 (Jetson, Pi 5), wrap this module in a short
+C extension that adds dmb barriers, or use mmap.flush() after each write.
 
 Typical use in a step loop::
 
@@ -150,6 +153,10 @@ class ShmBridge:
     The Python side creates and owns the segment; the C++ side attaches
     read-write.  Call ``open()`` before the simulation loop and
     ``close()`` (or use as a context manager) at the end.
+
+    Hot-path slot references (``_state_slot``, ``_cmd_slot``,
+    ``_state_inner``) are cached in ``open()`` to eliminate repeated
+    ctypes attribute traversal on every write/read call.
     """
 
     def __init__(
@@ -161,7 +168,12 @@ class ShmBridge:
         self._size = shm_size
         self._mm: mmap.mmap | None = None
         self._blk: _IrsimBlock | None = None
+        # seqlock counter: even = valid, odd = writing
         self._state_seq: int = 0
+        # cached slot references (set in open(), cleared in close())
+        self._state_slot: _IrsimStateSlot | None = None
+        self._cmd_slot: _IrsimCmdSlot | None = None
+        self._state_inner: _IrsimState | None = None
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -189,8 +201,16 @@ class ShmBridge:
         self._blk = _IrsimBlock.from_buffer(self._mm)
         self._blk.ready = 1  # signal C++ side that segment is ready
 
+        # cache slot references to avoid per-call ctypes attribute traversal
+        self._state_slot = self._blk.state
+        self._cmd_slot = self._blk.cmd
+        self._state_inner = self._state_slot.state
+
     def close(self) -> None:
         """Unmap and delete the shm segment."""
+        self._state_inner = None
+        self._state_slot = None
+        self._cmd_slot = None
         if self._blk is not None:
             self._blk = None
         if self._mm is not None:
@@ -229,17 +249,19 @@ class ShmBridge:
         st = robot.state  # np.ndarray [x, y, heading, ...]
         vel = robot.velocity  # np.ndarray [linear, angular] for diff
 
-        x = float(st[0])
-        y = float(st[1])
-        heading = float(st[2])
-        vx = float(vel[0]) if len(vel) > 0 else 0.0
-        vy = float(vel[1]) if len(vel) > 1 else 0.0
-        omega = float(vel[2]) if len(vel) > 2 else 0.0
+        # .item() extracts a Python scalar directly from the numpy buffer
+        # without creating an intermediate array object.
+        x = st.item(0)
+        y = st.item(1)
+        heading = st.item(2)
+        vx = vel.item(0) if vel.size > 0 else 0.0
+        vy = vel.item(1) if vel.size > 1 else 0.0
+        omega = vel.item(2) if vel.size > 2 else 0.0
 
         goal = robot.goal  # column vector or None
         if goal is not None:
-            goal_x = float(goal[0])
-            goal_y = float(goal[1])
+            goal_x = goal.item(0)
+            goal_y = goal.item(1)
             dx, dy = goal_x - x, goal_y - y
             goal_dist = math.sqrt(dx * dx + dy * dy)
         else:
@@ -278,12 +300,14 @@ class ShmBridge:
         collision: bool = False,
     ) -> None:
         """Write raw state values directly (no robot object needed)."""
-        assert self._blk is not None, "call open() first"
-        slot = self._blk.state
-        self._state_seq += 1
-        slot.seq = self._state_seq  # odd → writing
+        assert self._state_slot is not None, "call open() first"
+        slot = self._state_slot
+        s = self._state_inner
 
-        s = slot.state
+        # seqlock begin-write: even → odd
+        self._state_seq += 1
+        slot.seq = self._state_seq
+
         s.x = x
         s.y = y
         s.heading = heading
@@ -298,7 +322,9 @@ class ShmBridge:
         s.reached = int(reached)
         s.collision = int(collision)
 
-        slot.seq2 = self._state_seq  # even → valid
+        # seqlock end-write: odd → even
+        self._state_seq += 1
+        slot.seq2 = self._state_seq
 
     # ── read command (call before env.step()) ─────────────────────────────
 
@@ -310,8 +336,8 @@ class ShmBridge:
         available, or ``None`` if the slot is mid-write or no command
         has been written yet.
         """
-        assert self._blk is not None, "call open() first"
-        slot = self._blk.cmd
+        assert self._cmd_slot is not None, "call open() first"
+        slot = self._cmd_slot
         s1 = slot.seq
         linear = slot.cmd.linear
         angular = slot.cmd.angular
