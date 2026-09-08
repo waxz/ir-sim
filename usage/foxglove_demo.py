@@ -1,310 +1,457 @@
 """
 Foxglove Studio integration demo for IR-SIM.
 
-Streams 2D/3D LiDAR, robot pose, IMU, wheel encoder, motor telemetry, and
-performance metrics to Foxglove Studio at 10 Hz while the simulation runs
-at full speed.
+Runs a real IR-SIM environment with one differential-drive robot and several
+obstacles, streams all sensor and telemetry channels to Foxglove Studio, and
+accepts remote-operation commands back from Studio.
 
-Channels
---------
-/irsim/pose        foxglove.PoseInFrame  — robot pose
-/irsim/lidar2d     foxglove.LaserScan    — 2D horizontal scan
-/irsim/lidar3d     foxglove.PointCloud   — 3D spinning LiDAR (optional)
-/irsim/imu         foxglove.Imu          — gyro + accelerometer
-/irsim/encoder     irsim.Encoder         — per-wheel angle / ticks / speed
-/irsim/motor       irsim.Motor           — per-wheel cmd / actual / motor shaft
-/irsim/metrics     irsim.Metrics         — timing and CPU
+Channels published (sim -> Studio)
+------------------------------------
+/irsim/pose        foxglove.PoseInFrame  - robot pose
+/irsim/lidar2d     foxglove.LaserScan    - 2D horizontal scan
+/irsim/imu         foxglove.Imu          - gyro + accelerometer
+/irsim/encoder     irsim.Encoder         - per-wheel angle / ticks / speed
+/irsim/motor       irsim.Motor           - per-wheel cmd / actual / motor shaft
+/irsim/metrics     irsim.Metrics         - timing and CPU
+/irsim/map         foxglove.Grid         - 2D occupancy map (static, sent once)
+/irsim/scene       foxglove.SceneUpdate  - 3D bodies: robot, obstacles
+
+Client channels (Studio -> sim)
+------------------------------------
+/irsim/cmd_vel     velocity override     {"linear":{"x":0.5},"angular":{"z":0.3}}
+/irsim/cmd_pose    goal override         {"robot_id":0,"x":5.0,"y":3.0,"theta":0}
+
+Services (Studio -> sim)
+------------------------------------
+/irsim/control     pause / resume / reset
 
 Requirements::
 
-    pip install ir-sim[foxglove]          # WebSocket bridge
-    pip install ir-sim[lidar3d]           # 3D scene / LiDAR (optional)
+    pip install ir-sim[foxglove]
 
 Run::
 
     python usage/foxglove_demo.py
 
-Then open Foxglove Studio → Add connection → Foxglove WebSocket → ws://localhost:8765
+Then open Foxglove Studio -> Add connection -> Foxglove WebSocket -> ws://localhost:8765
+
+Suggested Foxglove panel layout
+---------------------------------
+- 3D panel         : /irsim/scene (robot + obstacles), /irsim/lidar2d, /irsim/pose
+- Image / Raw Msgs : /irsim/map
+- Plot panel       : /irsim/metrics fields (fps, scan_2d_ms, cpu_pct)
+- Publish panel    : topic=/irsim/cmd_vel  {"linear":{"x":1.0},"angular":{"z":0.5}}
+- Service panel    : /irsim/control        {"command":"pause"}
 """
 
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 import time
 
 import numpy as np
 
+import irsim
 from irsim.util.foxglove_bridge import FoxgloveBridge
 
 # ---------------------------------------------------------------------------
-# Foxglove bridge — starts a background WebSocket server
+# Inline YAML environment — one diff-drive robot + mixed obstacles
 # ---------------------------------------------------------------------------
 
-bridge = FoxgloveBridge(port=8765, publish_hz=10.0)
-bridge.start()
-print("Foxglove bridge ready — connect Foxglove Studio to ws://localhost:8765")
+_WORLD_YAML = """
+world:
+  height: 20
+  width: 20
+  step_time: 0.05
+  collision_mode: stop
+  plot:
+    no_axis: True
+
+robot:
+  - kinematics: {name: diff}
+    shape: {name: circle, radius: 0.2}
+    state: [-7.0, -7.0, 0.0]
+    goal: [7.0, 7.0, 0.0]
+    behavior: {name: dash}
+    vel_min: [-1.5, -2.0]
+    vel_max: [1.5, 2.0]
+    sensors:
+      - type: lidar2d
+        range_min: 0.0
+        range_max: 10.0
+        angle_range: 3.14159
+        number: 360
+        noise: False
+    plot:
+      show_goal: True
+      show_trajectory: True
+      keep_traj_length: 200
+
+obstacle:
+  - shape: {name: circle, radius: 0.5}
+    state: [0.0, 0.0, 0.0]
+
+  - shape: {name: circle, radius: 0.4}
+    state: [3.0, -3.0, 0.0]
+
+  - shape: {name: rectangle, length: 1.5, width: 0.6}
+    state: [-3.0, 2.0, 0.8]
+
+  - shape: {name: rectangle, length: 1.0, width: 1.0}
+    state: [4.0, 4.0, 0.5]
+
+  - kinematics: {name: omni}
+    shape: {name: circle, radius: 0.3}
+    state: [5.0, -5.0, 0.0]
+    goal: [-5.0, 5.0]
+    behavior: {name: dash, loop: True}
+    vel_min: [-0.8, -0.8]
+    vel_max: [0.8, 0.8]
+
+  - kinematics: {name: diff}
+    shape: {name: circle, radius: 0.25}
+    state: [-4.0, 4.0, 0.0]
+    goal: [[4.0, -4.0], [-4.0, 4.0]]
+    behavior: {name: dash, loop: True}
+    vel_min: [-1.0, -2.0]
+    vel_max: [1.0, 2.0]
+"""
 
 # ---------------------------------------------------------------------------
-# Optional: build a 3D scene (requires ir-sim[lidar3d])
+# Synthetic wheel and IMU models
 # ---------------------------------------------------------------------------
 
-try:
-    from irsim.world.env3d import Scene3D
+_G = 9.80665
+WHEEL_RADIUS = 0.033
+TRACK = 0.16
+ENCODER_CPR = 2048
+_MOTOR_TAU = 0.030
 
-    scene = Scene3D()
-    scene.add_ground(-15, 15, -15, 15, resolution=30, color=(0.3, 0.3, 0.3))
-    scene.add_wall([-15, -15], [15, -15], height=2.5, thickness=0.2)
-    scene.add_wall([-15, 15], [15, 15], height=2.5, thickness=0.2)
-    scene.add_wall([-15, -15], [-15, 15], height=2.5, thickness=0.2)
-    scene.add_wall([15, -15], [15, 15], height=2.5, thickness=0.2)
-    scene.add_box([5.0, 3.0, 1.0], [2.0, 2.0, 2.0], label="box_a")
-    scene.add_box([-4.0, -5.0, 0.75], [3.0, 1.0, 1.5], label="box_b")
-    scene.add_car([-6.0, 6.0], yaw=math.radians(20), label="car_1")
-    scene.build()
-    HAS_3D = True
-    print("3D scene built — 3D LiDAR enabled")
-except ImportError:
-    HAS_3D = False
-    print("ir-sim[lidar3d] not installed — 3D LiDAR disabled")
-
-# ---------------------------------------------------------------------------
-# Synthetic IMU state (finite-difference acceleration from trajectory)
-# ---------------------------------------------------------------------------
-
-_G = 9.80665  # m/s²
-
-# IMU bias random walk (MPU-6050 typical)
 _gyro_bias = np.zeros(3)
 _accel_bias = np.zeros(3)
-_gyro_bias_walk = 1.75e-4  # rad/s/sqrt(s)
-_accel_bias_walk = 1.96e-4  # m/s²/sqrt(s)
-_gyro_noise = 8.73e-5  # rad/s/sqrt(Hz)
-_accel_noise = 3.92e-3  # m/s²/sqrt(Hz)
-
 _prev_vel_world = np.zeros(2)
-_prev_theta = 0.0
+_theta_enc = {"left": 0.0, "right": 0.0}
+_omega_act = {"left": 0.0, "right": 0.0}
 
 
-def synthetic_imu(x, y, theta, vx, vy, omega_z, dt):
-    """Derive noisy IMU measurement from ground-truth kinematics."""
-    global _gyro_bias, _accel_bias, _prev_vel_world, _prev_theta
-
-    # Ground-truth signals
-    dv_world = np.array([vx, vy]) - _prev_vel_world
-    accel_world = dv_world / dt
-
-    # Rotate to body frame
+def _synthetic_imu(theta, vx, vy, omega_z, dt):
+    global _gyro_bias, _accel_bias, _prev_vel_world
+    dv = np.array([vx, vy]) - _prev_vel_world
+    accel_world = dv / dt
     c, s = math.cos(theta), math.sin(theta)
-    accel_body = np.array(
+    ab = np.array(
         [
             c * accel_world[0] + s * accel_world[1],
             -s * accel_world[0] + c * accel_world[1],
+            _G,
         ]
     )
-    accel_true = np.array([accel_body[0], accel_body[1], _G])
-    omega_true = np.array([0.0, 0.0, omega_z])
-
-    # IEEE 517 noise model
-    sigma_g = _gyro_noise / math.sqrt(dt)
-    sigma_a = _accel_noise / math.sqrt(dt)
-    _gyro_bias += _gyro_bias_walk * math.sqrt(dt) * np.random.randn(3)
-    _accel_bias += _accel_bias_walk * math.sqrt(dt) * np.random.randn(3)
-
-    omega_meas = omega_true + _gyro_bias + sigma_g * np.random.randn(3)
-    accel_meas = accel_true + _accel_bias + sigma_a * np.random.randn(3)
-
+    _gyro_bias += 1.75e-4 * math.sqrt(dt) * np.random.randn(3)
+    _accel_bias += 1.96e-4 * math.sqrt(dt) * np.random.randn(3)
+    omega_meas = (
+        np.array([0.0, 0.0, omega_z])
+        + _gyro_bias
+        + 8.73e-5 / math.sqrt(dt) * np.random.randn(3)
+    )
+    accel_meas = ab + _accel_bias + 3.92e-3 / math.sqrt(dt) * np.random.randn(3)
     _prev_vel_world[:] = [vx, vy]
-    _prev_theta = theta
     return omega_meas, accel_meas
 
 
-# ---------------------------------------------------------------------------
-# Synthetic wheel state (differential-drive robot)
-# ---------------------------------------------------------------------------
-
-WHEEL_RADIUS = 0.033  # m
-TRACK = 0.16  # m
-ENCODER_CPR = 2048  # counts per revolution
-
-# Per-wheel accumulated encoder angle (rad)
-_theta_enc = {"left": 0.0, "right": 0.0}
-
-# Simple first-order motor lag: τ ≈ 30 ms (small_dc preset)
-_MOTOR_TAU = 0.030
-_omega_actual = {"left": 0.0, "right": 0.0}
-
-
-def diff_inv_kin(v, omega):
-    """Differential drive inverse kinematics → (omega_l, omega_r)."""
-    omega_l = (v - omega * TRACK / 2) / WHEEL_RADIUS
-    omega_r = (v + omega * TRACK / 2) / WHEEL_RADIUS
-    return omega_l, omega_r
-
-
-def synthetic_wheels(v, omega, dt):
-    """Advance synthetic wheel state and return encoder + motor dicts."""
-    omega_cmd_l, omega_cmd_r = diff_inv_kin(v, omega)
-
-    # Motor first-order lag
+def _synthetic_wheels(v, omega_z, dt):
+    omega_l = (v - omega_z * TRACK / 2) / WHEEL_RADIUS
+    omega_r = (v + omega_z * TRACK / 2) / WHEEL_RADIUS
     decay = math.exp(-dt / _MOTOR_TAU)
-    for name, cmd in [("left", omega_cmd_l), ("right", omega_cmd_r)]:
-        _omega_actual[name] = cmd + (_omega_actual[name] - cmd) * decay
-        _theta_enc[name] += _omega_actual[name] * dt
-
-    ticks_per_rad = ENCODER_CPR / (2.0 * math.pi)
-
+    tpr = ENCODER_CPR / (2.0 * math.pi)
+    for name, cmd in [("left", omega_l), ("right", omega_r)]:
+        _omega_act[name] = cmd + (_omega_act[name] - cmd) * decay
+        _theta_enc[name] += _omega_act[name] * dt
     encoder = {
-        name: {
-            "theta_enc": _theta_enc[name],
-            "ticks": int(np.int32(round(_theta_enc[name] * ticks_per_rad))),
-            "omega_actual": _omega_actual[name],
+        n: {
+            "theta_enc": _theta_enc[n],
+            "ticks": int(np.int32(round(_theta_enc[n] * tpr))),
+            "omega_actual": _omega_act[n],
         }
-        for name in ("left", "right")
+        for n in ("left", "right")
     }
-
     motor = {
         "left": {
-            "omega_cmd": omega_cmd_l,
-            "omega_actual": _omega_actual["left"],
-            "motor_omega": _omega_actual["left"] * 46.0,  # 46:1 gearbox
+            "omega_cmd": omega_l,
+            "omega_actual": _omega_act["left"],
+            "motor_omega": _omega_act["left"] * 46.0,
         },
         "right": {
-            "omega_cmd": omega_cmd_r,
-            "omega_actual": _omega_actual["right"],
-            "motor_omega": _omega_actual["right"] * 46.0,
+            "omega_cmd": omega_r,
+            "omega_actual": _omega_act["right"],
+            "motor_omega": _omega_act["right"] * 46.0,
         },
     }
-
     return encoder, motor
 
 
 # ---------------------------------------------------------------------------
-# Simulation loop — circular trajectory at 20 Hz
+# Build a simple occupancy grid from the world YAML's obstacles
 # ---------------------------------------------------------------------------
 
-N_STEPS = 500
-DT = 0.05  # 50 ms → 20 Hz sim rate
-RADIUS = 8.0  # m
-OMEGA_BODY = 0.3  # rad/s turn rate
 
-print(f"Running {N_STEPS} steps ({N_STEPS * DT:.1f} s sim time) …")
+def _build_occupancy_grid(env, resolution=0.1):
+    """Return (grid, origin_xy) from the env's static obstacle geometries."""
+    world = env.world
+    W = float(world.width)
+    H = float(world.height)
+    cols = int(W / resolution)
+    rows = int(H / resolution)
+    grid = np.zeros((rows, cols), dtype=np.float32)
+    ox = -W / 2.0
+    oy = -H / 2.0
 
-for step in range(N_STEPS):
-    t = step * DT
-    theta = OMEGA_BODY * t
+    # Mark cells occupied by static obstacle boundaries
+    for obj in world.obstacle_list:
+        if not obj.static:
+            continue
+        geom = obj._geometry
+        if geom is None:
+            continue
+        # Sample boundary points from shapely geometry
+        try:
+            coords = []
+            gtype = geom.geom_type
+            if gtype in ("Polygon", "MultiPolygon"):
+                coords = list(
+                    geom.exterior.coords
+                    if gtype == "Polygon"
+                    else [pt for g in geom.geoms for pt in g.exterior.coords]
+                )
+            elif gtype in ("LineString", "MultiLineString"):
+                coords = list(
+                    geom.coords
+                    if gtype == "LineString"
+                    else [pt for g in geom.geoms for pt in g.coords]
+                )
+            for gx, gy in coords:
+                ci = int((gx - ox) / resolution)
+                cj = int((gy - oy) / resolution)
+                for di in range(-1, 2):
+                    for dj in range(-1, 2):
+                        ni, nj = ci + di, cj + dj
+                        if 0 <= ni < cols and 0 <= nj < rows:
+                            grid[nj, ni] = 100.0
+        except Exception:
+            pass
 
-    # Robot pose
-    x = RADIUS * math.cos(theta)
-    y = RADIUS * math.sin(theta)
-    heading = theta + math.pi / 2
+    # Add world boundary walls
+    for j in range(rows):
+        grid[j, 0] = 100.0
+        grid[j, cols - 1] = 100.0
+    for i in range(cols):
+        grid[0, i] = 100.0
+        grid[rows - 1, i] = 100.0
 
-    # Body-frame linear velocity (tangential) and angular velocity
-    v_body = RADIUS * OMEGA_BODY
-    vx = -v_body * math.sin(theta)
-    vy = v_body * math.cos(theta)
+    return grid, [ox, oy]
 
-    bridge.update_pose(x, y, heading, robot_id=0, robot_name="diff_bot")
 
-    # ── IMU ───────────────────────────────────────────────────────────────
-    omega_meas, accel_meas = synthetic_imu(x, y, heading, vx, vy, OMEGA_BODY, DT)
-    bridge.update_imu(
-        omega_meas, accel_meas, robot_id=0, robot_name="diff_bot", sensor_name="imu_0"
+# ---------------------------------------------------------------------------
+# Scene helpers — colour palette
+# ---------------------------------------------------------------------------
+
+_ROBOT_COLOR = (0.2, 0.55, 1.0, 0.92)
+_STATIC_OBS_COLOR = (0.75, 0.35, 0.1, 0.85)
+_DYNAMIC_OBS_COLOR = (0.2, 0.85, 0.45, 0.85)
+
+
+def _publish_scene(bridge, robot, obstacles):
+    """Push robot + obstacle markers for Foxglove 3D panel."""
+    sx, sy, stheta = (
+        float(robot.state[0, 0]),
+        float(robot.state[1, 0]),
+        float(robot.state[2, 0]),
+    )
+    bridge.update_robot_marker(
+        sx,
+        sy,
+        stheta,
+        robot_id=robot._id,
+        robot_name=robot.name,
+        radius=float(robot.radius),
+        height=0.5,
+        color=_ROBOT_COLOR,
     )
 
-    # ── Encoder + Motor ───────────────────────────────────────────────────
-    encoder_data, motor_data = synthetic_wheels(v_body, OMEGA_BODY, DT)
-    bridge.update_encoder(
-        encoder_data, robot_id=0, robot_name="diff_bot", sensor_name="encoder_0"
-    )
-    bridge.update_motor(
-        motor_data, robot_id=0, robot_name="diff_bot", sensor_name="motor_0"
-    )
+    for obs in obstacles:
+        ox_pos = float(obs.state[0, 0])
+        oy_pos = float(obs.state[1, 0])
+        oth = float(obs.state[2, 0])
+        eid = f"obs_{obs._id}"
+        color = _DYNAMIC_OBS_COLOR if not obs.static else _STATIC_OBS_COLOR
 
-    # ── 2D LiDAR ──────────────────────────────────────────────────────────
-    t0 = time.perf_counter()
-    if HAS_3D:
-        raw = scene.cast_2d_lidar([x, y], z_height=1.2, n_beams=720, range_max=20.0)
-        ranges_2d = raw[:, 3].astype(float)
-        scan_2d_ms = (time.perf_counter() - t0) * 1000
-        bridge.update_lidar2d(
-            ranges_2d,
-            [x, y, 1.2],
-            angle_min=-math.pi,
-            angle_max=math.pi,
-            robot_id=0,
-            robot_name="diff_bot",
-            sensor_name="lidar2d_0",
-        )
-    else:
-        n = 720
-        angles = np.linspace(-math.pi, math.pi, n, endpoint=False)
-        ranges_2d = np.where(np.abs(angles) < 0.2, 0.0, 5.0 + np.random.randn(n) * 0.05)
-        scan_2d_ms = (time.perf_counter() - t0) * 1000
-        bridge.update_lidar2d(
-            ranges_2d,
-            [x, y, 1.2],
-            angle_min=-math.pi,
-            angle_max=math.pi,
-            robot_id=0,
-            robot_name="diff_bot",
-            sensor_name="lidar2d_0",
-        )
+        if obs.shape == "circle":
+            bridge.update_circle_marker(
+                eid, ox_pos, oy_pos, radius=float(obs.radius), height=0.8, color=color
+            )
+        else:
+            bridge.update_box_marker(
+                eid,
+                ox_pos,
+                oy_pos,
+                oth,
+                length=float(obs.length),
+                width=float(obs.width),
+                height=0.8,
+                color=color,
+            )
 
-    # ── 3D LiDAR ──────────────────────────────────────────────────────────
-    scan_3d_ms = 0.0
-    if HAS_3D:
-        t0 = time.perf_counter()
-        pts3 = scene.cast_3d_lidar([x, y, 1.5], profile="vlp16", range_max=20.0)
-        scan_3d_ms = (time.perf_counter() - t0) * 1000
-        bridge.update_lidar3d(
-            pts3[:, :3],
-            [x, y, 1.5],
-            robot_id=0,
-            robot_name="diff_bot",
-            sensor_name="vlp16_0",
-        )
 
-    # ── Metrics ───────────────────────────────────────────────────────────
-    cpu_est = (scan_2d_ms + scan_3d_ms) / (DT * 1000) * 100
-    bridge.update_metrics(
-        scan_2d_ms=scan_2d_ms,
-        scan_3d_ms=scan_3d_ms,
-        cpu_pct=cpu_est,
-        step=step,
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    print("Starting Foxglove bridge on ws://localhost:8765 …")
+    bridge = FoxgloveBridge(port=8765, publish_hz=10.0)
+    bridge.start()
+    print("Bridge ready — open Foxglove Studio and connect to ws://localhost:8765")
+
+    # Write inline YAML to a temp file, then load the environment
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tf:
+        tf.write(_WORLD_YAML)
+        yaml_path = tf.name
+
+    env = irsim.make(
+        world_name=yaml_path,
+        display=False,
+        save_ani=False,
     )
 
-    # ── Remote operation (Studio → sim) ───────────────────────────────────
-    # Pause/resume from Foxglove Studio "Service Call" panel:
-    #   Service: /irsim/control   Body: {"command": "pause"}
-    if bridge.is_paused():
-        # In a real sim loop: skip env.step() while paused
-        print(f"  [step {step}] paused — waiting for resume …", end="\r")
-        time.sleep(DT)
-        continue
+    robot = env.robot_list[0]
+    obstacles = env.obstacle_list
+    DT = float(env.world.step_time)
 
-    # Velocity override from Foxglove Studio "Publish" panel:
-    #   Topic: /irsim/cmd_vel   Schema: irsim.CmdVel
-    #   Body: {"linear": {"x": 1.0}, "angular": {"z": 0.5}}
-    cmd = bridge.pop_cmd_vel()
-    if cmd is not None:
-        # In a real sim loop: pass cmd["linear"] / cmd["angular"] to the robot
-        print(
-            f"  [step {step}] remote cmd_vel:"
-            f" v={cmd['linear']:.2f} m/s  w={cmd['angular']:.2f} rad/s"
-        )
+    # Publish static occupancy map once (and refresh every 50 steps for dynamic map)
+    grid, origin_xy = _build_occupancy_grid(env, resolution=0.1)
+    bridge.update_map(grid, resolution=0.1, origin_xy=origin_xy)
+    print(f"Map published: {grid.shape[1]}x{grid.shape[0]} cells @ 0.1 m/cell")
 
-    # Goal pose from Foxglove Studio "Publish" panel:
-    #   Topic: /irsim/cmd_pose  Schema: irsim.CmdPose
-    #   Body: {"robot_id": 0, "x": 5.0, "y": 3.0, "theta": 1.57}
-    goal = bridge.pop_cmd_pose()
-    if goal is not None:
-        print(
-            f"  [step {step}] remote goal:"
-            f" ({goal.get('x', 0):.1f}, {goal.get('y', 0):.1f})"
-            f"  θ={goal.get('theta', 0):.2f}"
-        )
+    step = 0
+    print(f"Running simulation (step_time={DT:.3f} s, Ctrl-C to stop) …")
 
-    time.sleep(DT)
+    try:
+        while not env.done():
+            t0 = time.perf_counter()
 
-bridge.stop()
-print("Done.")
+            # ── Handle remote pause ──────────────────────────────────────────
+            if bridge.is_paused():
+                time.sleep(DT)
+                continue
+
+            # ── Remote velocity override ─────────────────────────────────────
+            cmd = bridge.pop_cmd_vel()
+            if cmd is not None:
+                vel = np.array([[cmd["linear"]], [cmd["angular"]]])
+                robot.set_vel(vel)
+                print(
+                    f"  [step {step}] remote cmd_vel: v={cmd['linear']:.2f} w={cmd['angular']:.2f}"
+                )
+
+            # ── Remote goal override ─────────────────────────────────────────
+            goal = bridge.pop_cmd_pose()
+            if goal is not None:
+                robot.set_goal(
+                    [goal.get("x", 0.0), goal.get("y", 0.0), goal.get("theta", 0.0)]
+                )
+                print(
+                    f"  [step {step}] remote goal: ({goal.get('x', 0):.1f}, {goal.get('y', 0):.1f})"
+                )
+
+            # ── Simulation step ──────────────────────────────────────────────
+            env.step()
+
+            # ── Extract robot state ──────────────────────────────────────────
+            x = float(robot.state[0, 0])
+            y = float(robot.state[1, 0])
+            theta = float(robot.state[2, 0])
+            vel_state = robot.velocity
+            v = float(vel_state[0, 0]) if vel_state is not None else 0.0
+            omega_z = float(vel_state[1, 0]) if vel_state is not None else 0.0
+            vx = v * math.cos(theta)
+            vy = v * math.sin(theta)
+
+            # ── Pose ─────────────────────────────────────────────────────────
+            bridge.update_pose(x, y, theta, robot_id=robot._id, robot_name=robot.name)
+
+            # ── LiDAR 2D ────────────────────────────────────────────────────
+            scan_t0 = time.perf_counter()
+            scan = robot.get_lidar_scan()
+            scan_2d_ms = (time.perf_counter() - scan_t0) * 1000
+            if isinstance(scan, dict) and scan.get("ranges") is not None:
+                ranges = np.asarray(scan["ranges"], dtype=float)
+                a_min = float(scan.get("angle_min", -math.pi))
+                a_max = float(scan.get("angle_max", math.pi))
+                bridge.update_lidar2d(
+                    ranges,
+                    [x, y, 0.2],
+                    angle_min=a_min,
+                    angle_max=a_max,
+                    robot_id=robot._id,
+                    robot_name=robot.name,
+                    sensor_name="lidar2d_0",
+                )
+
+            # ── IMU ──────────────────────────────────────────────────────────
+            omega_meas, accel_meas = _synthetic_imu(theta, vx, vy, omega_z, DT)
+            bridge.update_imu(
+                omega_meas,
+                accel_meas,
+                robot_id=robot._id,
+                robot_name=robot.name,
+                sensor_name="imu_0",
+            )
+
+            # ── Encoder + Motor ──────────────────────────────────────────────
+            encoder_data, motor_data = _synthetic_wheels(v, omega_z, DT)
+            bridge.update_encoder(
+                encoder_data,
+                robot_id=robot._id,
+                robot_name=robot.name,
+                sensor_name="enc_0",
+            )
+            bridge.update_motor(
+                motor_data,
+                robot_id=robot._id,
+                robot_name=robot.name,
+                sensor_name="mot_0",
+            )
+
+            # ── Scene (3D markers) ───────────────────────────────────────────
+            _publish_scene(bridge, robot, obstacles)
+
+            # ── Metrics ──────────────────────────────────────────────────────
+            cpu_est = scan_2d_ms / (DT * 1000) * 100
+            bridge.update_metrics(scan_2d_ms=scan_2d_ms, cpu_pct=cpu_est, step=step)
+
+            # ── Refresh map every 50 steps (dynamic obstacles may have moved) ─
+            if step % 50 == 0 and step > 0:
+                grid, origin_xy = _build_occupancy_grid(env, resolution=0.1)
+                bridge.update_map(grid, resolution=0.1, origin_xy=origin_xy)
+
+            step += 1
+
+            # ── Real-time pacing ─────────────────────────────────────────────
+            elapsed = time.perf_counter() - t0
+            wait = DT - elapsed
+            if wait > 0:
+                time.sleep(wait)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    finally:
+        bridge.stop()
+        env.end()
+        os.unlink(yaml_path)
+        print(f"Done after {step} steps.")
+
+
+if __name__ == "__main__":
+    main()

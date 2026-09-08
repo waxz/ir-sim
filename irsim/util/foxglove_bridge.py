@@ -13,6 +13,8 @@ Channels published (sim → Studio)
 /irsim/encoder     irsim.Encoder        — wheel encoders      (per robot x sensor)
 /irsim/motor       irsim.Motor          — motor telemetry     (per robot x sensor)
 /irsim/metrics     irsim.Metrics        — timing and CPU
+/irsim/map         foxglove.Grid        — 2D occupancy grid
+/irsim/scene       foxglove.SceneUpdate — 3D scene (robots, obstacles)
 
 Client channels received (Studio → sim)
 -----------------------------------------
@@ -132,6 +134,25 @@ _ID_PROPS = {
     "robot_name": {"type": "string"},
     "sensor_name": {"type": "string"},
 }
+
+_COLOR_DEF = {
+    "type": "object",
+    "properties": {
+        "r": {"type": "number"},
+        "g": {"type": "number"},
+        "b": {"type": "number"},
+        "a": {"type": "number"},
+    },
+}
+_SIZE_DEF = {
+    "type": "object",
+    "properties": {
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "z": {"type": "number"},
+    },
+}
+_DEFS_SCENE = {**_DEFS, "Color": _COLOR_DEF, "Size": _SIZE_DEF}
 
 _SCHEMAS: dict[str, str] = {
     "/irsim/lidar2d": json.dumps(
@@ -284,6 +305,127 @@ _SCHEMAS: dict[str, str] = {
             },
         }
     ),
+    "/irsim/map": json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "foxglove.Grid",
+            "type": "object",
+            "$defs": {**_DEFS},
+            "properties": {
+                "timestamp": {"$ref": "#/$defs/Time"},
+                "frame_id": {"type": "string"},
+                "pose": {"$ref": "#/$defs/Pose"},
+                "column_count": {"type": "integer"},
+                "cell_size": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                    },
+                },
+                "row_stride": {"type": "integer"},
+                "cell_stride": {"type": "integer"},
+                "fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "offset": {"type": "integer"},
+                            "type": {"type": "integer"},
+                        },
+                    },
+                },
+                "data": {"type": "string", "contentEncoding": "base64"},
+            },
+        }
+    ),
+    "/irsim/scene": json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "foxglove.SceneUpdate",
+            "type": "object",
+            "$defs": _DEFS_SCENE,
+            "properties": {
+                "deletions": {"type": "array"},
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "timestamp": {"$ref": "#/$defs/Time"},
+                            "frame_id": {"type": "string"},
+                            "id": {"type": "string"},
+                            "lifetime": {"$ref": "#/$defs/Time"},
+                            "frame_locked": {"type": "boolean"},
+                            "metadata": {"type": "array"},
+                            "cubes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pose": {"$ref": "#/$defs/Pose"},
+                                        "size": {"$ref": "#/$defs/Size"},
+                                        "color": {"$ref": "#/$defs/Color"},
+                                    },
+                                },
+                            },
+                            "spheres": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pose": {"$ref": "#/$defs/Pose"},
+                                        "size": {"$ref": "#/$defs/Size"},
+                                        "color": {"$ref": "#/$defs/Color"},
+                                    },
+                                },
+                            },
+                            "cylinders": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pose": {"$ref": "#/$defs/Pose"},
+                                        "size": {"$ref": "#/$defs/Size"},
+                                        "color": {"$ref": "#/$defs/Color"},
+                                    },
+                                },
+                            },
+                            "arrows": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pose": {"$ref": "#/$defs/Pose"},
+                                        "shaft_diameter": {"type": "number"},
+                                        "head_diameter": {"type": "number"},
+                                        "head_length": {"type": "number"},
+                                        "length": {"type": "number"},
+                                        "color": {"$ref": "#/$defs/Color"},
+                                    },
+                                },
+                            },
+                            "texts": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pose": {"$ref": "#/$defs/Pose"},
+                                        "billboard": {"type": "boolean"},
+                                        "font_size": {"type": "number"},
+                                        "scale_invariant": {"type": "boolean"},
+                                        "color": {"$ref": "#/$defs/Color"},
+                                        "text": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+    ),
 }
 
 _SCHEMA_NAMES = {
@@ -294,6 +436,8 @@ _SCHEMA_NAMES = {
     "/irsim/imu": "foxglove.Imu",
     "/irsim/encoder": "irsim.Encoder",
     "/irsim/motor": "irsim.Motor",
+    "/irsim/map": "foxglove.Grid",
+    "/irsim/scene": "foxglove.SceneUpdate",
 }
 
 # PackedElementField numeric type: 7 = FLOAT32
@@ -946,6 +1090,206 @@ class FoxgloveBridge:
             "wheels": wheels,
         }
         self._queue("/irsim/motor", _encode(msg), self._sub(robot_id, sensor_name))
+
+    def update_map(
+        self,
+        grid: np.ndarray,
+        resolution: float,
+        origin_xy: list | np.ndarray | None = None,
+        frame_id: str = "map",
+    ) -> None:
+        """
+        Publish a 2D occupancy grid (foxglove.Grid).
+
+        Parameters
+        ----------
+        grid : 2-D array, shape (rows, cols)
+            Occupancy values.  Values > 50 are displayed as occupied.
+            Typical ranges: 0-100 (ROS-style) or 0-1 (normalised).
+            Will be cast to float32 before encoding.
+        resolution : float
+            Cell size in metres (same for X and Y).
+        origin_xy : [x, y], optional
+            World coordinates of the bottom-left corner of the grid.
+            Defaults to ``[-cols*resolution/2, -rows*resolution/2]`` (centred).
+        frame_id : str
+            Coordinate frame for Foxglove rendering (default ``"map"``).
+        """
+        ts_ns = time.time_ns()
+        arr = np.asarray(grid, dtype=np.float32)
+        rows, cols = arr.shape
+
+        if origin_xy is None:
+            ox = -cols * resolution / 2.0
+            oy = -rows * resolution / 2.0
+        else:
+            ox, oy = float(origin_xy[0]), float(origin_xy[1])
+
+        cell_stride = 4  # float32
+        row_stride = cols * cell_stride
+        data_b64 = base64.b64encode(arr.tobytes()).decode()
+
+        msg = {
+            "timestamp": _ts(ts_ns),
+            "frame_id": frame_id,
+            "pose": _pose(ox, oy),
+            "column_count": cols,
+            "cell_size": {"x": resolution, "y": resolution},
+            "row_stride": row_stride,
+            "cell_stride": cell_stride,
+            "fields": [{"name": "occupancy", "offset": 0, "type": 7}],
+            "data": data_b64,
+        }
+        self._queue("/irsim/map", _encode(msg))
+
+    def update_robot_marker(
+        self,
+        x: float,
+        y: float,
+        theta: float,
+        robot_id: int = 0,
+        robot_name: str = "robot",
+        radius: float = 0.2,
+        height: float = 0.5,
+        color: tuple[float, float, float, float] = (0.2, 0.6, 1.0, 0.9),
+        frame_id: str = "map",
+    ) -> None:
+        """
+        Publish a single robot as a cylinder + heading arrow in foxglove.SceneUpdate.
+
+        Parameters
+        ----------
+        x, y, theta : robot pose (metres, radians)
+        robot_id : integer id (used as entity id)
+        robot_name : label text shown in Foxglove
+        radius : cylinder radius in metres
+        height : cylinder height in metres
+        color : (r, g, b, a) each 0.0-1.0
+        frame_id : coordinate frame for rendering
+        """
+        ts_ns = time.time_ns()
+        r, g, b, a = color
+        entity = {
+            "timestamp": _ts(ts_ns),
+            "frame_id": frame_id,
+            "id": f"robot_{robot_id}",
+            "lifetime": {"sec": 0, "nsec": 0},
+            "frame_locked": False,
+            "metadata": [],
+            "cylinders": [
+                {
+                    "pose": _pose(x, y, height / 2, theta),
+                    "size": {"x": radius * 2, "y": radius * 2, "z": height},
+                    "color": {"r": r, "g": g, "b": b, "a": a},
+                }
+            ],
+            "arrows": [
+                {
+                    "pose": _pose(x, y, height, theta),
+                    "shaft_diameter": radius * 0.25,
+                    "head_diameter": radius * 0.6,
+                    "head_length": radius * 0.6,
+                    "length": radius * 1.4,
+                    "color": {"r": 1.0, "g": 1.0, "b": 0.2, "a": 1.0},
+                }
+            ],
+            "texts": [
+                {
+                    "pose": _pose(x, y, height + 0.15),
+                    "billboard": True,
+                    "font_size": 0.18,
+                    "scale_invariant": False,
+                    "color": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                    "text": robot_name,
+                }
+            ],
+        }
+        msg = {"deletions": [], "entities": [entity]}
+        self._queue("/irsim/scene", _encode(msg), f"robot_{robot_id}")
+
+    def update_box_marker(
+        self,
+        entity_id: str,
+        x: float,
+        y: float,
+        theta: float,
+        length: float,
+        width: float,
+        height: float = 1.0,
+        color: tuple[float, float, float, float] = (0.8, 0.4, 0.1, 0.8),
+        frame_id: str = "map",
+    ) -> None:
+        """
+        Publish a rectangular obstacle as a cube in foxglove.SceneUpdate.
+
+        Parameters
+        ----------
+        entity_id : unique string id for this entity (stable across frames)
+        x, y, theta : obstacle pose
+        length, width : obstacle footprint in metres
+        height : visual height (default 1.0 m)
+        color : (r, g, b, a) each 0.0-1.0
+        """
+        ts_ns = time.time_ns()
+        r, g, b, a = color
+        entity = {
+            "timestamp": _ts(ts_ns),
+            "frame_id": frame_id,
+            "id": entity_id,
+            "lifetime": {"sec": 0, "nsec": 0},
+            "frame_locked": False,
+            "metadata": [],
+            "cubes": [
+                {
+                    "pose": _pose(x, y, height / 2, theta),
+                    "size": {"x": length, "y": width, "z": height},
+                    "color": {"r": r, "g": g, "b": b, "a": a},
+                }
+            ],
+        }
+        msg = {"deletions": [], "entities": [entity]}
+        self._queue("/irsim/scene", _encode(msg), entity_id)
+
+    def update_circle_marker(
+        self,
+        entity_id: str,
+        x: float,
+        y: float,
+        radius: float,
+        height: float = 1.0,
+        color: tuple[float, float, float, float] = (0.9, 0.3, 0.3, 0.8),
+        frame_id: str = "map",
+    ) -> None:
+        """
+        Publish a circular obstacle as a cylinder in foxglove.SceneUpdate.
+
+        Parameters
+        ----------
+        entity_id : unique string id for this entity
+        x, y : obstacle centre position
+        radius : obstacle radius in metres
+        height : visual height (default 1.0 m)
+        color : (r, g, b, a) each 0.0-1.0
+        """
+        ts_ns = time.time_ns()
+        r, g, b, a = color
+        entity = {
+            "timestamp": _ts(ts_ns),
+            "frame_id": frame_id,
+            "id": entity_id,
+            "lifetime": {"sec": 0, "nsec": 0},
+            "frame_locked": False,
+            "metadata": [],
+            "cylinders": [
+                {
+                    "pose": _pose(x, y, height / 2),
+                    "size": {"x": radius * 2, "y": radius * 2, "z": height},
+                    "color": {"r": r, "g": g, "b": b, "a": a},
+                }
+            ],
+        }
+        msg = {"deletions": [], "entities": [entity]}
+        self._queue("/irsim/scene", _encode(msg), entity_id)
 
     # ------------------------------------------------------------------
     # Remote-operation receive methods — poll from the sim loop
