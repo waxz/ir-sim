@@ -1,0 +1,10 @@
+{
+  "unoptimized": {
+    "write_state": 890.15348,
+    "write_state_from_robot": 5099.673395
+  },
+  "optimized": {
+    "write_state": 864.51457,
+    "write_state_from_robot": 1819.82443
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "baseline": {
+    "name": "baseline",
+    "write_state": {
+      "total_ms": 188.9312,
+      "per_call_ns": 944.656,
+      "ops_per_s": 1058586.4060568078,
+      "n": 200000
+    },
+    "read_cmd": {
+      "total_ms": 106.883653,
+      "per_call_ns": 534.418265,
+      "ops_per_s": 1871193.5304082467,
+      "n": 200000
+    },
+    "write_state_from_robot": {
+      "total_ms": 381.438889,
+      "per_call_ns": 1907.194445,
+      "ops_per_s": 524330.3862496307,
+      "n": 200000
+    },
+    "combined_step": {
+      "total_ms": 298.530239,
+      "per_call_ns": 1492.651195,
+      "ops_per_s": 669948.8824648011,
+      "n": 200000
+    }
+  }
+}
