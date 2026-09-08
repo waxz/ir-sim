@@ -263,12 +263,12 @@ class TestSeqlock:
         try:
             b.write_state(1.0, 2.0, 0.5, 0.3, 0.0, 0.1, 5.0, 5.0, 4.24, 10, 0.5)
             assert b._state_seq == 2  # 0+1+1 = 2 (even after write)
-            assert b._blk.state.seq == 1  # seq set to odd (begin-write value)
+            assert b._blk.state.seq == 2  # seq set to even (end-write value)
             assert b._blk.state.seq2 == 2  # seq2 set to even (end-write value)
 
             b.write_state(1.1, 2.1, 0.6, 0.3, 0.0, 0.1, 5.0, 5.0, 4.10, 11, 0.55)
             assert b._state_seq == 4
-            assert b._blk.state.seq == 3
+            assert b._blk.state.seq == 4
             assert b._blk.state.seq2 == 4
         finally:
             b.close()
@@ -445,8 +445,8 @@ class TestMultipleWrites:
                     i,
                     float(i) * 0.05,
                 )
-                # seq (begin-write) is odd, seq2 (end-write) is even
-                assert b._blk.state.seq == (2 * i - 1)
+                # both seq and seq2 are even after a complete write
+                assert b._blk.state.seq == (2 * i)
                 assert b._blk.state.seq2 == (2 * i)
         finally:
             b.close()

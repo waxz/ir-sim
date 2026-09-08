@@ -1,0 +1,162 @@
+{
+  "write_latency": {
+    "imu": {
+      "n": 100000,
+      "total_ms": 86.150648,
+      "per_call_ns": 861.50648,
+      "ops_per_s": 1160757.3746862588
+    },
+    "encoder": {
+      "n": 100000,
+      "total_ms": 161.024856,
+      "per_call_ns": 1610.24856,
+      "ops_per_s": 621022.1358620559
+    },
+    "pc_1k": {
+      "n": 20000,
+      "total_ms": 31.010029,
+      "per_call_ns": 1550.50145,
+      "ops_per_s": 644952.6377418092
+    },
+    "pc_8k": {
+      "n": 10000,
+      "total_ms": 45.039781,
+      "per_call_ns": 4503.9781,
+      "ops_per_s": 222025.94635173737
+    },
+    "pc_32k": {
+      "n": 5000,
+      "total_ms": 70.701589,
+      "per_call_ns": 14140.3178,
+      "ops_per_s": 70719.7684057709
+    },
+    "pc_64k": {
+      "n": 2000,
+      "total_ms": 140.826636,
+      "per_call_ns": 70413.318,
+      "ops_per_s": 14201.858801768154
+    }
+  },
+  "write_bandwidth_mbs": {
+    "imu": 92.8605899749007,
+    "encoder": 49.68177086896448,
+    "pc_1k": 10566.904016761802,
+    "pc_8k": 29101.38484021492,
+    "pc_32k": 37077.52593792481,
+    "pc_64k": 14891.728294922843
+  },
+  "read_latency": {
+    "imu": {
+      "n": 100000,
+      "total_ms": 82.640904,
+      "per_call_ns": 826.40904,
+      "ops_per_s": 1210054.5269930735
+    },
+    "encoder": {
+      "n": 100000,
+      "total_ms": 241.346634,
+      "per_call_ns": 2413.46634,
+      "ops_per_s": 414341.8051564788
+    },
+    "pc_header": {
+      "n": 100000,
+      "total_ms": 36.866824,
+      "per_call_ns": 368.66824,
+      "ops_per_s": 2712465.8202181994
+    },
+    "pc_1k_copy": {
+      "n": 20000,
+      "total_ms": 31.32493,
+      "per_call_ns": 1566.2465,
+      "ops_per_s": 638469.1043204246
+    }
+  },
+  "correctness": {
+    "imu": true,
+    "encoder": true,
+    "pc_1k": true,
+    "pc_8k": true,
+    "pc_64k": true,
+    "pc_64k_max_err": 0.0
+  },
+  "torn_read": {
+    "n": 200000,
+    "torn": 0,
+    "ok": 200000,
+    "torn_rate_pct": 0.0
+  },
+  "timed_rate": {
+    "imu_1khz": {
+      "target_hz": 1000.0,
+      "actual_hz": 999.9989035012022,
+      "count": 2000,
+      "wall_s": 2.0000021930000003,
+      "cpu_s": 1.9997576220000002,
+      "cpu_pct": 99.98777146340858
+    },
+    "imu_2khz": {
+      "target_hz": 2000.0,
+      "actual_hz": 1999.9997660000272,
+      "count": 4000,
+      "wall_s": 2.0000002340000003,
+      "cpu_s": 1.999852378,
+      "cpu_pct": 99.99260720086494
+    },
+    "encoder_1khz": {
+      "target_hz": 1000.0,
+      "actual_hz": 999.9999200000065,
+      "count": 2000,
+      "wall_s": 2.00000016,
+      "cpu_s": 1.999947293,
+      "cpu_pct": 99.99735665021147
+    },
+    "pc_10hz_64k": {
+      "target_hz": 10.0,
+      "actual_hz": 9.999998580000202,
+      "count": 20,
+      "wall_s": 2.000000284,
+      "cpu_s": 1.999874793,
+      "cpu_pct": 99.99372545089099
+    }
+  },
+  "drop_rate": {
+    "writer1k_reader2k": {
+      "writer_hz": 1000.0,
+      "reader_hz": 2000.0,
+      "total_written": 3001,
+      "total_seen": 6001,
+      "total_dropped": 0,
+      "drop_rate_pct": 0.0,
+      "actual_writer_hz": 1000.3,
+      "actual_reader_hz": 2000.3
+    },
+    "writer1k_reader1k": {
+      "writer_hz": 1000.0,
+      "reader_hz": 1000.0,
+      "total_written": 3001,
+      "total_seen": 3000,
+      "total_dropped": 0,
+      "drop_rate_pct": 0.0,
+      "actual_writer_hz": 1000.3,
+      "actual_reader_hz": 1000.0
+    },
+    "writer1k_reader500": {
+      "writer_hz": 1000.0,
+      "reader_hz": 500.0,
+      "total_written": 3001,
+      "total_seen": 1500,
+      "total_dropped": 1497,
+      "drop_rate_pct": 49.88,
+      "actual_writer_hz": 1000.3,
+      "actual_reader_hz": 500.0
+    }
+  },
+  "combined_load": {
+    "imu_actual_hz": 1000.0,
+    "enc_actual_hz": 1000.0,
+    "pc_actual_hz": 10.0,
+    "pc_bandwidth_mbs": 10.49,
+    "cpu_pct": 99.99,
+    "wall_s": 3.0
+  }
+}

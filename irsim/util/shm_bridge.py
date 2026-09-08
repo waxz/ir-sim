@@ -324,6 +324,7 @@ class ShmBridge:
 
         # seqlock end-write: odd → even
         self._state_seq += 1
+        slot.seq = self._state_seq
         slot.seq2 = self._state_seq
 
     # ── read command (call before env.step()) ─────────────────────────────
