@@ -22,6 +22,7 @@ Requires: pip install ir-sim[lidar3d]
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar
@@ -336,6 +337,56 @@ class Scene3D:
         verts = np.asarray(mesh.vertices, dtype=np.float32)
         faces = np.asarray(mesh.triangles, dtype=np.int32)
         self._grounds.append(_GroundRecord(verts, faces, color))
+        self._meshes.append(mesh)
+        return self
+
+    def load_mesh(
+        self,
+        path: str | os.PathLike,
+        scale: float = 1.0,
+        position: list | np.ndarray | None = None,
+        yaw: float = 0.0,
+        color: tuple[float, float, float] | None = None,
+        label: str = "",
+    ) -> Scene3D:
+        """
+        Load an external mesh file into the scene (GLB, OBJ, PLY, STL, FBX).
+
+        The mesh is added to the Embree BVH on the next ``build()`` call.
+
+        Parameters
+        ----------
+        path : str or PathLike
+            Path to the mesh file.  Supported formats depend on the Open3D
+            build (ASSIMP backend): GLB, GLTF, OBJ, PLY, STL, FBX, OFF.
+        scale : float
+            Uniform scale factor applied before rotation and translation.
+        position : (3,) array-like or None
+            World-frame translation [x, y, z] applied after scale and rotation.
+        yaw : float
+            Rotation around the Z-axis (radians), applied after scale.
+        color : (R, G, B) tuple of floats in [0, 1] or None
+            Paint the mesh with a uniform color.  None keeps the file's colors.
+        label : str
+            Human-readable label (unused by the raycaster; for bookkeeping).
+        """
+        _require_open3d()
+        mesh = o3d.io.read_triangle_mesh(str(path), enable_post_processing=True)
+        if len(mesh.vertices) == 0:
+            raise ValueError(
+                f"load_mesh: no geometry loaded from '{path}'.  "
+                "Check that the file exists and the format is supported."
+            )
+        if scale != 1.0:
+            mesh.scale(scale, center=(0.0, 0.0, 0.0))
+        if abs(yaw) > 1e-9:
+            R = mesh.get_rotation_matrix_from_xyz((0.0, 0.0, yaw))
+            mesh.rotate(R, center=(0.0, 0.0, 0.0))
+        if position is not None:
+            mesh.translate(np.asarray(position, dtype=float))
+        if color is not None:
+            mesh.paint_uniform_color(list(color))
+        mesh.compute_vertex_normals()
         self._meshes.append(mesh)
         return self
 
