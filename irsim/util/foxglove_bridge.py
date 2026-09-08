@@ -553,7 +553,13 @@ class FoxgloveBridge:
         self._loop.run_until_complete(self._serve())
 
     async def _serve(self) -> None:
-        server = _FoxgloveServer(self._host, self._port, "IR-SIM")
+        server = _FoxgloveServer(
+            self._host,
+            self._port,
+            "IR-SIM",
+            capabilities=["clientPublish", "services"],
+            supported_encodings=["json"],
+        )
 
         # Attach listener before start() so no events are missed
         server.set_listener(_BridgeListener(self))
