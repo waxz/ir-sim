@@ -420,6 +420,23 @@ _SCHEMAS: dict[str, str] = {
                                     },
                                 },
                             },
+                            "models": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pose": {"$ref": "#/$defs/Pose"},
+                                        "scale": {"$ref": "#/$defs/Size"},
+                                        "media_type": {"type": "string"},
+                                        "data": {
+                                            "type": "string",
+                                            "contentEncoding": "base64",
+                                        },
+                                        "color": {"$ref": "#/$defs/Color"},
+                                        "override_color": {"type": "boolean"},
+                                    },
+                                },
+                            },
                         },
                     },
                 },
@@ -1290,6 +1307,95 @@ class FoxgloveBridge:
         }
         msg = {"deletions": [], "entities": [entity]}
         self._queue("/irsim/scene", _encode(msg), entity_id)
+
+    def update_scene(self, scene: Any, frame_id: str = "map") -> None:
+        """
+        Publish a ``Scene3D`` snapshot as a ``foxglove.SceneUpdate``.
+
+        Encodes each ``_BoxRecord`` as a cube primitive and each entry in
+        ``_mesh_files`` as a ``ModelPrimitive`` (GLB embedded as base64).
+
+        Parameters
+        ----------
+        scene : Scene3D
+            A ``irsim.world.env3d.scene3d.Scene3D`` instance that has been
+            populated with ``add_wall()``, ``add_box()``, ``load_mesh()``, etc.
+        frame_id : str
+            Coordinate frame for Foxglove rendering (default ``"map"``).
+
+        Notes
+        -----
+        Each call publishes the *entire* scene as one entity batch.  Only
+        ``_boxes`` and ``_mesh_files`` are exported; ground meshes are
+        typically too large for real-time streaming and are omitted.
+        """
+        ts_ns = time.time_ns()
+        entities: list[dict] = []
+
+        # --- Box primitives (walls, obstacles, furniture …) ----------------
+        for i, b in enumerate(scene._boxes):
+            r, g, bl = b.color
+            entity = {
+                "timestamp": _ts(ts_ns),
+                "frame_id": frame_id,
+                "id": b.label if b.label else f"box_{i}",
+                "lifetime": {"sec": 0, "nsec": 0},
+                "frame_locked": False,
+                "metadata": [],
+                "cubes": [
+                    {
+                        "pose": _pose(b.cx, b.cy, b.cz, b.yaw),
+                        "size": {"x": b.lx, "y": b.ly, "z": b.lz},
+                        "color": {
+                            "r": float(r),
+                            "g": float(g),
+                            "b": float(bl),
+                            "a": 0.9,
+                        },
+                    }
+                ],
+            }
+            entities.append(entity)
+
+        # --- Mesh/model primitives (GLB files loaded via load_mesh) ---------
+        for i, mf in enumerate(scene._mesh_files):
+            path = mf.get("path", "")
+            try:
+                raw = __import__("pathlib").Path(path).read_bytes()
+            except OSError:
+                continue
+            data_b64 = base64.b64encode(raw).decode()
+            pos = mf.get("position") or [0.0, 0.0, 0.0]
+            yaw = float(mf.get("yaw", 0.0))
+            sc = float(mf.get("scale", 1.0))
+            label = mf.get("label") or f"model_{i}"
+            entity = {
+                "timestamp": _ts(ts_ns),
+                "frame_id": frame_id,
+                "id": label,
+                "lifetime": {"sec": 0, "nsec": 0},
+                "frame_locked": False,
+                "metadata": [],
+                "models": [
+                    {
+                        "pose": _pose(
+                            float(pos[0]),
+                            float(pos[1]),
+                            float(pos[2]) if len(pos) > 2 else 0.0,
+                            yaw,
+                        ),
+                        "scale": {"x": sc, "y": sc, "z": sc},
+                        "media_type": "model/gltf-binary",
+                        "data": data_b64,
+                        "override_color": False,
+                        "color": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                    }
+                ],
+            }
+            entities.append(entity)
+
+        msg = {"deletions": [], "entities": entities}
+        self._queue("/irsim/scene", _encode(msg), "scene3d")
 
     # ------------------------------------------------------------------
     # Remote-operation receive methods — poll from the sim loop

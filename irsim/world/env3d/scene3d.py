@@ -177,6 +177,9 @@ class Scene3D:
         self._boxes: list[_BoxRecord] = []
         self._grounds: list[_GroundRecord] = []
         self._meshes: list[o3d.geometry.TriangleMesh] = []
+        self._mesh_files: list[
+            dict
+        ] = []  # parallel to _meshes; tracks source paths for Foxglove export
         self._rc: otg.RaycastingScene | None = None
 
     # ------------------------------------------------------------------
@@ -387,6 +390,15 @@ class Scene3D:
         if color is not None:
             mesh.paint_uniform_color(list(color))
         mesh.compute_vertex_normals()
+        self._mesh_files.append(
+            {
+                "path": str(path),
+                "scale": scale,
+                "position": list(position) if position is not None else None,
+                "yaw": yaw,
+                "label": label,
+            }
+        )
         self._meshes.append(mesh)
         return self
 
