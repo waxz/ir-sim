@@ -1,0 +1,158 @@
+name: shmbridge CI
+
+# Triggers: any push/PR that touches shmbridge/ or this workflow file.
+on:
+  push:
+    paths:
+      - 'shmbridge/**'
+      - '.github/workflows/shmbridge-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'shmbridge/**'
+      - '.github/workflows/shmbridge-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job 1 — C++ unit tests + benchmark build + Node API examples  (Ubuntu only)
+# The full C++ stack uses POSIX shm_open / mmap / futex and cannot run on
+# Windows.  Tested on two Ubuntu LTS releases to catch glibc differences.
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  cpp-ubuntu:
+    name: C++ · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTest
+        run: sudo apt-get install -y libgtest-dev
+
+      - name: Configure (tests + benchmarks)
+        run: |
+          cmake -B shmbridge/build -S shmbridge \
+            -DSHMBRIDGE_BUILD_TESTS=ON \
+            -DSHMBRIDGE_BUILD_BENCH=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build shmbridge/build --parallel $(nproc)
+
+      - name: Run C++ unit tests
+        run: |
+          ./shmbridge/build/test_topic
+          ./shmbridge/build/test_migration
+
+      - name: Write test summary
+        if: always()
+        run: |
+          echo "## C++ unit tests — ${{ matrix.os }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test binary | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          for t in test_topic test_migration; do
+            if ./shmbridge/build/$t > /dev/null 2>&1; then
+              echo "| \`$t\` | ✅ passed |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| \`$t\` | ❌ failed |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+      - name: Build Node API examples (talker + listener)
+        run: |
+          cmake -B shmbridge/examples/cpp_node/build \
+                -S shmbridge/examples/cpp_node \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build shmbridge/examples/cpp_node/build --parallel $(nproc)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job 2 — Python package with C++ extension  (Ubuntu)
+# Installs the pybind11-backed _core extension and runs the Python test suite.
+# ──────────────────────────────────────────────────────────────────────────────
+  python-ubuntu:
+    name: Python ${{ matrix.python-version }} · ubuntu-latest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install build dependencies
+        run: uv pip install "scikit-build-core>=0.8" "pybind11>=2.12" pytest
+
+      - name: Install shmbridge with C++ extension
+        run: cd shmbridge && uv pip install -e . --no-build-isolation
+
+      - name: Verify C++ backend loaded
+        run: |
+          uv run python -c "
+          import shmbridge
+          print(f'shmbridge {shmbridge.__version__}  backend={shmbridge._BACKEND}')
+          assert shmbridge._BACKEND == 'cpp', \
+              f'Expected cpp backend, got {shmbridge._BACKEND!r}'
+          "
+
+      - name: Run Python tests
+        run: uv run pytest shmbridge/tests/test_shmbridge.py -v
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Job 3 — Python package, ctypes fallback  (Windows)
+# POSIX shm_open is unavailable on Windows, so the C++ extension is skipped
+# (pybind11 is intentionally not installed).  The package falls back to the
+# pure-Python ctypes implementation.  Only the struct-layout tests run because
+# they exercise the ctypes types without opening any SHM segment.
+# ──────────────────────────────────────────────────────────────────────────────
+  python-windows:
+    name: Python ${{ matrix.python-version }} · windows-latest (ctypes fallback)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Install scikit-build-core but NOT pybind11.
+      # CMakeLists.txt: find_package(pybind11 QUIET) → not found → C++ extension
+      # target is skipped → only Python source files are installed.
+      - name: Install scikit-build-core (no pybind11 → skips C++ extension)
+        run: pip install "scikit-build-core>=0.8" pytest
+
+      - name: Install shmbridge (ctypes fallback)
+        run: pip install --no-build-isolation ./shmbridge
+
+      - name: Verify ctypes fallback active
+        run: |
+          python -c "
+          import shmbridge
+          print(f'shmbridge {shmbridge.__version__}  backend={shmbridge._BACKEND}')
+          assert shmbridge._BACKEND == 'python', \
+              f'Expected python ctypes fallback, got {shmbridge._BACKEND!r}'
+          "
+
+      # Only the struct-size / layout tests run; they use ctypes.sizeof() and
+      # do not open any POSIX SHM segment, so they pass on Windows.
+      - name: Run struct-layout tests (no POSIX SHM required)
+        run: pytest shmbridge/tests/test_shmbridge.py -v -k "size or magic or schema or version"

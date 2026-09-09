@@ -10,10 +10,14 @@ if(NOT TARGET shmbridge::shmbridge)
     add_subdirectory(../.. shmbridge_build EXCLUDE_FROM_ALL)
 endif()
 
-foreach(ex talker listener)
-    add_executable(${ex} ${ex}.cpp)
-    target_link_libraries(${ex} PRIVATE shmbridge::shmbridge)
-    target_compile_options(${ex} PRIVATE
-        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
-    )
-endforeach()
+if(UNIX)
+    foreach(ex talker listener)
+        add_executable(${ex} ${ex}.cpp)
+        target_link_libraries(${ex} PRIVATE shmbridge::shmbridge)
+        target_compile_options(${ex} PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
+        )
+    endforeach()
+else()
+    message(STATUS "shmbridge examples: skipping POSIX examples on non-Unix platform")
+endif()

@@ -49,10 +49,11 @@ target_compile_definitions(shmbridge INTERFACE
 )
 
 # ── pybind11 extension module ─────────────────────────────────────────────────
-# scikit-build-core installs pybind11 as a build dep; find it via CMake config.
+# POSIX-only: shm_open / mmap are not available on Windows, so the extension
+# is only built on Unix-like systems where the underlying APIs exist.
 find_package(pybind11 CONFIG QUIET)
 
-if(pybind11_FOUND)
+if(UNIX AND pybind11_FOUND)
     pybind11_add_module(_core csrc/py_bindings.cpp)
     target_include_directories(_core PRIVATE include)
     target_compile_options(_core PRIVATE
@@ -67,7 +68,8 @@ if(pybind11_FOUND)
 endif()
 
 # ── C++ unit tests ────────────────────────────────────────────────────────────
-if(SHMBRIDGE_BUILD_TESTS)
+# Tests and benchmarks use POSIX SHM; only build on Unix.
+if(UNIX AND SHMBRIDGE_BUILD_TESTS)
     find_package(GTest REQUIRED)
     enable_testing()
 
@@ -87,7 +89,7 @@ if(SHMBRIDGE_BUILD_TESTS)
 endif()
 
 # ── C++ microbenchmarks ───────────────────────────────────────────────────────
-if(SHMBRIDGE_BUILD_BENCH)
+if(UNIX AND SHMBRIDGE_BUILD_BENCH)
     foreach(bench bench_migration bench_realistic)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${bench}.cpp")
             add_executable(${bench} tests/${bench}.cpp)
