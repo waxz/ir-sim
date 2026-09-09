@@ -1,0 +1,90 @@
+/*
+ * shmbridge/types.h  –  shared-memory layout v2 for the shmbridge library.
+ *
+ * Wire format improvements over irsim_bridge_v1:
+ *
+ *   IrsimHeader  : magic (0x53484D42) + schema_version (2) + n_robots
+ *                  at offsets 8–16 (were padding in v1 → backward-compat)
+ *   IrsimStateSlot: writer_ts_ns at offset 88 (was _fill in v1)
+ *   IrsimCmdSlot  : writer_ts_ns at offset 32 (was _fill in v1)
+ *
+ * A v1 C++ controller can read a v2 segment without recompilation:
+ *   – header.ready is still at offset 0 (uint64, value 1)
+ *   – state/cmd payloads and seqlock positions are unchanged
+ *   – new fields fall in bytes that v1 treated as padding
+ *
+ * Multi-robot layout (N robots):
+ *   offset 0       : IrsimHeader  (128 B)
+ *   offset 128     : IrsimStateSlot[N] (N × 128 B)
+ *   offset 128+128N: IrsimCmdSlot[N]   (N × 128 B)
+ *   total          : 128 + 256 × N bytes
+ */
+
+#pragma once
+
+#include <stdint.h>
+#include <string.h>
+
+#define SHMBRIDGE_MAGIC         0x53484D42u   /* ASCII "SHMB" */
+#define SHMBRIDGE_VERSION       2
+#define SHMBRIDGE_SHM_NAME      "/irsim_bridge_v2"
+#define SHMBRIDGE_SHM_SIZE_N(n) (128u + 256u * (unsigned)(n))
+
+/* Size of a segment for n_robots, page-aligned to 4096. */
+#define SHMBRIDGE_SHM_SIZE_ALIGNED(n) \
+    (( SHMBRIDGE_SHM_SIZE_N(n) + 4095u ) & ~4095u)
+
+/* ── Robot state (72 bytes) — unchanged from v1 ─────────────────────────── */
+typedef struct {
+    double   x, y, heading;      /* world-frame pose  (m, m, rad)          */
+    float    vx, vy, omega;      /* world-frame velocity (m/s, rad/s)       */
+    float    goal_x, goal_y;     /* current goal (m)                        */
+    float    goal_dist;          /* Euclidean distance to goal (m)           */
+    uint64_t step;               /* sim step counter                        */
+    double   sim_time;           /* simulated time (s)                      */
+    uint8_t  reached;            /* 1 = goal reached                        */
+    uint8_t  collision;          /* 1 = in collision                         */
+    uint8_t  _pad[6];
+} IrsimState; /* sizeof == 72 */
+
+/* ── Velocity command (16 bytes) — unchanged from v1 ───────────────────── */
+typedef struct {
+    float    linear;             /* forward velocity (m/s)                  */
+    float    angular;            /* angular velocity (rad/s, CCW+)          */
+    uint32_t seq;                /* command counter (monotone)              */
+    uint32_t valid;              /* nonzero = fresh command                 */
+} IrsimCmd; /* sizeof == 16 */
+
+/* ── State seqlock slot (128 bytes) ────────────────────────────────────── */
+typedef struct {
+    volatile uint64_t seq;           /* offset  0  odd while writing        */
+    IrsimState        state;         /* offset  8  72 bytes                 */
+    volatile uint64_t seq2;          /* offset 80  mirrors seq when valid   */
+    volatile uint64_t writer_ts_ns;  /* offset 88  monotonic ns (NEW in v2) */
+    uint8_t           _fill[32];     /* offset 96  pad to 128               */
+} IrsimStateSlot; /* sizeof == 128 */
+
+/* ── Cmd seqlock slot (128 bytes) ──────────────────────────────────────── */
+typedef struct {
+    volatile uint64_t seq;           /* offset  0                           */
+    IrsimCmd          cmd;           /* offset  8  16 bytes                 */
+    volatile uint64_t seq2;          /* offset 24                           */
+    volatile uint64_t writer_ts_ns;  /* offset 32  monotonic ns (NEW in v2) */
+    uint8_t           _fill[88];     /* offset 40  pad to 128               */
+} IrsimCmdSlot; /* sizeof == 128 */
+
+/* ── Shared-memory header (128 bytes) ──────────────────────────────────── */
+typedef struct {
+    volatile uint64_t ready;         /* offset  0  1 = initialized (v1 compat) */
+    uint32_t          magic;         /* offset  8  SHMBRIDGE_MAGIC             */
+    uint32_t          schema_version;/* offset 12  SHMBRIDGE_VERSION           */
+    uint8_t           n_robots;      /* offset 16  number of robot slots       */
+    uint8_t           _fill[111];    /* offset 17  pad to 128                  */
+} IrsimHeader; /* sizeof == 128 */
+
+/* Single-robot convenience block (use SHMBRIDGE_SHM_SIZE_N(1) bytes). */
+typedef struct {
+    IrsimHeader    header;
+    IrsimStateSlot states[1];
+    IrsimCmdSlot   cmds[1];
+} IrsimBlock; /* sizeof == 384 for n=1 */
