@@ -1,5 +1,5 @@
 """
-python_writer.py – example: drive a fake robot state into shmbridge and read
+python_writer.py - example: drive a fake robot state into shmbridge and read
 back a cmd, without needing ir-sim installed.
 
 Run:
@@ -8,7 +8,9 @@ Run:
 """
 
 import time
-from shmbridge import ShmBridge, RobotState
+
+from shmbridge import RobotState, ShmBridge
+
 
 def main():
     bridge = ShmBridge()
@@ -33,8 +35,10 @@ def main():
 
             cmd = bridge.read_cmd()
             if cmd is not None:
-                print(f"step {step:5d}  cmd linear={cmd.linear:.3f}  "
-                      f"angular={cmd.angular:.3f}  seq={cmd.seq}")
+                print(
+                    f"step {step:5d}  cmd linear={cmd.linear:.3f}  "
+                    f"angular={cmd.angular:.3f}  seq={cmd.seq}"
+                )
             else:
                 print(f"step {step:5d}  no cmd")
 
@@ -48,6 +52,7 @@ def main():
     finally:
         bridge.close()
         print("Bridge closed.")
+
 
 if __name__ == "__main__":
     main()

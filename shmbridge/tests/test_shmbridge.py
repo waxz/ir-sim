@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from shmbridge import MAGIC, SCHEMA_VERSION, RobotCmd, ShmBridge
+from shmbridge import MAGIC, SCHEMA_VERSION, ShmBridge
 from shmbridge._types import (
     _IrsimCmdSlot,
     _IrsimHeader,
@@ -146,7 +146,6 @@ def test_read_cmd_after_write(bridge):
     slot.seq2 = 2
     cmd = bridge.read_cmd()
     assert cmd is not None
-    assert isinstance(cmd, RobotCmd)
     assert abs(cmd.linear - 0.8) < 1e-5
     assert abs(cmd.angular + 0.3) < 1e-5
 

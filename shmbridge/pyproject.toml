@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=0.8", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "shmbridge"
-version = "2.0.0"
-description = "Zero-dependency POSIX shared-memory seqlock bridge for Python ↔ C++ robot control"
+version = "2.1.0"
+description = "POSIX shared-memory seqlock bridge for Python and C++ robot control"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -13,10 +13,12 @@ dependencies = []
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.24"]
-dev   = ["pytest", "numpy"]
+dev   = ["pytest", "numpy", "pybind11>=2.12"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/shmbridge"]
+[tool.scikit-build]
+# Source layout: Python package in src/shmbridge, C++ extension in csrc/
+wheel.packages = ["src/shmbridge"]
+cmake.build-type = "Release"
 
 [tool.ruff]
 line-length = 88

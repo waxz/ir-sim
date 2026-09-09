@@ -513,3 +513,169 @@ class ShmBridge:
             return True
         age_ms = (_monotonic_ns() - ts) / 1_000_000.0
         return age_ms < max_age_ms
+
+
+# ── Pure-Python subscriber (fallback when C++ extension is not built) ─────────
+
+
+class _PyShmSubscriber:
+    """
+    Pure-Python subscriber: attaches to an existing shm segment, reads robot
+    state, and writes velocity commands.
+
+    This is the fallback implementation; when the C++ ``_core`` extension is
+    available, ``shmbridge.ShmSubscriber`` resolves to the C++ class instead.
+    """
+
+    def __init__(self, shm_name: str = SHM_NAME_DEFAULT, n_robots: int = 1) -> None:
+        self._name = shm_name.encode()
+        self._n = n_robots
+        self._nc = 1
+        self._mm: mmap.mmap | None = None
+        self._blk = None
+        self._blk_type = None
+        self._state_slots: list[_IrsimStateSlot] | None = None
+        self._cmd_slots: list[list[_IrsimCmdSlot]] | None = None
+        self._cmd_seqs: list[list[int]] = []
+
+    def attach(self, timeout_ms: float = 30000.0) -> None:
+        """Attach to an existing segment; blocks until ready or timeout."""
+        from ._platform import O_RDWR as _O_RDWR
+
+        fd = _libc.shm_open(self._name, _O_RDWR, 0o666)
+        if fd < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err), self._name.decode())
+        # Map header page to read n_robots / n_consumers
+        hdr_mm = mmap.mmap(fd, 128, mmap.MAP_SHARED, mmap.PROT_READ)
+        from ._types import _IrsimHeader
+
+        hdr_peek = _IrsimHeader.from_buffer_copy(hdr_mm)
+        hdr_mm.close()
+        if hdr_peek.n_robots > 0:
+            self._n = hdr_peek.n_robots
+        if hdr_peek.n_consumers > 0:
+            self._nc = hdr_peek.n_consumers
+        self._blk_type = make_block_type(self._n, self._nc)
+        size = _shm_size(self._n, self._nc)
+        self._mm = mmap.mmap(
+            fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+        )
+        os.close(fd)
+        self._blk = self._blk_type.from_buffer(self._mm)
+        # Wait for ready
+        deadline = time.monotonic() + timeout_ms * 1e-3
+        while not self._blk.header.ready:
+            if time.monotonic() > deadline:
+                self.detach()
+                raise TimeoutError("attach timeout: publisher not ready")
+            time.sleep(0.0005)
+        if self._blk.header.magic and self._blk.header.magic != MAGIC:
+            self.detach()
+            raise ValueError(f"Schema mismatch: magic=0x{self._blk.header.magic:08X}")
+        if self._blk.header.n_robots > 0:
+            self._n = self._blk.header.n_robots
+        if self._blk.header.n_consumers > 0:
+            self._nc = self._blk.header.n_consumers
+        n, nc = self._n, self._nc
+        self._state_slots = [self._blk.states[r] for r in range(n)]
+        self._cmd_slots = [
+            [self._blk.cmds[r * nc + c] for c in range(nc)] for r in range(n)
+        ]
+        self._cmd_seqs = [[0] * nc for _ in range(n)]
+
+    def detach(self) -> None:
+        self._state_slots = None
+        self._cmd_slots = None
+        self._blk = None
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+
+    def is_attached(self) -> bool:
+        return self._mm is not None
+
+    def __enter__(self) -> _PyShmSubscriber:
+        self.attach()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.detach()
+
+    @property
+    def n_robots(self) -> int:
+        return self._n
+
+    @property
+    def n_consumers(self) -> int:
+        return self._nc
+
+    def read_state(self, robot_idx: int = 0) -> RobotState | None:
+        """Seqlock read; returns RobotState or None on torn read."""
+        assert self._state_slots is not None, "call attach() first"
+        slot = self._state_slots[robot_idx]
+        s1 = slot.seq
+        d = slot.state
+        x, y, heading = d.x, d.y, d.heading
+        vx, vy, omega = d.vx, d.vy, d.omega
+        gx, gy, gd = d.goal_x, d.goal_y, d.goal_dist
+        step, sim_time = d.step, d.sim_time
+        reached, collision = d.reached, d.collision
+        s2 = slot.seq2
+        if s1 != s2 or (s1 & 1):
+            return None
+        return RobotState(
+            x=x,
+            y=y,
+            heading=heading,
+            vx=vx,
+            vy=vy,
+            omega=omega,
+            goal_x=gx,
+            goal_y=gy,
+            goal_dist=gd,
+            step=step,
+            sim_time=sim_time,
+            reached=bool(reached),
+            collision=bool(collision),
+        )
+
+    def read_state_spin(
+        self, robot_idx: int = 0, max_retries: int = 64
+    ) -> RobotState | None:
+        """Spin until a clean read; returns None only on persistent torn reads."""
+        for _ in range(max_retries):
+            s = self.read_state(robot_idx)
+            if s is not None:
+                return s
+        return None
+
+    def write_cmd(
+        self,
+        robot_idx: int,
+        consumer_idx: int,
+        linear: float,
+        angular: float,
+    ) -> None:
+        """Seqlock-write a velocity command to the specified consumer slot."""
+        assert self._cmd_slots is not None, "call attach() first"
+        slot = self._cmd_slots[robot_idx][consumer_idx]
+        self._cmd_seqs[robot_idx][consumer_idx] += 1
+        seq = self._cmd_seqs[robot_idx][consumer_idx]
+        slot.seq = seq  # even → odd
+        slot.cmd.linear = linear
+        slot.cmd.angular = angular
+        slot.cmd.seq = seq
+        slot.cmd.valid = 1
+        self._cmd_seqs[robot_idx][consumer_idx] += 1
+        seq = self._cmd_seqs[robot_idx][consumer_idx]
+        slot.seq = seq  # odd → even
+        slot.seq2 = seq
+        slot.writer_ts_ns = _monotonic_ns()
+
+    def is_publisher_alive(self, max_age_ms: float = 100.0, robot_idx: int = 0) -> bool:
+        assert self._state_slots is not None, "call attach() first"
+        ts = self._state_slots[robot_idx].writer_ts_ns
+        if ts == 0:
+            return True
+        return (_monotonic_ns() - ts) / 1_000_000.0 < max_age_ms
