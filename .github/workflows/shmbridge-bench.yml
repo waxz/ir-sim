@@ -1,0 +1,114 @@
+name: shmbridge IPC Benchmark
+
+# Triggers: any push that touches shmbridge/ or this workflow file,
+# plus manual dispatch with an optional --quick flag.
+on:
+  push:
+    paths:
+      - 'shmbridge/**'
+      - '.github/workflows/shmbridge-bench.yml'
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: 'Quick mode (fewer iterations, faster run)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: IPC Benchmark — ubuntu-latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install build dependencies and shmbridge
+        run: |
+          uv pip install scikit_build_core pybind11 pyzmq numpy
+          cd shmbridge && uv pip install -e . --no-build-isolation
+
+      - name: Show CPU topology
+        run: lscpu && nproc
+
+      - name: Run IPC benchmark
+        run: |
+          uv run python shmbridge/tests/bench_ipc.py \
+            --json bench_ipc.json \
+            ${{ (inputs.quick == true || inputs.quick == 'true') && '--quick' || '' }}
+
+      - name: Write step summary
+        run: |
+          uv run python - <<'PY'
+          import json, os
+
+          data = json.load(open("bench_ipc.json"))
+          benchmarks = data.get("benchmarks", {})
+          backend = data.get("backend", "?")
+          n_iter = data.get("n_iter", "?")
+          duration = data.get("duration", "?")
+
+          def fmt(val, digits=2):
+              if val is None:
+                  return "—"
+              return f"{val:.{digits}f}"
+
+          rows = [
+              ("C++ in-proc write",         "cpp_inproc_write", False),
+              ("C++ cross-proc (seqlock)",   "cpp_xproc",        True),
+              ("Atomic uint64 cache-prop",   "atomic_cache",     True),
+              ("ZMQ PUSH/PULL TCP",          "zmq_tcp",          False),
+          ]
+
+          lines = [
+              f"## shmbridge IPC Benchmark — ubuntu-latest",
+              "",
+              f"> backend={backend} · n_iter={n_iter} · duration={duration}s",
+              "",
+              "| Benchmark | p50 µs | p95 µs | p99 µs | n | CPU pinned |",
+              "|-----------|--------|--------|--------|---|------------|",
+          ]
+
+          for label, key, _ in rows:
+              s = benchmarks.get(key)
+              if s is None:
+                  lines.append(f"| {label} | — | — | — | — | — |")
+                  continue
+              pin = "✅" if s.get("cpu_pinned") else "—"
+              n = f"{s['n']:,}"
+              lines.append(
+                  f"| {label} | {fmt(s['p50'])} | {fmt(s['p95'])} "
+                  f"| {fmt(s['p99'])} | {n} | {pin} |"
+              )
+
+          # Retry stats
+          rs = data.get("retry_stats", {})
+          if rs:
+              lines += [
+                  "",
+                  "### Torn-read retry statistics",
+                  "",
+                  f"- Total reads: {rs.get('n_reads', 0):,}",
+                  f"- Mean retries: {rs.get('mean_retries', 0):.4f}",
+                  f"- Max retries: {rs.get('max_retries', 0)}",
+                  f"- % reads with ≥1 retry: {rs.get('pct_with_retry', 0):.2f}%",
+              ]
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-ipc-${{ github.sha }}
+          path: bench_ipc.json
+          retention-days: 30
