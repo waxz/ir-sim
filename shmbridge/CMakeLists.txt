@@ -75,8 +75,14 @@ if(SHMBRIDGE_BUILD_TESTS)
     target_compile_options(test_topic PRIVATE
         $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -g -Wall -Wextra>
     )
-
     add_test(NAME test_topic COMMAND test_topic)
+
+    add_executable(test_migration tests/test_migration.cpp)
+    target_link_libraries(test_migration PRIVATE shmbridge::shmbridge GTest::gtest_main)
+    target_compile_options(test_migration PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -g -Wall -Wextra>
+    )
+    add_test(NAME test_migration COMMAND test_migration)
 endif()
 
 # ── Install rules for the INTERFACE target ────────────────────────────────────
