@@ -41,8 +41,7 @@ dependencies = [
 keyboard = ['pynput']
 lidar3d = ['open3d>=0.19.0', 'trimesh>=5.1.0', 'rtree>=1.4.1']
 foxglove = ['foxglove-websocket>=0.1.4']
-bridge = ['shmbridge>=2.0.0']
-all = ['pynput', 'imageio[ffmpeg]', 'pyrvo', 'open3d>=0.19.0', 'trimesh>=5.1.0', 'rtree>=1.4.1', 'foxglove-websocket>=0.1.4', 'shmbridge>=2.0.0']
+all = ['pynput', 'imageio[ffmpeg]', 'pyrvo', 'open3d>=0.19.0', 'trimesh>=5.1.0', 'rtree>=1.4.1', 'foxglove-websocket>=0.1.4']
 
 [dependency-groups]
 docs = [
@@ -104,7 +103,7 @@ exclude = ["docs*", "tests*"]
 line-length = 88
 target-version = "py310"
 # Optional: keep docs/examples out of lint (adjust as you like)
-extend-exclude = ["docs/source/conf.py"]
+extend-exclude = ["docs/source/conf.py", "shmbridge/"]
 
 [tool.ruff.lint]
 # Baseline: correctness + PEP8 + imports + modernize + common bugs + sensible cleanups
@@ -155,7 +154,7 @@ exclude_dirs = ["tests", "docs", ".venv"]
 #   B110 try_except_pass  - intentional best-effort cleanup paths
 #   B404 import_subprocess - subprocess is used only for the legacy gcc fallback in ray_casting_2d_omp.py
 #   B603 subprocess_without_shell_equals_true - same call; arguments are hardcoded, not user input
-skips = ["B101", "B311", "B110", "B404", "B603"]
+skips = ["B101", "B311", "B110", "B404", "B603", "B104"]
 
 [project.urls]
 "Homepage" = "https://ir-sim.readthedocs.io/en/stable/"

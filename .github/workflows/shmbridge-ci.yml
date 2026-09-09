@@ -95,14 +95,14 @@ jobs:
           enable-cache: true
 
       - name: Install build dependencies
-        run: uv pip install "scikit-build-core>=0.8" "pybind11>=2.12" pytest
+        run: uv pip install --system "scikit-build-core>=0.8" "pybind11>=2.12" pytest
 
       - name: Install shmbridge with C++ extension
-        run: cd shmbridge && uv pip install -e . --no-build-isolation
+        run: cd shmbridge && uv pip install --system -e . --no-build-isolation
 
       - name: Verify C++ backend loaded
         run: |
-          uv run python -c "
+          python -c "
           import shmbridge
           print(f'shmbridge {shmbridge.__version__}  backend={shmbridge._BACKEND}')
           assert shmbridge._BACKEND == 'cpp', \
@@ -110,7 +110,7 @@ jobs:
           "
 
       - name: Run Python tests
-        run: uv run pytest shmbridge/tests/test_shmbridge.py -v
+        run: pytest shmbridge/tests/test_shmbridge.py -v
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Job 3 — Python package, ctypes fallback  (Windows)

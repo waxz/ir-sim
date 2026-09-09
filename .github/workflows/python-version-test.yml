@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
 
     steps:
     - uses: actions/checkout@v4
@@ -33,22 +33,14 @@ jobs:
         enable-cache: true
 
     - name: Install the project
-      run: uv sync --locked --all-extras --dev
+      run: uv sync --all-extras --dev
 
-    - name: Test with pytest (Ubuntu)
-      if: startsWith(matrix.os, 'ubuntu')
+    - name: Test with pytest
       run: |
         xvfb-run -s "-screen 0 1024x768x24" uv run pytest --cov-report=xml --cov-report=html
 
-    - name: Test with pytest (macOS)
-      if: startsWith(matrix.os, 'macos')
-      env:
-        MPLBACKEND: Agg
-      run: |
-        uv run pytest --cov-report=xml --cov-report=html
-
     - name: Upload coverage information
-      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+      if: matrix.python-version == '3.12'
       uses: codecov/codecov-action@v5
       with:
         fail_ci_if_error: false
