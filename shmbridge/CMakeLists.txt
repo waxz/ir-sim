@@ -10,6 +10,7 @@ option(SHMBRIDGE_NATIVE_ARCH "Build with -march=native (SIMD memcpy, optimal pau
 option(SHMBRIDGE_LTO         "Enable link-time optimisation on the INTERFACE target"   ON)
 option(SHMBRIDGE_NOTIFY      "Enable futex broadcast notify (Linux only)"              ON)
 option(SHMBRIDGE_BUILD_TESTS "Build C++ unit tests (requires googletest)"              OFF)
+option(SHMBRIDGE_BUILD_BENCH "Build C++ microbenchmarks"                               OFF)
 
 # ── shmbridge INTERFACE library ───────────────────────────────────────────────
 # Header-only: consumers link against shmbridge::shmbridge and get all include
@@ -83,6 +84,19 @@ if(SHMBRIDGE_BUILD_TESTS)
         $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -g -Wall -Wextra>
     )
     add_test(NAME test_migration COMMAND test_migration)
+endif()
+
+# ── C++ microbenchmarks ───────────────────────────────────────────────────────
+if(SHMBRIDGE_BUILD_BENCH)
+    foreach(bench bench_migration bench_realistic)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${bench}.cpp")
+            add_executable(${bench} tests/${bench}.cpp)
+            target_link_libraries(${bench} PRIVATE shmbridge::shmbridge)
+            target_compile_options(${bench} PRIVATE
+                $<$<CXX_COMPILER_ID:GNU,Clang>:-O3 -march=native -funroll-loops>
+            )
+        endif()
+    endforeach()
 endif()
 
 # ── Install rules for the INTERFACE target ────────────────────────────────────

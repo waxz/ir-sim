@@ -362,15 +362,14 @@ public:
      * 3. Poll every attached subscriber and fire callbacks / push to queues.
      */
     void spin_once() {
-        if (registry_.is_open()) {
-            int64_t now = static_cast<int64_t>(shmbridge::detail::now_ns());
-            if (now - last_heartbeat_ns_ >= HEARTBEAT_INTERVAL_NS) {
-                registry_.heartbeat(registry_.slot_idx());
-                last_heartbeat_ns_ = now;
-            }
+        /* Single clock read shared by heartbeat check and attach-retry throttle. */
+        const int64_t now = static_cast<int64_t>(shmbridge::detail::now_ns());
+
+        if (registry_.is_open() && now - last_heartbeat_ns_ >= HEARTBEAT_INTERVAL_NS) {
+            registry_.heartbeat(registry_.slot_idx());
+            last_heartbeat_ns_ = now;
         }
 
-        int64_t now = static_cast<int64_t>(shmbridge::detail::now_ns());
         for (auto& slot : sub_slots_) {
             if (!slot.attached) {
                 if (now - slot.last_attach_try_ns >= ATTACH_RETRY_NS) {
