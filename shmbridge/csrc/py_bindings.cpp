@@ -8,9 +8,12 @@
  */
 
 #include <pybind11/pybind11.h>
+#include <pybind11/functional.h>
 #include <pybind11/stl.h>
 
 #include <shmbridge/core.hpp>
+#include <shmbridge/spin_sleep.hpp>
+#include <shmbridge/scheduler.hpp>
 
 namespace py = pybind11;
 using namespace shmbridge;
@@ -163,4 +166,102 @@ PYBIND11_MODULE(_core, m) {
              py::arg("max_age_ms") = 100.0, py::arg("robot_idx") = 0u)
         .def_property_readonly("n_robots",    &ShmSubscriber::n_robots)
         .def_property_readonly("n_consumers", &ShmSubscriber::n_consumers);
+
+    /* ── spin_sleep utilities ──────────────────────────────────────────── */
+    m.def("spin_sleep_us", &spin_sleep_us, py::arg("us"),
+          "Precise hybrid sleep for `us` microseconds (nanosleep + spin tail).\n"
+          "Releases the GIL so other Python threads can run during the coarse phase.");
+
+    m.def("spin_sleep_ms", &spin_sleep_ms, py::arg("ms"),
+          "Precise hybrid sleep for `ms` milliseconds.");
+
+    m.def("now_ns_mono", &now_ns_mono,
+          "Monotonic raw clock in nanoseconds (CLOCK_MONOTONIC_RAW).");
+
+    py::class_<LoopSleeper>(m, "LoopSleeper",
+        R"doc(
+        Fixed-rate loop timer using precise hybrid sleep.
+
+        Call start() at the top of each iteration and sleep() at the bottom.
+        The remaining time in each period is consumed by nanosleep (coarse)
+        followed by a _SB_PAUSE() spin loop (fine), so actual jitter is
+        typically < 1 µs.
+
+        Parameters
+        ----------
+        hz : float
+            Target loop rate in Hz (default 200.0).
+        )doc")
+        .def(py::init<double>(), py::arg("hz") = 200.0)
+        .def("set_hz",      &LoopSleeper::set_hz,      py::arg("hz"))
+        .def("start",       &LoopSleeper::start)
+        .def("sleep",       &LoopSleeper::sleep,
+             "Sleep for the remainder of this period (releases GIL during wait).")
+        .def("elapsed_ns",  &LoopSleeper::elapsed_ns,
+             "Nanoseconds since the last start() call.")
+        .def_readonly("target_ns", &LoopSleeper::target_ns,
+                      "Target period in nanoseconds.");
+
+    /* ── TaskScheduler ────────────────────────────────────────────────── */
+    py::class_<TaskScheduler>(m, "TaskScheduler",
+        R"doc(
+        Lightweight in-process task scheduler with priority-based tick dispatch.
+
+        Runs tasks at specified periods within a single thread.  Use run() in
+        your own loop or run_threaded() to let it manage its own background
+        thread.
+
+        Priority rules
+        --------------
+        prio 0        -> runs every tick
+        prio N        -> runs every (N+1) ticks; tasks at the same prio are
+                         spread across N+1 slots so they don't all fire at once
+        prio max_prio -> "lazy" time-based: fires when elapsed >= period
+
+        Parameters
+        ----------
+        loop_hz  : float  Target base tick rate (default 200.0 Hz).
+        max_prio : int    Max priority level; prio==max_prio tasks are lazy.
+        )doc")
+        .def(py::init<double, int>(),
+             py::arg("loop_hz")  = 200.0,
+             py::arg("max_prio") = 10)
+        .def("add_task",
+             [](TaskScheduler& sched, const std::string& name,
+                py::object func, double period_ms) {
+                 /* Wrap the Python callable; acquire GIL before calling it
+                  * (important when run_threaded() is used). */
+                 auto pyfunc = std::make_shared<py::object>(func);
+                 sched.add_task(name.c_str(),
+                     [pyfunc]() -> bool {
+                         py::gil_scoped_acquire gil;
+                         py::object ret = (*pyfunc)();
+                         return ret.cast<bool>();
+                     },
+                     period_ms);
+             },
+             py::arg("name"), py::arg("func"), py::arg("period_ms"),
+             R"doc(
+             Register a periodic task.
+
+             Parameters
+             ----------
+             name      : str    Label shown in report().
+             func      : callable() -> bool
+                         Returns True to keep running, False for one-shot removal.
+             period_ms : float  Desired call period in milliseconds.
+             )doc")
+        .def("run", &TaskScheduler::run, py::call_guard<py::gil_scoped_release>(),
+             "Execute one scheduler tick (releases GIL during C++ sleep phase).")
+        .def("run_threaded", &TaskScheduler::run_threaded,
+             "Start the scheduler in a background C++ thread; returns immediately.")
+        .def("stop", &TaskScheduler::stop,
+             "Stop the background thread and join it.")
+        .def("is_running", &TaskScheduler::is_running)
+        .def("tick",       &TaskScheduler::tick,
+             "Number of ticks executed so far.")
+        .def("target_ns",  &TaskScheduler::target_ns,
+             "Base tick period in nanoseconds.")
+        .def("report",     &TaskScheduler::report,
+             "Return a markdown table with per-task timing statistics.");
 }
