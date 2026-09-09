@@ -31,7 +31,6 @@ try:
         ShmSubscriber,
         TaskScheduler,
         now_ns_mono,
-        spin_sleep_us,
     )
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../src"))
@@ -41,7 +40,6 @@ except ImportError:
         ShmSubscriber,
         TaskScheduler,
         now_ns_mono,
-        spin_sleep_us,
     )
 
 
@@ -151,8 +149,19 @@ def bench_publisher_jitter(hz=100, n=400, warmup=20):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # B. read_cmd_blocking CPU EFFICIENCY
-#    Current: tight busy-poll.  Improved: spin_sleep hint between polls.
-#    Measure CPU time consumed for a fixed wall-clock budget.
+#
+# Four variants compared over a 10 ms wall-clock budget (no cmd ever arrives):
+#
+#   Py-tight    Python tight while loop  — baseline (100% CPU)
+#   Py-sleep    Python + time.sleep(500µs) — OS yield via Python
+#   C++-busy    C++ read_cmd_blocking(poll_sleep_ns=0) — pure-spin in C++
+#   C++-nanosleep C++ read_cmd_blocking(poll_sleep_ns=500_000) — nanosleep in C++
+#
+# The key insight: spin_sleep_us < 1 ms stays in pure-spin (Welford estimate =
+# 1 ms → no nanosleep issued), so it never reduces CPU.  Real CPU reduction
+# requires an OS-level nanosleep — either via Python time.sleep or directly
+# from C++ with nanosleep(). The C++ path has lower per-poll overhead and
+# releases the GIL for the whole call duration.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _cpu_us() -> float:
@@ -162,77 +171,59 @@ def _cpu_us() -> float:
 
 def bench_blocking_read_cpu(wall_us=10_000, n=200):
     """
-    Create a publisher but write NO cmd.  Time how much CPU the blocking-read
-    loop burns while waiting for a cmd that never arrives.
-
-    Compares:
-      - current: tight while loop (time.monotonic only)
-      - improved: spin_sleep_us(5) between poll attempts
+    Create a publisher with NO cmd posted.  Measure CPU consumed while waiting
+    for a cmd that never arrives, across four polling strategies.
     """
     pub = ShmPublisher(_SHM_A, 1, 1, 0)
     pub.open()
 
-    # Prime with a dummy state so the slot is valid
-    from shmbridge._core import RobotState
-    pub.write_state(0, RobotState())
-
-    sub = ShmSubscriber(_SHM_A, 1)
-    sub.attach(5000)
-
     results = {}
 
-    # — B1: tight poll --------------------------------------------------------
+    # — B1: Python tight poll (baseline) ---------------------------------------
     cpu_costs = []
     for _ in range(n):
         deadline = time.monotonic() + wall_us * 1e-6
         c0 = _cpu_us()
         while time.monotonic() < deadline:
-            sub.read_state(0)  # always returns (no writer racing it here)
+            pub.read_cmd(0, 0)
         c1 = _cpu_us()
         cpu_costs.append(c1 - c0)
-    results["tight_poll"] = _stats(cpu_costs)
-    results["tight_poll"]["wall_us"] = wall_us
+    results["py_tight_poll"] = _stats(cpu_costs)
+    results["py_tight_poll"]["wall_us"] = wall_us
 
-    # — B2: spin_sleep hybrid -------------------------------------------------
+    # — B2: Python + time.sleep(500 µs) ----------------------------------------
     cpu_costs = []
     for _ in range(n):
         deadline = time.monotonic() + wall_us * 1e-6
         c0 = _cpu_us()
         while time.monotonic() < deadline:
-            sub.read_state(0)
-            spin_sleep_us(5)   # yield for 5 µs between attempts
+            pub.read_cmd(0, 0)
+            time.sleep(0.0005)
         c1 = _cpu_us()
         cpu_costs.append(c1 - c0)
-    results["spin_sleep_5us"] = _stats(cpu_costs)
-    results["spin_sleep_5us"]["wall_us"] = wall_us
+    results["py_sleep_500us"] = _stats(cpu_costs)
+    results["py_sleep_500us"]["wall_us"] = wall_us
 
-    # — B3: spin_sleep 50 µs --------------------------------------------------
+    # — B3: C++ busy-poll (poll_sleep_ns=0, GIL released for full call) --------
     cpu_costs = []
     for _ in range(n):
-        deadline = time.monotonic() + wall_us * 1e-6
         c0 = _cpu_us()
-        while time.monotonic() < deadline:
-            sub.read_state(0)
-            spin_sleep_us(50)
+        pub.read_cmd_blocking(wall_us / 1000.0, 0, 0, 0)   # timeout=wall, no sleep
         c1 = _cpu_us()
         cpu_costs.append(c1 - c0)
-    results["spin_sleep_50us"] = _stats(cpu_costs)
-    results["spin_sleep_50us"]["wall_us"] = wall_us
+    results["cpp_busy_poll"] = _stats(cpu_costs)
+    results["cpp_busy_poll"]["wall_us"] = wall_us
 
-    # — B4: time.sleep 500 µs (OS yield — actual CPU reduction) ---------------
+    # — B4: C++ nanosleep 500 µs between polls (GIL released for full call) ----
     cpu_costs = []
     for _ in range(n):
-        deadline = time.monotonic() + wall_us * 1e-6
         c0 = _cpu_us()
-        while time.monotonic() < deadline:
-            sub.read_state(0)
-            time.sleep(0.0005)   # 500 µs OS sleep → genuine CPU yield
+        pub.read_cmd_blocking(wall_us / 1000.0, 500_000, 0, 0)
         c1 = _cpu_us()
         cpu_costs.append(c1 - c0)
-    results["time_sleep_500us"] = _stats(cpu_costs)
-    results["time_sleep_500us"]["wall_us"] = wall_us
+    results["cpp_nanosleep_500us"] = _stats(cpu_costs)
+    results["cpp_nanosleep_500us"]["wall_us"] = wall_us
 
-    sub.detach()
     pub.close()
     return results
 
@@ -409,9 +400,16 @@ def main():
     print(f"\n=== B. Blocking-read CPU burn (10 ms wall, N={n_block}) ===")
     cpu = bench_blocking_read_cpu(wall_us=10_000, n=n_block)
     out["blocking_read_cpu"] = cpu
+    labels = {
+        "py_tight_poll":      "Py tight poll",
+        "py_sleep_500us":     "Py + time.sleep(500µs)",
+        "cpp_busy_poll":      "C++ busy-poll",
+        "cpp_nanosleep_500us":"C++ nanosleep(500µs)",
+    }
     for name, s in cpu.items():
         util = min(100.0, s["p50"] / s["wall_us"] * 100)
-        print(f"  {name:20}  CPU p50={_fmt(s['p50'])}µs  ({util:.0f}% of {s['wall_us']}µs wall)")
+        label = labels.get(name, name)
+        print(f"  {label:26}  CPU p50={_fmt(s['p50'])}µs  ({util:.0f}% of {s['wall_us']}µs wall)")
 
     # C. Cross-proc round-trip
     print(f"\n=== C. Cross-proc round-trip (pub=100Hz, N={n_cross}) ===")

@@ -305,6 +305,41 @@ public:
     }
 
     /**
+     * Block until a valid cmd arrives or timeout_ms elapses.
+     *
+     * Between poll attempts nanosleep(poll_sleep_ns) is issued — a direct
+     * OS syscall that yields the CPU without going through Python or the
+     * spin_sleep Welford estimator.  This drops idle CPU from ~100 % to
+     * ~5-10 % at negligible extra latency cost.
+     *
+     * poll_sleep_ns = 0  →  pure busy-poll (lowest latency, 100 % CPU).
+     * poll_sleep_ns = 500'000  →  500 µs sleep between polls (default).
+     *
+     * Returns nullopt on timeout.
+     */
+    std::optional<RobotCmd> read_cmd_blocking(
+            double   timeout_ms    = 10.0,
+            int64_t  poll_sleep_ns = 500'000LL,
+            unsigned robot_idx     = 0,
+            unsigned consumer_idx  = 0) const noexcept
+    {
+        uint64_t deadline = detail::now_ns() +
+                            static_cast<uint64_t>(timeout_ms * 1e6);
+        while (detail::now_ns() < deadline) {
+            auto cmd = detail::read_cmd_slot(
+                    detail::cmd_ptr(mem_, robot_idx, consumer_idx, nc_));
+            if (cmd) return cmd;
+            if (poll_sleep_ns > 0) {
+                struct timespec req{0, poll_sleep_ns};
+                nanosleep(&req, nullptr);
+            } else {
+                _SB_PAUSE();
+            }
+        }
+        return std::nullopt;
+    }
+
+    /**
      * Read across all consumer slots; return the one with the highest seq
      * (most recently posted valid command).
      */

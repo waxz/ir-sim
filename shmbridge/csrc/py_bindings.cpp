@@ -100,6 +100,28 @@ PYBIND11_MODULE(_core, m) {
              py::arg("robot_idx") = 0u, py::arg("consumer_idx") = 0u,
              "Non-blocking seqlock read from one consumer slot. Returns None "
              "if mid-write or no valid cmd.")
+        .def("read_cmd_blocking",
+             [](const ShmPublisher& self, double timeout_ms,
+                int64_t poll_sleep_ns, unsigned r, unsigned c) {
+                 return self.read_cmd_blocking(timeout_ms, poll_sleep_ns, r, c);
+             },
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("timeout_ms")    = 10.0,
+             py::arg("poll_sleep_ns") = 500'000LL,
+             py::arg("robot_idx")     = 0u,
+             py::arg("consumer_idx")  = 0u,
+             R"doc(
+             Block until a valid cmd arrives or timeout_ms elapses (GIL released).
+
+             Between poll attempts nanosleep(poll_sleep_ns) is issued — a direct
+             OS-level yield that drops idle CPU from 100 % to ~5 % without going
+             through Python or the spin_sleep Welford estimator.
+
+             poll_sleep_ns = 0       -> pure busy-poll (lowest latency, 100 % CPU)
+             poll_sleep_ns = 500_000 -> 500 µs OS sleep between polls (default)
+
+             Returns None on timeout.
+             )doc")
         .def("read_best_cmd",
              [](const ShmPublisher& self, unsigned r) {
                  return self.read_best_cmd(r);
