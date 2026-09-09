@@ -273,6 +273,45 @@ public:
         return count;
     }
 
+    /*
+     * Skip to the newest item, discarding all earlier ones.
+     *
+     * For SPSC safety the read_idx is advanced to (w-1) BEFORE copying the
+     * slot so the publisher cannot recycle that slot while we read it.
+     * Returns nullopt if the ring is empty.
+     */
+    std::optional<T> pop_latest() noexcept {
+        if (!hdr_) return std::nullopt;
+        const uint64_t r = hdr_->read_idx.load(std::memory_order_relaxed);
+        const uint64_t w = hdr_->write_idx.load(std::memory_order_acquire);
+        if (w == r) return std::nullopt;
+        /* Advance past all but the newest — protects slot (w-1)%N from being
+         * recycled by the publisher before we have a chance to read it. */
+        if (w - 1 != r)
+            hdr_->read_idx.store(w - 1, std::memory_order_release);
+        T item;
+        std::memcpy(&item, &data_[(w - 1) % N], sizeof(T));
+        hdr_->read_idx.store(w, std::memory_order_release);
+        return item;
+    }
+
+    /*
+     * Drop oldest messages so that at most keep_n remain.
+     * Advancing read_idx frees ring slots for the publisher immediately,
+     * preventing silent message drops when the subscriber is slow.
+     * Returns the number of messages discarded.
+     */
+    uint32_t skip_old(uint32_t keep_n) noexcept {
+        if (!hdr_) return 0;
+        const uint64_t r     = hdr_->read_idx.load(std::memory_order_relaxed);
+        const uint64_t w     = hdr_->write_idx.load(std::memory_order_acquire);
+        const uint64_t avail = w - r;
+        if (avail <= keep_n) return 0;
+        const uint64_t drop = avail - keep_n;
+        hdr_->read_idx.store(r + drop, std::memory_order_release);
+        return static_cast<uint32_t>(drop);
+    }
+
     /* Peek at the next item without consuming it. */
     std::optional<T> peek() const noexcept {
         if (!hdr_) return std::nullopt;

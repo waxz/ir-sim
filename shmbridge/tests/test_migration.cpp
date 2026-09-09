@@ -530,5 +530,219 @@ TEST(Node, SpinOnceNonBlockingWhenNoPublisher) {
     EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(dt).count(), 50);
 }
 
+/* ── Ring::skip_old ───────────────────────────────────────────────────────── */
+
+TEST(Ring, SkipOldKeepsLatestN) {
+    const char* topic = "test_ring_skipold";
+    ::shm_unlink("/sbr_test_ring_skipold");
+
+    RingPublisher<Pose2d, 8> pub;
+    ASSERT_TRUE(pub.open(topic));
+
+    RingSubscriber<Pose2d, 8> sub;
+    ASSERT_TRUE(sub.attach(topic, 1000));
+
+    /* Push 5 messages: x = 0 .. 4 */
+    for (int i = 0; i < 5; ++i) {
+        Pose2d m{}; m.x = static_cast<double>(i);
+        ASSERT_TRUE(pub.push(m));
+    }
+    EXPECT_EQ(sub.size(), 5u);
+
+    /* Keep only the 3 newest: should drop 2 (x=0,1), keep x=2,3,4. */
+    uint32_t dropped = sub.skip_old(3);
+    EXPECT_EQ(dropped, 2u);
+    EXPECT_EQ(sub.size(), 3u);
+
+    for (double expected = 2.0; expected <= 4.0; ++expected) {
+        auto item = sub.pop();
+        ASSERT_TRUE(item.has_value());
+        EXPECT_DOUBLE_EQ(item->x, expected);
+    }
+    EXPECT_TRUE(sub.empty());
+}
+
+TEST(Ring, SkipOldNoop) {
+    const char* topic = "test_ring_skipnoop";
+    ::shm_unlink("/sbr_test_ring_skipnoop");
+
+    RingPublisher<Pose2d, 8> pub;
+    ASSERT_TRUE(pub.open(topic));
+
+    RingSubscriber<Pose2d, 8> sub;
+    ASSERT_TRUE(sub.attach(topic, 1000));
+
+    for (int i = 0; i < 3; ++i) {
+        Pose2d m{}; m.x = static_cast<double>(i);
+        pub.push(m);
+    }
+
+    /* keep_n >= avail → nothing dropped */
+    EXPECT_EQ(sub.skip_old(3), 0u);
+    EXPECT_EQ(sub.skip_old(10), 0u);
+    EXPECT_EQ(sub.size(), 3u);
+}
+
+/* ── Ring::pop_latest ─────────────────────────────────────────────────────── */
+
+TEST(Ring, PopLatestGetsNewest) {
+    const char* topic = "test_ring_poplatest";
+    ::shm_unlink("/sbr_test_ring_poplatest");
+
+    RingPublisher<Pose2d, 8> pub;
+    ASSERT_TRUE(pub.open(topic));
+
+    RingSubscriber<Pose2d, 8> sub;
+    ASSERT_TRUE(sub.attach(topic, 1000));
+
+    /* Push 4 messages: x = 0 .. 3 */
+    for (int i = 0; i < 4; ++i) {
+        Pose2d m{}; m.x = static_cast<double>(i);
+        ASSERT_TRUE(pub.push(m));
+    }
+
+    auto latest = sub.pop_latest();
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_DOUBLE_EQ(latest->x, 3.0);   /* newest item */
+    EXPECT_TRUE(sub.empty());            /* all consumed */
+}
+
+TEST(Ring, PopLatestEmpty) {
+    const char* topic = "test_ring_plat_empty";
+    ::shm_unlink("/sbr_test_ring_plat_empty");
+
+    RingPublisher<Pose2d, 4> pub;
+    ASSERT_TRUE(pub.open(topic));
+
+    RingSubscriber<Pose2d, 4> sub;
+    ASSERT_TRUE(sub.attach(topic, 1000));
+
+    EXPECT_FALSE(sub.pop_latest().has_value());
+}
+
+TEST(Ring, PopLatestSingle) {
+    const char* topic = "test_ring_plat_single";
+    ::shm_unlink("/sbr_test_ring_plat_single");
+
+    RingPublisher<Pose2d, 4> pub;
+    ASSERT_TRUE(pub.open(topic));
+
+    RingSubscriber<Pose2d, 4> sub;
+    ASSERT_TRUE(sub.attach(topic, 1000));
+
+    Pose2d m{}; m.x = 99.0;
+    pub.push(m);
+
+    auto item = sub.pop_latest();
+    ASSERT_TRUE(item.has_value());
+    EXPECT_DOUBLE_EQ(item->x, 99.0);
+    EXPECT_TRUE(sub.empty());
+}
+
+/* ── LatestSlot<T> ────────────────────────────────────────────────────────── */
+
+TEST(LatestSlot, StoreAndTake) {
+    LatestSlot<Pose2d> slot;
+    EXPECT_FALSE(slot.has_value());
+
+    Pose2d m{1.0, 2.0, 0.5, 0};
+    slot.store(m);
+    EXPECT_TRUE(slot.has_value());
+    EXPECT_NE(slot.peek(), nullptr);
+    EXPECT_DOUBLE_EQ(slot.peek()->x, 1.0);
+
+    auto taken = slot.take();
+    ASSERT_TRUE(taken.has_value());
+    EXPECT_DOUBLE_EQ(taken->x, 1.0);
+    EXPECT_FALSE(slot.has_value());
+    EXPECT_EQ(slot.peek(), nullptr);
+}
+
+TEST(LatestSlot, MultipleStoresKeepLast) {
+    LatestSlot<Pose2d> slot;
+    for (int i = 0; i < 5; ++i) {
+        Pose2d m{}; m.x = static_cast<double>(i);
+        slot.store(m);
+    }
+    EXPECT_TRUE(slot.has_value());
+    auto taken = slot.take();
+    ASSERT_TRUE(taken.has_value());
+    EXPECT_DOUBLE_EQ(taken->x, 4.0);   /* last stored wins */
+    EXPECT_FALSE(slot.has_value());
+}
+
+TEST(LatestSlot, TakeEmpty) {
+    LatestSlot<Pose2d> slot;
+    EXPECT_FALSE(slot.take().has_value());
+}
+
+TEST(LatestSlot, Clear) {
+    LatestSlot<Pose2d> slot;
+    Pose2d m{}; m.x = 7.0;
+    slot.store(m);
+    slot.clear();
+    EXPECT_FALSE(slot.has_value());
+    EXPECT_FALSE(slot.take().has_value());
+}
+
+/* ── Node::create_latest ──────────────────────────────────────────────────── */
+
+TEST(Node, CreateLatestSeqlock) {
+    ::shm_unlink("/sb_cl_seqlock_pose");
+
+    auto pub_node = make_node("cl_seq_pub");
+    auto sub_node = make_node("cl_seq_sub");
+
+    auto pub = pub_node->create_publisher<Pose2d>("cl_seqlock_pose", SensorDataQoS());
+    auto [sub, slot] = sub_node->create_latest<Pose2d>("cl_seqlock_pose", SensorDataQoS());
+
+    EXPECT_FALSE(slot->has_value());
+
+    Pose2d msg{5.0, 6.0, 1.1, 0};
+    pub->publish(msg);
+
+    /* Spin until attached and the message arrives. */
+    for (int i = 0; i < 30 && !slot->has_value(); ++i) {
+        pub->publish(msg);
+        sub_node->spin_once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    auto got = slot->take();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_DOUBLE_EQ(got->x, 5.0);
+    EXPECT_DOUBLE_EQ(got->y, 6.0);
+    EXPECT_FALSE(slot->has_value());   /* consumed */
+}
+
+TEST(Node, CreateLatestRing) {
+    ::shm_unlink("/sbr_cl_ring_twist");
+
+    auto pub_node = make_node("cl_ring_pub");
+    auto sub_node = make_node("cl_ring_sub");
+
+    auto pub = pub_node->create_publisher<Twist>("cl_ring_twist", SystemDefaultsQoS());
+    auto [sub, slot] = sub_node->create_latest<Twist>("cl_ring_twist", SystemDefaultsQoS());
+
+    EXPECT_FALSE(slot->has_value());
+
+    /* Publish 8 messages; only the newest should be visible to the slot. */
+    for (int i = 1; i <= 8; ++i) {
+        Twist t{}; t.vx = static_cast<float>(i);
+        pub->publish(t);
+    }
+
+    for (int i = 0; i < 30 && !slot->has_value(); ++i) {
+        sub_node->spin_once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    auto got = slot->take();
+    ASSERT_TRUE(got.has_value());
+    /* pop_latest() delivers the newest; must be one of the later messages. */
+    EXPECT_GE(got->vx, 1.0f);
+    EXPECT_FALSE(slot->has_value());   /* slot cleared after take */
+}
+
 /* ── entry point ──────────────────────────────────────────────────────────── */
 /* GTest main is provided by GTest::gtest_main link target. */

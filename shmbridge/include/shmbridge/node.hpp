@@ -136,6 +136,36 @@ private:
     std::size_t    capacity_;
 };
 
+/* ── LatestSlot<T> — single-message keep-latest store, no heap allocation ── */
+
+/*
+ * Stores exactly one message: each store() overwrites the previous value.
+ * take() returns the stored value and clears the slot in O(1).
+ * No std::deque, no heap allocation in the hot path.
+ *
+ * NOT thread-safe: store() (called from spin_once()) and take()/peek()
+ * (called by the user) must execute from the same thread, or be guarded.
+ */
+template <typename T>
+class LatestSlot {
+public:
+    void store(const T& msg) noexcept { value_ = msg; has_value_ = true; }
+
+    std::optional<T> take() noexcept {
+        if (!has_value_) return std::nullopt;
+        has_value_ = false;
+        return value_;
+    }
+
+    const T* peek()      const noexcept { return has_value_ ? &value_ : nullptr; }
+    bool     has_value() const noexcept { return has_value_; }
+    void     clear()           noexcept { has_value_ = false; }
+
+private:
+    T    value_{};
+    bool has_value_{false};
+};
+
 /* ── Subscription handle (stateless, user-visible) ───────────────────────── */
 
 /*
@@ -318,7 +348,12 @@ public:
             slot.try_attach = [sub, topic]() -> bool {
                 return sub->attach(topic.c_str(), 0);
             };
-            slot.poll_fn = [sub, cb_copy]() {
+            /* Enforce backlog limit before draining: if the subscriber is
+             * slower than the publisher, skip_old() advances read_idx past
+             * stale messages so the ring never stays full and the publisher
+             * never silently drops new writes due to overflow. */
+            slot.poll_fn = [sub, cb_copy, keep_n = qos.depth()]() {
+                sub->skip_old(keep_n);
                 sub->drain([&](const T& msg) { cb_copy(msg); });
             };
             ring_subs_[topic] = sub;
@@ -351,6 +386,59 @@ public:
         auto sub = create_subscription<T>(topic, qos,
                        [q](const T& msg) { q->push(msg); });
         return {sub, q};
+    }
+
+    /* ── create_latest ───────────────────────────────────────────────────── */
+
+    /*
+     * Single-message subscription backed by LatestSlot<T>.
+     * spin_once() overwrites the slot with the newest available message;
+     * the caller reads it with slot->take() or slot->peek().
+     *
+     *   auto [sub, slot] = node->create_latest<Pose2d>("pose");
+     *   while (running) {
+     *       node->spin_once();
+     *       if (auto m = slot->take()) process(*m);
+     *   }
+     *
+     * For seqlock topics (depth <= 1) the callback approach is used — the
+     * seqlock already gives keep-latest semantics via read_if_new().
+     * For ring topics (depth > 1) pop_latest() is used inside poll_fn,
+     * skipping all but the newest item in O(1) — no drain loop, no deque.
+     */
+    template <typename T>
+    std::pair<std::shared_ptr<Subscription<T>>, std::shared_ptr<LatestSlot<T>>>
+    create_latest(const std::string& topic, const QoS& qos = SensorDataQoS()) {
+        auto slot_ptr = std::make_shared<LatestSlot<T>>();
+
+        if (qos.wants_keep_latest()) {
+            /* Seqlock path: delegate to create_subscription, which already
+             * calls read_if_new() — inherently keep-latest. */
+            auto sub = create_subscription<T>(topic, qos,
+                           [slot_ptr](const T& msg) { slot_ptr->store(msg); });
+            return {sub, slot_ptr};
+        }
+
+        /* Ring path: custom poll_fn uses pop_latest() to skip the backlog
+         * and take only the single newest item in O(1). */
+        auto raw_sub = std::make_shared<shmbridge::RingSubscriber<T>>();
+
+        detail::SubSlot sub_slot;
+        sub_slot.topic       = topic;
+        sub_slot.keep_latest = false;
+        sub_slot.try_attach  = [raw_sub, topic]() -> bool {
+            return raw_sub->attach(topic.c_str(), 0);
+        };
+        sub_slot.poll_fn = [raw_sub, slot_ptr]() {
+            if (auto item = raw_sub->pop_latest()) slot_ptr->store(*item);
+        };
+        ring_subs_[topic] = raw_sub;
+
+        sub_topics_.push_back(topic);
+        refresh_registry();
+        sub_slots_.push_back(std::move(sub_slot));
+
+        return {std::make_shared<Subscription<T>>(topic), slot_ptr};
     }
 
     /* ── spin_once ────────────────────────────────────────────────────────── */
