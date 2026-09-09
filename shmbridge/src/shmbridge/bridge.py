@@ -461,18 +461,25 @@ class ShmBridge:
         timeout_ms: float = 10.0,
         robot_idx: int = 0,
         consumer_idx: int = 0,
+        poll_sleep_ms: float = 0.5,
     ) -> RobotCmd | None:
         """
         Block until a valid command arrives or *timeout_ms* elapses.
 
-        Busy-polls the seqlock; suitable for hard RT loops.
+        Polls the seqlock with a short sleep between attempts to avoid burning
+        100 % CPU.  ``poll_sleep_ms`` (default 0.5 ms) controls the trade-off:
+        lower values reduce latency at the cost of higher CPU usage.
+        Set to 0 for a pure busy-poll (original behaviour).
         Returns ``None`` on timeout.
         """
         deadline = time.monotonic() + timeout_ms * 1e-3
+        sleep_s = poll_sleep_ms * 1e-3
         while time.monotonic() < deadline:
             cmd = self.read_cmd(robot_idx, consumer_idx)
             if cmd is not None:
                 return cmd
+            if sleep_s > 0:
+                time.sleep(sleep_s)
         return None
 
     # ── liveness ──────────────────────────────────────────────────────────
