@@ -5,20 +5,106 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── pybind11 ──────────────────────────────────────────────────────────────────
-# scikit-build-core installs pybind11 as a build dep; find it via CMake config.
-find_package(pybind11 CONFIG REQUIRED)
+# ── Feature flags ─────────────────────────────────────────────────────────────
+option(SHMBRIDGE_NATIVE_ARCH "Build with -march=native (SIMD memcpy, optimal pause)"  ON)
+option(SHMBRIDGE_LTO         "Enable link-time optimisation on the INTERFACE target"   ON)
+option(SHMBRIDGE_NOTIFY      "Enable futex broadcast notify (Linux only)"              ON)
+option(SHMBRIDGE_BUILD_TESTS "Build C++ unit tests (requires googletest)"              OFF)
 
-# ── Extension module ──────────────────────────────────────────────────────────
-pybind11_add_module(_core csrc/py_bindings.cpp)
+# ── shmbridge INTERFACE library ───────────────────────────────────────────────
+# Header-only: consumers link against shmbridge::shmbridge and get all include
+# paths, compile options, and preprocessor flags propagated automatically.
 
-target_include_directories(_core PRIVATE include)
+add_library(shmbridge INTERFACE)
+add_library(shmbridge::shmbridge ALIAS shmbridge)
 
-# Aggressive inlining for the header-only seqlock paths
-target_compile_options(_core PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-O3 -march=native -fvisibility=hidden>
+target_include_directories(shmbridge INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_compile_features(shmbridge INTERFACE cxx_std_17)
+
+# Optimisation options propagated to every TU that links shmbridge
+target_compile_options(shmbridge INTERFACE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:
+        -O3
+        $<$<BOOL:${SHMBRIDGE_NATIVE_ARCH}>:-march=native>
+        -funroll-loops
+    >
     $<$<CXX_COMPILER_ID:MSVC>:/O2>
 )
 
-# Install into the shmbridge Python package directory
-install(TARGETS _core DESTINATION shmbridge)
+# LTO: set the property; consumer project must also enable it for full effect
+if(SHMBRIDGE_LTO)
+    set_target_properties(shmbridge PROPERTIES
+        INTERFACE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
+# Preprocessor flags
+target_compile_definitions(shmbridge INTERFACE
+    $<$<BOOL:${SHMBRIDGE_NOTIFY}>:SB_ENABLE_NOTIFY=1>
+    $<$<NOT:$<BOOL:${SHMBRIDGE_NOTIFY}>>:SB_ENABLE_NOTIFY=0>
+)
+
+# ── pybind11 extension module ─────────────────────────────────────────────────
+# scikit-build-core installs pybind11 as a build dep; find it via CMake config.
+find_package(pybind11 CONFIG QUIET)
+
+if(pybind11_FOUND)
+    pybind11_add_module(_core csrc/py_bindings.cpp)
+    target_include_directories(_core PRIVATE include)
+    target_compile_options(_core PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:
+            -O3
+            $<$<BOOL:${SHMBRIDGE_NATIVE_ARCH}>:-march=native>
+            -fvisibility=hidden
+        >
+        $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    )
+    install(TARGETS _core DESTINATION shmbridge)
+endif()
+
+# ── C++ unit tests ────────────────────────────────────────────────────────────
+if(SHMBRIDGE_BUILD_TESTS)
+    find_package(GTest REQUIRED)
+    enable_testing()
+
+    add_executable(test_topic tests/test_topic.cpp)
+    target_link_libraries(test_topic PRIVATE shmbridge::shmbridge GTest::gtest_main)
+    target_compile_options(test_topic PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -g -Wall -Wextra>
+    )
+
+    add_test(NAME test_topic COMMAND test_topic)
+endif()
+
+# ── Install rules for the INTERFACE target ────────────────────────────────────
+include(GNUInstallDirs)
+
+install(TARGETS shmbridge EXPORT shmbridge-targets)
+install(EXPORT shmbridge-targets
+    FILE        shmbridge-targets.cmake
+    NAMESPACE   shmbridge::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shmbridge
+)
+install(DIRECTORY include/shmbridge
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/shmbridge-config-version.cmake"
+    VERSION       3.0.0
+    COMPATIBILITY SameMajorVersion
+)
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/shmbridge-config.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/shmbridge-config.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shmbridge
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/shmbridge-config.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/shmbridge-config-version.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shmbridge
+)
