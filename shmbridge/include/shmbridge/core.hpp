@@ -37,13 +37,32 @@
 #include <string>
 #include <vector>
 
+/* ── Memory-order fences ──────────────────────────────────────────────────────
+ * Split writer / reader fences instead of seq_cst.
+ * On x86 (TSO) these compile to compiler barriers only — no mfence (~30 ns).
+ * On AArch64 they emit dmb ishst / dmb ish, still lighter than dmb sy.
+ * ─────────────────────────────────────────────────────────────────────────── */
 #ifdef __cplusplus
 #  include <atomic>
-#  define _SB_FENCE() std::atomic_thread_fence(std::memory_order_seq_cst)
+/* StoreStore: seals the write window before and after payload stores. */
+#  define _SB_FENCE_W() std::atomic_thread_fence(std::memory_order_release)
+/* LoadLoad: ensures seq is read before payload, and payload before seq2. */
+#  define _SB_FENCE_R() std::atomic_thread_fence(std::memory_order_acquire)
 #elif defined(__aarch64__) || defined(__ARM_ARCH_8A__)
-#  define _SB_FENCE() __asm__ volatile("dmb ish" ::: "memory")
+#  define _SB_FENCE_W() __asm__ volatile("dmb ishst" ::: "memory")
+#  define _SB_FENCE_R() __asm__ volatile("dmb ish"   ::: "memory")
 #else
-#  define _SB_FENCE() __sync_synchronize()
+#  define _SB_FENCE_W() __asm__ volatile("" ::: "memory")
+#  define _SB_FENCE_R() __asm__ volatile("" ::: "memory")
+#endif
+
+/* Spin-wait hint — cuts memory-bus contention and pipeline stalls in retry loops. */
+#if defined(__x86_64__) || defined(__i386__)
+#  define _SB_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(__ARM_ARCH_8A__)
+#  define _SB_PAUSE() __asm__ volatile("yield" ::: "memory")
+#else
+#  define _SB_PAUSE() ((void)0)
 #endif
 
 #ifdef __linux__
@@ -113,7 +132,7 @@ inline void write_state_slot(IrsimStateSlot* slot, const RobotState& s,
                               uint64_t& seq_counter, unsigned& write_count,
                               unsigned heartbeat_every) noexcept {
     slot->seq = ++seq_counter;  /* even → odd */
-    _SB_FENCE();
+    _SB_FENCE_W();
     IrsimState& d = slot->state;
     d.x         = s.x;
     d.y         = s.y;
@@ -128,17 +147,17 @@ inline void write_state_slot(IrsimStateSlot* slot, const RobotState& s,
     d.sim_time  = s.sim_time;
     d.reached   = s.reached ? 1u : 0u;
     d.collision = s.collision ? 1u : 0u;
-    _SB_FENCE();
+    _SB_FENCE_W();
     slot->seq = ++seq_counter;  /* odd → even */
     slot->seq2 = seq_counter;
-    if (++write_count % heartbeat_every == 0)
+    if (heartbeat_every > 0 && (++write_count % heartbeat_every) == 0)
         slot->writer_ts_ns = now_ns();
 }
 
 /* Seqlock read of robot state; returns false on torn read. */
 inline bool read_state_slot(const IrsimStateSlot* slot, RobotState& out) noexcept {
     uint64_t s1 = slot->seq;
-    _SB_FENCE();
+    _SB_FENCE_R();
     const IrsimState& d = slot->state;
     out.x         = d.x;
     out.y         = d.y;
@@ -153,7 +172,7 @@ inline bool read_state_slot(const IrsimStateSlot* slot, RobotState& out) noexcep
     out.sim_time  = d.sim_time;
     out.reached   = d.reached != 0;
     out.collision = d.collision != 0;
-    _SB_FENCE();
+    _SB_FENCE_R();
     uint64_t s2 = slot->seq2;
     return s1 == s2 && !(s1 & 1u);
 }
@@ -162,12 +181,12 @@ inline bool read_state_slot(const IrsimStateSlot* slot, RobotState& out) noexcep
 inline void write_cmd_slot(IrsimCmdSlot* slot, float linear, float angular,
                             uint64_t& seq_counter) noexcept {
     slot->seq = ++seq_counter;
-    _SB_FENCE();
+    _SB_FENCE_W();
     slot->cmd.linear  = linear;
     slot->cmd.angular = angular;
     slot->cmd.seq     = static_cast<uint32_t>(seq_counter);
     slot->cmd.valid   = 1;
-    _SB_FENCE();
+    _SB_FENCE_W();
     slot->seq = ++seq_counter;
     slot->seq2 = seq_counter;
     slot->writer_ts_ns = now_ns();
@@ -176,12 +195,12 @@ inline void write_cmd_slot(IrsimCmdSlot* slot, float linear, float angular,
 /* Seqlock read of a cmd; returns nullopt on torn read or no valid cmd. */
 inline std::optional<RobotCmd> read_cmd_slot(const IrsimCmdSlot* slot) noexcept {
     uint64_t s1 = slot->seq;
-    _SB_FENCE();
+    _SB_FENCE_R();
     float    lin   = slot->cmd.linear;
     float    ang   = slot->cmd.angular;
     uint32_t seq   = slot->cmd.seq;
     uint32_t valid = slot->cmd.valid;
-    _SB_FENCE();
+    _SB_FENCE_R();
     uint64_t s2 = slot->seq2;
     if (s1 != s2 || (s1 & 1u) || !valid) return std::nullopt;
     return RobotCmd{lin, ang, seq};
@@ -220,7 +239,7 @@ public:
     {
         if (n_robots < 1)    throw std::invalid_argument("n_robots must be >= 1");
         if (n_consumers < 1) throw std::invalid_argument("n_consumers must be >= 1");
-        if (heartbeat_every < 1) throw std::invalid_argument("heartbeat_every >= 1");
+        /* heartbeat_every == 0 means never update writer_ts_ns (lowest-latency mode). */
     }
 
     ~ShmPublisher() { close(); }
@@ -416,6 +435,7 @@ public:
                                               unsigned max_retries = 64) const noexcept {
         for (unsigned i = 0; i < max_retries; ++i) {
             if (auto s = read_state(robot_idx)) return s;
+            _SB_PAUSE();
         }
         return std::nullopt;
     }
