@@ -14,6 +14,13 @@ _libc.shm_unlink.argtypes = [ctypes.c_char_p]
 _libc.ftruncate.restype = ctypes.c_int
 _libc.ftruncate.argtypes = [ctypes.c_int, ctypes.c_long]
 
+# mlock / munlock - pin pages in RAM to eliminate page-fault latency on first access
+_libc.mlock.restype = ctypes.c_int
+_libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+
+_libc.munlock.restype = ctypes.c_int
+_libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+
 # clock_gettime is needed for liveness timestamps (monotonic ns)
 if sys.platform.startswith("linux"):
     CLOCK_MONOTONIC = 1

@@ -23,9 +23,9 @@ SHM_NAME_DEFAULT = "/irsim_bridge_v2"
 EXT_SHM_NAME_DEFAULT = "/irsim_bridge_ext_v2"
 
 
-def _shm_size(n_robots: int = 1) -> int:
-    """Segment byte size for *n_robots* robots, page-aligned."""
-    raw = 128 + 256 * n_robots
+def _shm_size(n_robots: int = 1, n_consumers: int = 1) -> int:
+    """Segment byte size for *n_robots* robots and *n_consumers* cmd writers, page-aligned."""
+    raw = 128 + 128 * n_robots + 128 * n_robots * n_consumers
     page = 4096
     return (raw + page - 1) & ~(page - 1)
 
@@ -125,28 +125,36 @@ class _IrsimHeader(ctypes.Structure):
         ("magic", ctypes.c_uint32),  # offset  8  NEW
         ("schema_version", ctypes.c_uint32),  # offset 12  NEW
         ("n_robots", ctypes.c_uint8),  # offset 16  NEW
-        ("_fill", ctypes.c_uint8 * 111),  # offset 17  pad to 128
+        ("n_consumers", ctypes.c_uint8),  # offset 17  NEW - cmd writers per robot
+        ("_fill", ctypes.c_uint8 * 110),  # offset 18  pad to 128
     ]
 
 
 assert ctypes.sizeof(_IrsimHeader) == 128, ctypes.sizeof(_IrsimHeader)
 
 
-def make_block_type(n_robots: int = 1) -> type[ctypes.Structure]:
+def make_block_type(n_robots: int = 1, n_consumers: int = 1) -> type[ctypes.Structure]:
     """
-    Build a ctypes Structure for *n_robots* robot slots.
+    Build a ctypes Structure for *n_robots* robots and *n_consumers* cmd writers.
 
-    Layout: IrsimHeader (128) + n*IrsimStateSlot (n*128) + n*IrsimCmdSlot (n*128)
+    Layout:
+      IrsimHeader (128)
+      IrsimStateSlot[n_robots]           (n_robots * 128)
+      IrsimCmdSlot[n_robots * n_consumers] (n_robots * n_consumers * 128)
+
+    Cmd slot index for (robot r, consumer c): r * n_consumers + c.
+    When n_consumers == 1 the layout is identical to schema v2.
     """
+    n_cmd = n_robots * n_consumers
 
     class _IrsimBlock(ctypes.Structure):
         _fields_ = [
             ("header", _IrsimHeader),
             ("states", _IrsimStateSlot * n_robots),
-            ("cmds", _IrsimCmdSlot * n_robots),
+            ("cmds", _IrsimCmdSlot * n_cmd),
         ]
 
-    expected = 128 + 256 * n_robots
+    expected = 128 + 128 * n_robots + 128 * n_cmd
     assert ctypes.sizeof(_IrsimBlock) == expected, (
         f"Block size {ctypes.sizeof(_IrsimBlock)} != {expected}"
     )

@@ -1,23 +1,26 @@
 /*
- * shmbridge/types.h  –  shared-memory layout v2 for the shmbridge library.
+ * shmbridge/types.h  -  shared-memory layout v2 for the shmbridge library.
  *
  * Wire format improvements over irsim_bridge_v1:
  *
  *   IrsimHeader  : magic (0x53484D42) + schema_version (2) + n_robots
- *                  at offsets 8–16 (were padding in v1 → backward-compat)
+ *                  + n_consumers at offsets 8-17 (were padding in v1)
  *   IrsimStateSlot: writer_ts_ns at offset 88 (was _fill in v1)
  *   IrsimCmdSlot  : writer_ts_ns at offset 32 (was _fill in v1)
  *
  * A v1 C++ controller can read a v2 segment without recompilation:
- *   – header.ready is still at offset 0 (uint64, value 1)
- *   – state/cmd payloads and seqlock positions are unchanged
- *   – new fields fall in bytes that v1 treated as padding
+ *   - header.ready is still at offset 0 (uint64, value 1)
+ *   - state/cmd payloads and seqlock positions are unchanged
+ *   - new fields fall in bytes that v1 treated as padding
  *
- * Multi-robot layout (N robots):
- *   offset 0       : IrsimHeader  (128 B)
- *   offset 128     : IrsimStateSlot[N] (N × 128 B)
- *   offset 128+128N: IrsimCmdSlot[N]   (N × 128 B)
- *   total          : 128 + 256 × N bytes
+ * Multi-robot, multi-consumer layout (N robots, C consumers each):
+ *   offset 0          : IrsimHeader       (128 B)
+ *   offset 128        : IrsimStateSlot[N] (N * 128 B)
+ *   offset 128+128*N  : IrsimCmdSlot[N*C] (N*C * 128 B)
+ *   total             : 128 + 128*N + 128*N*C bytes
+ *
+ *   When C==1 the layout is byte-for-byte identical to the original v2.
+ *   Cmd slot for robot r, consumer c: index = r * n_consumers + c.
  */
 
 #pragma once
@@ -28,7 +31,13 @@
 #define SHMBRIDGE_MAGIC         0x53484D42u   /* ASCII "SHMB" */
 #define SHMBRIDGE_VERSION       2
 #define SHMBRIDGE_SHM_NAME      "/irsim_bridge_v2"
-#define SHMBRIDGE_SHM_SIZE_N(n) (128u + 256u * (unsigned)(n))
+
+/* Size for N robots and C consumers per robot (raw, not page-aligned). */
+#define SHMBRIDGE_SHM_SIZE_NC(n, c) \
+    (128u + 128u * (unsigned)(n) + 128u * (unsigned)(n) * (unsigned)(c))
+
+/* Legacy single-consumer alias; page-aligned variant. */
+#define SHMBRIDGE_SHM_SIZE_N(n) SHMBRIDGE_SHM_SIZE_NC((n), 1)
 
 /* Size of a segment for n_robots, page-aligned to 4096. */
 #define SHMBRIDGE_SHM_SIZE_ALIGNED(n) \
@@ -79,12 +88,24 @@ typedef struct {
     uint32_t          magic;         /* offset  8  SHMBRIDGE_MAGIC             */
     uint32_t          schema_version;/* offset 12  SHMBRIDGE_VERSION           */
     uint8_t           n_robots;      /* offset 16  number of robot slots       */
-    uint8_t           _fill[111];    /* offset 17  pad to 128                  */
+    uint8_t           n_consumers;   /* offset 17  cmd writers per robot (NEW) */
+    uint8_t           _fill[110];    /* offset 18  pad to 128                  */
 } IrsimHeader; /* sizeof == 128 */
 
-/* Single-robot convenience block (use SHMBRIDGE_SHM_SIZE_N(1) bytes). */
+/* Single-robot, single-consumer convenience block. */
 typedef struct {
     IrsimHeader    header;
     IrsimStateSlot states[1];
-    IrsimCmdSlot   cmds[1];
-} IrsimBlock; /* sizeof == 384 for n=1 */
+    IrsimCmdSlot   cmds[1];  /* index = robot * n_consumers + consumer */
+} IrsimBlock; /* sizeof == 384 for n=1, c=1 */
+
+/*
+ * Cmd-slot accessor for multi-consumer segments.
+ * blk must be cast to (char *) to do pointer arithmetic past cmds[0].
+ *
+ * Example (n_consumers known at runtime from header):
+ *   uint8_t nc = blk->header.n_consumers;
+ *   IrsimCmdSlot *slot = SHMBRIDGE_CMD(blk, robot_idx, consumer_idx, nc);
+ */
+#define SHMBRIDGE_CMD(blk, robot, consumer, n_consumers) \
+    (&(blk)->cmds[(unsigned)(robot) * (unsigned)(n_consumers) + (unsigned)(consumer)])

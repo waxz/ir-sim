@@ -64,15 +64,20 @@ static inline uint64_t shmbridge_now_ns(void) {
  * The caller must never munmap or shm_unlink the returned pointer; use
  * shmbridge_detach() instead.
  */
-static inline IrsimBlock *shmbridge_attach(
+/*
+ * shmbridge_attach_nc() - attach with explicit n_consumers.
+ * Use when n_consumers > 1; for the single-consumer case prefer shmbridge_attach().
+ */
+static inline IrsimBlock *shmbridge_attach_nc(
     const char *shm_name,
     unsigned    n_robots,
+    unsigned    n_consumers,
     unsigned    timeout_ms)
 {
     int fd = shm_open(shm_name, O_RDWR, 0666);
     if (fd < 0) return NULL;
 
-    size_t sz = (SHMBRIDGE_SHM_SIZE_ALIGNED(n_robots));
+    size_t sz = (SHMBRIDGE_SHM_SIZE_NC(n_robots, n_consumers) + 4095u) & ~4095u;
     void *ptr = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (ptr == MAP_FAILED) return NULL;
@@ -99,11 +104,38 @@ static inline IrsimBlock *shmbridge_attach(
     return blk;
 }
 
+static inline IrsimBlock *shmbridge_attach(
+    const char *shm_name,
+    unsigned    n_robots,
+    unsigned    timeout_ms)
+{
+    /* Read n_consumers from segment header; default 1 for v1 segments. */
+    int fd = shm_open(shm_name, O_RDWR, 0666);
+    if (fd < 0) return NULL;
+
+    /* Map just the header to read n_consumers, then remap with full size. */
+    size_t hdr_sz = 4096u;
+    void *hdr_ptr = mmap(NULL, hdr_sz, PROT_READ, MAP_SHARED, fd, 0);
+    unsigned nc = 1;
+    if (hdr_ptr != MAP_FAILED) {
+        IrsimHeader *hdr = (IrsimHeader *)hdr_ptr;
+        if (hdr->n_consumers > 0) nc = hdr->n_consumers;
+        munmap(hdr_ptr, hdr_sz);
+    }
+    close(fd);
+
+    return shmbridge_attach_nc(shm_name, n_robots, nc, timeout_ms);
+}
+
 /* shmbridge_attach() with default 30-second timeout, single-robot. */
 #define shmbridge_attach1(name) shmbridge_attach((name), 1, 30000)
 
-static inline void shmbridge_detach(IrsimBlock *blk, unsigned n_robots) {
-    if (blk) munmap(blk, SHMBRIDGE_SHM_SIZE_ALIGNED(n_robots));
+static inline void shmbridge_detach(IrsimBlock *blk, unsigned n_robots,
+                                     unsigned n_consumers) {
+    if (blk) {
+        size_t sz = (SHMBRIDGE_SHM_SIZE_NC(n_robots, n_consumers) + 4095u) & ~4095u;
+        munmap(blk, sz);
+    }
 }
 
 /* ── Seqlock read / write helpers ──────────────────────────────────────── */
@@ -169,34 +201,64 @@ static inline int irsim_cmd_alive(const IrsimCmdSlot *slot, uint64_t max_age_ms)
 
 #ifdef __cplusplus
 /*
- * C++ RAII wrapper.  Usage:
+ * C++ RAII wrapper.  Usage (single consumer):
  *
  *   ShmBridgeClient client("/irsim_bridge_v2");
  *   IrsimState s; while (client.read_state(s) != 0) {}
+ *   IrsimCmd c = {0.5f, 0.0f, 1, 1};
+ *   client.write_cmd(c);
+ *
+ * Multi-consumer (each C++ process uses a different consumer_idx):
+ *
+ *   ShmBridgeClient client("/irsim_bridge_v2", 1);
+ *   client.write_cmd(c, 0, 1);  // robot 0, consumer 1
  */
 struct ShmBridgeClient {
-    IrsimBlock *blk    = nullptr;
-    unsigned    n      = 1;
+    IrsimBlock *blk = nullptr;
+    unsigned    n   = 1;  /* n_robots  */
+    unsigned    nc  = 1;  /* n_consumers */
 
     explicit ShmBridgeClient(const char *name, unsigned n_robots = 1,
                               unsigned timeout_ms = 30000)
         : n(n_robots)
     {
         blk = shmbridge_attach(name, n_robots, timeout_ms);
+        if (blk) nc = blk->header.n_consumers > 0 ? blk->header.n_consumers : 1u;
     }
 
-    ~ShmBridgeClient() { shmbridge_detach(blk, n); blk = nullptr; }
+    ~ShmBridgeClient() { shmbridge_detach(blk, n, nc); blk = nullptr; }
 
     bool connected() const { return blk != nullptr; }
 
-    int  read_state(IrsimState &out, unsigned idx = 0) const {
-        return irsim_read_state(&blk->states[idx], &out);
+    int read_state(IrsimState &out, unsigned robot_idx = 0) const {
+        return irsim_read_state(&blk->states[robot_idx], &out);
     }
-    void write_cmd(const IrsimCmd &c, unsigned idx = 0) {
-        irsim_write_cmd(&blk->cmds[idx], &c);
+
+    /* Write a cmd to a specific consumer slot. */
+    void write_cmd(const IrsimCmd &c, unsigned robot_idx = 0,
+                   unsigned consumer_idx = 0) {
+        irsim_write_cmd(SHMBRIDGE_CMD(blk, robot_idx, consumer_idx, nc), &c);
     }
-    bool state_alive(uint64_t max_age_ms = 100, unsigned idx = 0) const {
-        return irsim_state_alive(&blk->states[idx], max_age_ms);
+
+    /* Read the best (highest seq) valid cmd across all consumer slots. */
+    bool read_best_cmd(IrsimCmd &out, unsigned robot_idx = 0) const {
+        bool found = false;
+        uint32_t best_seq = 0;
+        for (unsigned c = 0; c < nc; ++c) {
+            IrsimCmd tmp;
+            IrsimCmdSlot *slot = SHMBRIDGE_CMD(blk, robot_idx, c, nc);
+            if (irsim_read_cmd(slot, &tmp) == 0 && tmp.valid &&
+                (!found || tmp.seq > best_seq)) {
+                out = tmp;
+                best_seq = tmp.seq;
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    bool state_alive(uint64_t max_age_ms = 100, unsigned robot_idx = 0) const {
+        return irsim_state_alive(&blk->states[robot_idx], max_age_ms);
     }
 
     ShmBridgeClient(const ShmBridgeClient &) = delete;
