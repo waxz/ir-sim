@@ -394,5 +394,141 @@ TEST(Node, SpinFor) {
     SUCCEED();
 }
 
+/* ── DirectPublish via handle ─────────────────────────────────────────────── */
+
+TEST(Node, DirectPublishHandle) {
+    ::shm_unlink("/sb_dp_seqlock_pose");
+
+    auto pub_node = make_node("dp_pub");
+    auto sub_node = make_node("dp_sub");
+
+    auto pub = pub_node->create_publisher<Pose2d>("dp_seqlock_pose", SensorDataQoS());
+
+    Pose2d msg{7.0, 8.0, 0.1, 42};
+    pub->publish(msg);   /* direct path — no map lookup, no cast */
+
+    Pose2d received{};
+    bool got = false;
+    sub_node->create_subscription<Pose2d>(
+        "dp_seqlock_pose", SensorDataQoS(), [&](const Pose2d& m) {
+            received = m; got = true;
+        });
+
+    pub->publish(msg);
+    for (int i = 0; i < 20 && !got; ++i) {
+        sub_node->spin_once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    EXPECT_TRUE(got);
+    if (got) {
+        EXPECT_DOUBLE_EQ(received.x, 7.0);
+        EXPECT_DOUBLE_EQ(received.y, 8.0);
+    }
+}
+
+/* ── MessageQueue / create_queue ──────────────────────────────────────────── */
+
+TEST(MessageQueue, PushPopDrain) {
+    MessageQueue<Pose2d> q(4);
+    EXPECT_TRUE(q.empty());
+
+    Pose2d a{1.0, 0.0, 0.0, 0}, b{2.0, 0.0, 0.0, 0};
+    q.push(a);
+    q.push(b);
+    EXPECT_EQ(q.size(), 2u);
+
+    auto m = q.pop();
+    ASSERT_TRUE(m.has_value());
+    EXPECT_DOUBLE_EQ(m->x, 1.0);   /* FIFO */
+
+    q.push(a);
+    q.push(b);
+    auto latest = q.pop_latest();
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_DOUBLE_EQ(latest->x, 2.0);  /* newest */
+    EXPECT_TRUE(q.empty());             /* pop_latest clears all */
+}
+
+TEST(MessageQueue, BoundedDrop) {
+    MessageQueue<Pose2d> q(3);
+    for (int i = 0; i < 5; ++i) {
+        Pose2d m{}; m.x = static_cast<double>(i);
+        q.push(m);
+    }
+    EXPECT_EQ(q.size(), 3u);  /* capped; oldest dropped */
+    /* Remaining should be the 3 newest: x = 2, 3, 4 */
+    auto m = q.pop();
+    ASSERT_TRUE(m.has_value());
+    EXPECT_DOUBLE_EQ(m->x, 2.0);
+}
+
+TEST(Node, CreateQueueSeqlock) {
+    ::shm_unlink("/sb_cq_seqlock_pose");
+
+    auto pub_node = make_node("cq_pub");
+    auto sub_node = make_node("cq_sub");
+
+    auto pub = pub_node->create_publisher<Pose2d>("cq_seqlock_pose", SensorDataQoS());
+    auto [sub, q] = sub_node->create_queue<Pose2d>("cq_seqlock_pose", SensorDataQoS());
+
+    Pose2d msg{9.0, 3.0, 0.5, 0};
+    pub->publish(msg);
+
+    for (int i = 0; i < 30 && q->empty(); ++i) {
+        pub->publish(msg);
+        sub_node->spin_once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    auto got = q->pop_latest();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_DOUBLE_EQ(got->x, 9.0);
+    EXPECT_DOUBLE_EQ(got->y, 3.0);
+}
+
+TEST(Node, CreateQueueRing) {
+    ::shm_unlink("/sbr_cq_ring_twist");
+
+    auto pub_node = make_node("cqr_pub");
+    auto sub_node = make_node("cqr_sub");
+
+    auto pub = pub_node->create_publisher<Twist>("cq_ring_twist", SystemDefaultsQoS());
+    auto [sub, q] = sub_node->create_queue<Twist>("cq_ring_twist", SystemDefaultsQoS());
+
+    /* Publish 3 distinct messages */
+    for (int i = 1; i <= 3; ++i) {
+        Twist t{}; t.vx = static_cast<float>(i);
+        pub->publish(t);
+    }
+
+    for (int i = 0; i < 30 && q->size() < 3; ++i) {
+        sub_node->spin_once();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    std::vector<float> vals;
+    q->drain([&](const Twist& t) { vals.push_back(t.vx); });
+    ASSERT_EQ(vals.size(), 3u);
+    EXPECT_FLOAT_EQ(vals[0], 1.0f);
+    EXPECT_FLOAT_EQ(vals[2], 3.0f);
+}
+
+/* ── spin_once non-blocking with absent publisher ─────────────────────────── */
+
+TEST(Node, SpinOnceNonBlockingWhenNoPublisher) {
+    auto sub_node = make_node("nb_sub_node");
+    sub_node->create_subscription<Pose2d>(
+        "nonexistent_topic_nb", SensorDataQoS(), [](const Pose2d&) {});
+
+    /* With timeout=0 + 100ms retry throttle, spin_once must return quickly. */
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 5; ++i) sub_node->spin_once();
+    auto dt = std::chrono::steady_clock::now() - t0;
+
+    /* 5 calls with no publisher must complete in well under 50 ms total. */
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(dt).count(), 50);
+}
+
 /* ── entry point ──────────────────────────────────────────────────────────── */
 /* GTest main is provided by GTest::gtest_main link target. */

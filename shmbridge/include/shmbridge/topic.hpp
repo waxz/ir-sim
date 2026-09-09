@@ -361,15 +361,14 @@ public:
         std::string sname = to_shm_name(name);
         const std::size_t sz = topic_shm_size<T>();
 
-        /* Wait for the shm segment to appear */
+        /* Try once immediately; then poll if timeout allows */
+        int  fd = ::shm_open(sname.c_str(), O_RDWR, 0);
         long waited = 0, limit_ns = static_cast<long>(timeout_ms) * 1'000'000L;
-        int  fd = -1;
-        while (waited < limit_ns) {
-            fd = ::shm_open(sname.c_str(), O_RDWR, 0);
-            if (fd >= 0) break;
+        while (fd < 0 && waited < limit_ns) {
             struct timespec sl{0, 5'000'000L};
             ::nanosleep(&sl, nullptr);
             waited += 5'000'000L;
+            fd = ::shm_open(sname.c_str(), O_RDWR, 0);
         }
         if (fd < 0) return TopicError::Timeout;
 
@@ -377,14 +376,16 @@ public:
         ::close(fd);
         if (base_ == MAP_FAILED) { base_ = nullptr; return TopicError::ShmFailed; }
 
-        /* Wait for publisher to set ready */
-        waited = 0;
-        while (header()->ready == 0 && waited < limit_ns) {
-            struct timespec sl{0, 1'000'000L};
-            ::nanosleep(&sl, nullptr);
-            waited += 1'000'000L;
+        /* Check ready once; poll only if timeout still allows */
+        if (header()->ready == 0) {
+            waited = 0;
+            while (header()->ready == 0 && waited < limit_ns) {
+                struct timespec sl{0, 1'000'000L};
+                ::nanosleep(&sl, nullptr);
+                waited += 1'000'000L;
+            }
+            if (header()->ready == 0) return TopicError::NotReady;
         }
-        if (header()->ready == 0) return TopicError::NotReady;
 
         /* Type guards */
         if (header()->type_hash != type_id<T>()) return TopicError::TypeMismatch;
