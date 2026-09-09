@@ -81,6 +81,10 @@ struct RobotState {
     double   sim_time = 0;
     bool     reached  = false;
     bool     collision = false;
+    /* System-monotonic nanoseconds captured inside the seqlock at write time.
+     * Zero when heartbeat_every==0 (timestamp disabled). Use for staleness
+     * checks and usable-latency measurement: (now_ns() - write_ns). */
+    uint64_t write_ns = 0;
 };
 
 struct RobotCmd {
@@ -127,7 +131,10 @@ inline IrsimCmdSlot* cmd_ptr(void* mem, unsigned r, unsigned c,
     return reinterpret_cast<IrsimCmdSlot*>(static_cast<char*>(mem) + offset);
 }
 
-/* Seqlock write of robot state to a StateSlot. */
+/* Seqlock write of robot state to a StateSlot.
+ * When heartbeat_every > 0 the system-monotonic timestamp is captured
+ * INSIDE the seqlock window so readers get a consistent (state, write_ns)
+ * pair. Set heartbeat_every=0 to skip the clock call for minimum latency. */
 inline void write_state_slot(IrsimStateSlot* slot, const RobotState& s,
                               uint64_t& seq_counter, unsigned& write_count,
                               unsigned heartbeat_every) noexcept {
@@ -147,14 +154,18 @@ inline void write_state_slot(IrsimStateSlot* slot, const RobotState& s,
     d.sim_time  = s.sim_time;
     d.reached   = s.reached ? 1u : 0u;
     d.collision = s.collision ? 1u : 0u;
+    /* Timestamp inside the window — consistent with the state payload above. */
+    if (heartbeat_every > 0) {
+        (void)write_count;
+        slot->writer_ts_ns = now_ns();
+    }
     _SB_FENCE_W();
     slot->seq = ++seq_counter;  /* odd → even */
     slot->seq2 = seq_counter;
-    if (heartbeat_every > 0 && (++write_count % heartbeat_every) == 0)
-        slot->writer_ts_ns = now_ns();
 }
 
-/* Seqlock read of robot state; returns false on torn read. */
+/* Seqlock read of robot state; returns false on torn read.
+ * out.write_ns is populated from slot->writer_ts_ns (zero if never written). */
 inline bool read_state_slot(const IrsimStateSlot* slot, RobotState& out) noexcept {
     uint64_t s1 = slot->seq;
     _SB_FENCE_R();
@@ -172,6 +183,7 @@ inline bool read_state_slot(const IrsimStateSlot* slot, RobotState& out) noexcep
     out.sim_time  = d.sim_time;
     out.reached   = d.reached != 0;
     out.collision = d.collision != 0;
+    out.write_ns  = slot->writer_ts_ns;  /* consistent with payload above */
     _SB_FENCE_R();
     uint64_t s2 = slot->seq2;
     return s1 == s2 && !(s1 & 1u);

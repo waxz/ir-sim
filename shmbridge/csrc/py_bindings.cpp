@@ -37,6 +37,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("sim_time",  &RobotState::sim_time)
         .def_readwrite("reached",   &RobotState::reached)
         .def_readwrite("collision", &RobotState::collision)
+        .def_readwrite("write_ns",  &RobotState::write_ns)
         .def("__repr__", [](const RobotState& s) {
             return "<RobotState x=" + std::to_string(s.x) +
                    " y=" + std::to_string(s.y) +
