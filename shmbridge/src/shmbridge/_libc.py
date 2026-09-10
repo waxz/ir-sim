@@ -5,9 +5,10 @@ import sys
 
 if sys.platform == "win32":
     # POSIX shm_open/ftruncate/mlock are not available on Windows.
-    # Provide a sentinel so bridge.py can be imported for struct-layout
+    # Provide sentinels so bridge.py can be imported for struct-layout
     # purposes without crashing; actual SHM operations will fail at runtime.
     _libc = None  # type: ignore[assignment]
+    _libshm = None  # type: ignore[assignment]
 
     import time as _time
 
@@ -17,11 +18,22 @@ if sys.platform == "win32":
 else:
     _libc = ctypes.CDLL(None, use_errno=True)
 
-    _libc.shm_open.restype = ctypes.c_int
-    _libc.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint]
+    # shm_open/shm_unlink live in librt on glibc < 2.17; on glibc >= 2.17
+    # they moved to libc, but manylinux CPython builds may not have librt in
+    # their link map, so CDLL(None) won't expose them.  Probe and fall back.
+    try:
+        _libc.shm_open  # raises AttributeError when symbol is absent
+        _libshm = _libc
+    except AttributeError:
+        import ctypes.util as _cu
+        _rt = _cu.find_library("rt") or "librt.so.1"
+        _libshm = ctypes.CDLL(_rt, use_errno=True)
 
-    _libc.shm_unlink.restype = ctypes.c_int
-    _libc.shm_unlink.argtypes = [ctypes.c_char_p]
+    _libshm.shm_open.restype = ctypes.c_int
+    _libshm.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint]
+
+    _libshm.shm_unlink.restype = ctypes.c_int
+    _libshm.shm_unlink.argtypes = [ctypes.c_char_p]
 
     _libc.ftruncate.restype = ctypes.c_int
     _libc.ftruncate.argtypes = [ctypes.c_int, ctypes.c_long]

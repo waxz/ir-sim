@@ -24,7 +24,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from ._libc import _libc, _monotonic_ns
+from ._libc import _libc, _libshm, _monotonic_ns
 from ._platform import O_CREAT, O_EXCL, O_RDWR
 from ._types import (
     MAGIC,
@@ -143,8 +143,8 @@ class ShmBridge:
             self._mm.write(b"\x00" * self._size)
             self._mm.seek(0)
         else:
-            _libc.shm_unlink(self._name)
-            fd = _libc.shm_open(self._name, O_CREAT | O_RDWR | O_EXCL, 0o666)
+            _libshm.shm_unlink(self._name)
+            fd = _libshm.shm_open(self._name, O_CREAT | O_RDWR | O_EXCL, 0o666)
             if fd < 0:
                 err = ctypes.get_errno()
                 raise OSError(err, os.strerror(err), self._name.decode())
@@ -179,7 +179,7 @@ class ShmBridge:
             tag = self._name.decode().lstrip("/")
             self._mm = mmap.mmap(-1, self._size, tagname=tag, access=mmap.ACCESS_WRITE)
         else:
-            fd = _libc.shm_open(self._name, O_RDWR, 0o666)
+            fd = _libshm.shm_open(self._name, O_RDWR, 0o666)
             if fd < 0:
                 err = ctypes.get_errno()
                 raise OSError(err, os.strerror(err), self._name.decode())
@@ -230,7 +230,7 @@ class ShmBridge:
             self._mm.close()
             self._mm = None
         if sys.platform != "win32":
-            _libc.shm_unlink(self._name)
+            _libshm.shm_unlink(self._name)
 
     def __enter__(self) -> ShmBridge:
         self.open()
@@ -611,7 +611,7 @@ class _PyShmSubscriber:
             deadline = time.monotonic() + timeout_ms * 1e-3
             # Wait for publisher to create the segment.
             while True:
-                fd = _libc.shm_open(self._name, _O_RDWR, 0o666)
+                fd = _libshm.shm_open(self._name, _O_RDWR, 0o666)
                 if fd >= 0:
                     break
                 err = ctypes.get_errno()
