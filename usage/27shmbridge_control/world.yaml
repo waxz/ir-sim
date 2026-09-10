@@ -1,0 +1,27 @@
+world:
+  height: 10
+  width: 10
+  step_time: 0.05   # 20 Hz simulation
+  sample_time: 0.05
+
+robot:
+  kinematics: {name: 'diff'}
+  shape: {name: 'circle', radius: 0.2}
+  state: [1.0, 1.0, 0.0]
+  goal: [[9.0, 9.0, 0.0]]
+  color: 'g'
+  plot:
+    show_trajectory: true
+    show_goal: true
+    show_goal_text: true
+    show_text: true
+
+obstacle:
+  - shape: {name: 'circle', radius: 0.4}
+    state: [5.0, 5.0, 0.0]
+    static: true
+    color: 'k'
+  - shape: {name: 'rectangle', length: 1.0, width: 0.3}
+    state: [3.0, 7.0, 0.5]
+    static: true
+    color: 'k'
