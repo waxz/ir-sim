@@ -347,7 +347,17 @@ _SCHEMAS: dict[str, str] = {
             "type": "object",
             "$defs": _DEFS_SCENE,
             "properties": {
-                "deletions": {"type": "array"},
+                "deletions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "timestamp": {"$ref": "#/$defs/Time"},
+                            "type": {"type": "integer"},
+                            "id": {"type": "string"},
+                        },
+                    },
+                },
                 "entities": {
                     "type": "array",
                     "items": {

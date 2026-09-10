@@ -400,6 +400,11 @@ def main() -> None:
             prev_y = float(robot.state[1, 0])
             print(f"  [step {step}] manual reset")
 
+        # Apply keyboard velocity directly; env.step() with action=None and
+        # control_mode="keyboard" can raise TypeError via _assign_keyboard_action.
+        if kb is not None and getattr(env._world_param, "control_mode", "") == "keyboard":
+            robot.set_velocity(kb.key_vel[:2])
+
         env.step()
 
         rx = float(robot.state[0, 0])
