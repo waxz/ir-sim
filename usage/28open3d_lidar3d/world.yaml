@@ -1,0 +1,33 @@
+world:
+  height: 20
+  width: 20
+  depth: 4.0
+  step_time: 0.05
+  sample_time: 0.05
+
+robot:
+  kinematics: {name: diff}
+  shape: {name: circle, radius: 0.25}
+  state: [-7.0, -7.0, 0.0]
+  goal: [7.0, 7.0, 0.0]
+  behavior: {name: dash}
+  vel_min: [-1.5, -2.0]
+  vel_max: [1.5, 2.0]
+  color: r
+
+obstacle:
+  # pillar near centre
+  - shape: {name: rectangle, length: 1.0, width: 1.0}
+    state: [0.0, 0.0, 0.0]
+
+  # crate right-lower
+  - shape: {name: rectangle, length: 1.5, width: 0.8}
+    state: [4.0, -3.0, 0.3]
+
+  # barrier wall segment
+  - shape: {name: rectangle, length: 4.0, width: 0.2}
+    state: [0.0, 2.0, 0.0]
+
+  # tall column left-upper
+  - shape: {name: circle, radius: 0.4}
+    state: [-4.0, 4.0, 0.0]
