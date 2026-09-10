@@ -27,6 +27,9 @@
 - [Demonstrations](#demonstrations)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Advanced Integrations](#advanced-integrations)
+  - [Foxglove Studio](#foxglove-studio)
+  - [shmbridge — Shared-Memory Robot Control](#shmbridge--shared-memory-robot-control)
 - [Support](#support)
 - [Projects Using IR-SIM](#projects-using-ir-sim)
 - [Citation](#citation)
@@ -152,6 +155,137 @@ robot:
 ```
 
 For more examples, see the [usage directory](https://github.com/hanruihua/ir-sim/tree/main/usage) and the [documentation](https://ir-sim.readthedocs.io/en).
+
+## Advanced Integrations
+
+### Foxglove Studio
+
+Visualize and tele-operate a live IR-SIM environment from [Foxglove Studio](https://foxglove.dev) over a WebSocket connection.
+
+**Install the extra dependency:**
+
+```bash
+pip install ir-sim[foxglove]
+# or: pip install ir-sim foxglove-websocket
+```
+
+**Run the demo:**
+
+```bash
+python usage/foxglove_demo.py
+```
+
+Open Foxglove Studio → **Add connection** → **Foxglove WebSocket** → `ws://localhost:8765`.
+
+Channels streamed by the demo:
+
+| Channel | Schema | Description |
+|---|---|---|
+| `/irsim/pose` | `foxglove.PoseInFrame` | Robot pose |
+| `/irsim/lidar2d` | `foxglove.LaserScan` | 2D LiDAR scan |
+| `/irsim/imu` | `foxglove.Imu` | Gyro + accelerometer |
+| `/irsim/scene` | `foxglove.SceneUpdate` | 3D bodies for robot and obstacles |
+| `/irsim/map` | `foxglove.Grid` | 2D occupancy map |
+
+Send commands back to the sim from Studio's **Publish** panel:
+
+```json
+// /irsim/cmd_vel  — velocity override
+{"linear": {"x": 0.5}, "angular": {"z": 0.3}}
+
+// /irsim/control  — pause / resume / reset
+{"command": "pause"}
+```
+
+---
+
+### shmbridge — Shared-Memory Robot Control
+
+**shmbridge** provides a POSIX shared-memory seqlock transport so Python
+(IR-SIM) and C++ controllers can exchange robot state and velocity commands at
+low latency without a network stack.
+
+```
+IR-SIM (Python publisher)  ──write_state──►  C++ or Python controller
+                           ◄──write_cmd──    (shmbridge subscriber)
+```
+
+#### Building wheels
+
+**IR-SIM wheel** (pure Python):
+
+```bash
+pip install build
+python -m build          # produces dist/ir_sim-*.whl
+```
+
+**shmbridge wheel** (Python + C++ pybind11 extension):
+
+```bash
+cd shmbridge
+pip install scikit-build-core pybind11
+python -m build          # produces dist/shmbridge-*.whl
+# or install directly:
+pip install -e .
+```
+
+The C++ extension (`_core.so`) is compiled automatically by scikit-build-core.
+When it is not available the package falls back to a pure-Python ctypes
+implementation transparently.
+
+#### Building the C++ controller demo
+
+The [`usage/27shmbridge_control/`](usage/27shmbridge_control/) directory
+contains a standalone C++ controller (`controller_cpp.cpp`) that attaches to
+the IR-SIM shared-memory segment with no Python dependency at runtime.
+
+```bash
+# From the repo root
+cmake -S usage/27shmbridge_control \
+      -B /tmp/ctrl_build \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/ctrl_build
+```
+
+This produces `/tmp/ctrl_build/ctrl_cpp`.  The `CMakeLists.txt` finds the
+shmbridge headers from an installed package first, then falls back to
+`shmbridge/include/` in the repo.
+
+#### Running the integration demo
+
+The demo requires IR-SIM and shmbridge to be installed (or on `PYTHONPATH`).
+Open **two terminals**:
+
+```bash
+# Terminal 1 — simulator (IR-SIM publisher, 20 Hz)
+python usage/27shmbridge_control/sim.py
+
+# Terminal 2 — Python controller (proportional-heading, 40 Hz)
+python usage/27shmbridge_control/controller_py.py
+
+# — or — C++ controller (same algorithm, no Python runtime needed)
+/tmp/ctrl_build/ctrl_cpp
+```
+
+Add `--render` to `sim.py` to open a Matplotlib window.
+
+The simulator publishes robot pose, velocity, goal distance, and flags after
+each `env.step()`.  The controller reads the state, computes
+`[linear, angular]` via a proportional-heading law, and writes the command
+back.  The sim picks it up with `read_best_cmd()` and feeds it to the next
+`env.step()`.
+
+**Run the integration tests** (no subprocesses — everything in-process):
+
+```bash
+pytest usage/27shmbridge_control/test_shmbridge_irsim.py -v
+```
+
+Five tests cover the state round-trip, command round-trip, multiple writes,
+and a 200-step closed-loop run that verifies the robot closes ≥ 30 % of
+its goal distance.
+
+---
 
 ## Support
 
