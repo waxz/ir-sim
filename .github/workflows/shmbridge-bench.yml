@@ -31,23 +31,26 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
+      - name: Create virtual environment
+        run: uv venv
+
       - name: Install build dependencies and shmbridge
         run: |
-          uv pip install --system scikit_build_core pybind11 pyzmq numpy
-          cd shmbridge && uv pip install --system -e . --no-build-isolation
+          uv pip install scikit_build_core pybind11 pyzmq numpy
+          cd shmbridge && uv pip install -e . --no-build-isolation
 
       - name: Show CPU topology
         run: lscpu && nproc
 
       - name: Run IPC benchmark
         run: |
-          python shmbridge/tests/bench_ipc.py \
+          uv run python shmbridge/tests/bench_ipc.py \
             --json bench_ipc.json \
             ${{ (inputs.quick == true || inputs.quick == 'true') && '--quick' || '' }}
 
       - name: Write step summary
         run: |
-          python - <<'PY'
+          uv run python - <<'PY'
           import json, os
 
           data = json.load(open("bench_ipc.json"))

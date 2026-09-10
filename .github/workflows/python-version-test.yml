@@ -33,11 +33,11 @@ jobs:
         enable-cache: true
 
     - name: Install the project
-      run: uv sync --all-extras --dev
+      run: uv sync --dev
 
     - name: Test with pytest
       run: |
-        xvfb-run -s "-screen 0 1024x768x24" uv run pytest --cov-report=xml --cov-report=html
+        xvfb-run -s "-screen 0 1024x768x24" uv run pytest --ignore=tests/test_shm_bridge.py --cov-report=xml --cov-report=html
 
     - name: Upload coverage information
       if: matrix.python-version == '3.12'

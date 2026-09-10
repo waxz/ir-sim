@@ -464,7 +464,9 @@ def test_motor_controller_reset():
 
 def test_motor_controller_derivative_zero_first_step():
     """Derivative term is zero on the first call (no spike)."""
-    ctrl = MotorController(ControllerParams(Kp=0.0, Kd=100.0), mode=ControlMode.VELOCITY)
+    ctrl = MotorController(
+        ControllerParams(Kp=0.0, Kd=100.0), mode=ControlMode.VELOCITY
+    )
     out = ctrl.step(1.0, 0.0, 0.01)
     assert out == pytest.approx(0.0)
 
@@ -478,7 +480,9 @@ def test_motor_controller_velocity_feedforward():
 
 def test_motor_controller_acceleration_feedforward():
     """Kff_acc * setpoint_rate is added to the output (acceleration feedforward)."""
-    ctrl = MotorController(ControllerParams(Kp=0.0, Kff_acc=0.5), mode=ControlMode.VELOCITY)
+    ctrl = MotorController(
+        ControllerParams(Kp=0.0, Kff_acc=0.5), mode=ControlMode.VELOCITY
+    )
     out = ctrl.step(setpoint=0.0, measurement=0.0, dt=0.01, setpoint_rate=4.0)
     assert out == pytest.approx(2.0)  # 0.5 * 4.0
 
@@ -504,7 +508,9 @@ def test_motor_controller_ff_reduces_ramp_lag():
     tau = J / (params.K_motor + K_back)
     ramp_rate = 8.0 / (3 * tau)  # same ramp as the report (omega_max over 3*tau)
 
-    ctrl_no_ff = ControllerParams(Kp=0.13, Ki=0.0, Kff=0.0, Kff_acc=0.0, output_limit=3.0)
+    ctrl_no_ff = ControllerParams(
+        Kp=0.13, Ki=0.0, Kff=0.0, Kff_acc=0.0, output_limit=3.0
+    )
     ctrl_ff = ControllerParams(Kp=0.13, Ki=0.0, Kff=K_back, Kff_acc=J, output_limit=3.0)
 
     act_no_ff = DCMotorActuator(params, controller=ctrl_no_ff)
@@ -534,7 +540,9 @@ def test_motor_controller_ff_reduces_ramp_lag():
 def test_velocity_controller_presets_keys():
     """VELOCITY_CONTROLLER_PRESETS has an entry for every MOTOR_PRESETS key."""
     for key in MOTOR_PRESETS:
-        assert key in VELOCITY_CONTROLLER_PRESETS, f"Missing velocity preset for {key!r}"
+        assert key in VELOCITY_CONTROLLER_PRESETS, (
+            f"Missing velocity preset for {key!r}"
+        )
 
 
 def test_velocity_controller_presets_have_feedforward():
@@ -547,7 +555,9 @@ def test_velocity_controller_presets_have_feedforward():
 def test_position_controller_presets_keys():
     """POSITION_CONTROLLER_PRESETS has an entry for every SERVO_PRESETS key."""
     for key in SERVO_PRESETS:
-        assert key in POSITION_CONTROLLER_PRESETS, f"Missing position preset for {key!r}"
+        assert key in POSITION_CONTROLLER_PRESETS, (
+            f"Missing position preset for {key!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +610,10 @@ def test_commercial_motor_presets_exist():
 def test_dc_motor_actuator_sets_motor_omega():
     """DCMotorActuator.step() updates WheelState.motor_omega = omega * ratio."""
     m = DCMotorParams(
-        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        J=5e-3,
+        K_motor=0.065,
+        K_back=0.035,
+        omega_max=20.0,
         gearbox=GearboxParams(ratio=46.0, efficiency=0.72, backlash=0.0),
     )
     act = DCMotorActuator(m)
@@ -614,7 +627,10 @@ def test_dc_motor_actuator_backlash_suppresses_small_motion():
     """With backlash > commanded step, initial output velocity stays near zero."""
     backlash = 0.05  # 0.05 rad dead zone
     m = DCMotorParams(
-        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        J=5e-3,
+        K_motor=0.065,
+        K_back=0.035,
+        omega_max=20.0,
         gearbox=GearboxParams(ratio=1.0, efficiency=1.0, backlash=backlash),
     )
     act = DCMotorActuator(m)
@@ -628,7 +644,10 @@ def test_dc_motor_actuator_backlash_clears_after_full_play():
     """After consuming full backlash play, output tracks motor again."""
     backlash = 0.01  # small backlash
     m = DCMotorParams(
-        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        J=5e-3,
+        K_motor=0.065,
+        K_back=0.035,
+        omega_max=20.0,
         gearbox=GearboxParams(ratio=1.0, efficiency=1.0, backlash=backlash),
     )
     act = DCMotorActuator(m)
@@ -643,7 +662,10 @@ def test_dc_motor_actuator_backlash_clears_after_full_play():
 def test_dc_motor_actuator_reset_clears_backlash_state():
     """reset_controller() clears accumulated output-shaft and backlash-contact state."""
     m = DCMotorParams(
-        J=5e-3, K_motor=0.065, K_back=0.035, omega_max=20.0,
+        J=5e-3,
+        K_motor=0.065,
+        K_back=0.035,
+        omega_max=20.0,
         gearbox=GearboxParams(ratio=1.0, efficiency=1.0, backlash=0.05),
     )
     act = DCMotorActuator(m)
@@ -693,7 +715,9 @@ def test_dc_motor_actuator_pi_controller_eliminates_offset():
         act_pi.step(wheel_pi, 10.0, 0.001)
     err_p = abs(wheel_p.omega_actual - 10.0)
     err_pi = abs(wheel_pi.omega_actual - 10.0)
-    assert err_pi < err_p, f"PI error {err_pi:.4f} should be less than P error {err_p:.4f}"
+    assert err_pi < err_p, (
+        f"PI error {err_pi:.4f} should be less than P error {err_p:.4f}"
+    )
 
 
 def test_dc_motor_actuator_control_mode_property():

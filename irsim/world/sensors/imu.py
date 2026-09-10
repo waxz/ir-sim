@@ -251,8 +251,12 @@ class IMU:
                 self.gyro_bias += self._K_g * np.sqrt(dt) * rng.standard_normal(3)
                 self.accel_bias += self._K_a * np.sqrt(dt) * rng.standard_normal(3)
                 # White noise + bias
-                omega_meas = omega_true + self.gyro_bias + sigma_g * rng.standard_normal(3)
-                accel_meas = accel_true + self.accel_bias + sigma_a * rng.standard_normal(3)
+                omega_meas = (
+                    omega_true + self.gyro_bias + sigma_g * rng.standard_normal(3)
+                )
+                accel_meas = (
+                    accel_true + self.accel_bias + sigma_a * rng.standard_normal(3)
+                )
             else:  # gaussian — simple per-axis Gaussian, no drift
                 omega_meas = omega_true + sigma_g * rng.standard_normal(3)
                 accel_meas = accel_true + sigma_a * rng.standard_normal(3)

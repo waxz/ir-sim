@@ -30,14 +30,14 @@ from irsim.lib.algorithm.kinematics import differential_kinematics
 # Constants
 # ---------------------------------------------------------------------------
 
-FLOOR_HEIGHT = 3.0          # vertical separation between floors (m)
+FLOOR_HEIGHT = 3.0  # vertical separation between floors (m)
 ELEVATOR_CENTER = np.array([5.0, 5.0])
-ELEVATOR_RADIUS = 0.8       # robot must be within this radius to call elevator
-DT = 0.05                   # simulation timestep (s)
-V_MAX = 0.8                 # maximum linear speed (m/s)
-K_ANG = 2.0                 # proportional gain for heading controller
-GOAL_TOL = 0.15             # distance tolerance to declare waypoint reached (m)
-MAX_STEPS = 3_000           # safety cap for each navigation phase
+ELEVATOR_RADIUS = 0.8  # robot must be within this radius to call elevator
+DT = 0.05  # simulation timestep (s)
+V_MAX = 0.8  # maximum linear speed (m/s)
+K_ANG = 2.0  # proportional gain for heading controller
+GOAL_TOL = 0.15  # distance tolerance to declare waypoint reached (m)
+MAX_STEPS = 3_000  # safety cap for each navigation phase
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +342,9 @@ class TestElevatorScenario:
 
         # After elevator
         fm.ride_elevator(ELEVATOR_CENTER, target_floor=1)
-        state_3d = np.array([float(ELEVATOR_CENTER[0]), float(ELEVATOR_CENTER[1]), fm.z])
+        state_3d = np.array(
+            [float(ELEVATOR_CENTER[0]), float(ELEVATOR_CENTER[1]), fm.z]
+        )
         assert state_3d[2] == pytest.approx(FLOOR_HEIGHT)
 
     def test_cannot_skip_elevator_zone(self):

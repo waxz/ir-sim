@@ -276,7 +276,11 @@ def run_acker() -> dict:
     V_MAX, PSI_MAX = 1.0, 0.30
 
     layout = AckerWheelLayout(
-        wheel_radius=R, wheelbase=WB, track=TRACK, motor="agv_hub_motor", encoder_cpr=4096
+        wheel_radius=R,
+        wheelbase=WB,
+        track=TRACK,
+        motor="agv_hub_motor",
+        encoder_cpr=4096,
     )
     gt_state = np.zeros((4, 1))
     fk_state = np.zeros((4, 1))
@@ -575,7 +579,11 @@ def run_quad_steer() -> dict:
     names = ["FL", "FR", "RL", "RR"]
 
     layout = QuadSteerWheelLayout(
-        wheel_radius=R, half_length=HL, half_width=HW, motor="small_dc", encoder_cpr=4096
+        wheel_radius=R,
+        half_length=HL,
+        half_width=HW,
+        motor="small_dc",
+        encoder_cpr=4096,
     )
     gt_state = np.zeros((3, 1))
     fk_state = np.zeros((3, 1))

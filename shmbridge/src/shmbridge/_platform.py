@@ -2,7 +2,12 @@
 
 import sys
 
-if sys.platform == "darwin":
+if sys.platform == "win32":
+    # POSIX shm_open is not available on Windows; provide sentinel values.
+    O_RDWR = 0x0002
+    O_CREAT = 0x0040
+    O_EXCL = 0x0080
+elif sys.platform == "darwin":
     O_RDWR = 0x0002
     O_CREAT = 0x0200
     O_EXCL = 0x0800
