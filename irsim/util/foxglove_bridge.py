@@ -711,7 +711,8 @@ class FoxgloveBridge:
         origin_xyz: list | np.ndarray,
         angle_min: float = -math.pi,
         angle_max: float = math.pi,
-        frame_id: str = "lidar2d",
+        yaw: float = 0.0,
+        frame_id: str = "map",
         robot_id: int = 0,
         robot_name: str = "robot",
         sensor_name: str = "lidar2d_0",
@@ -723,8 +724,9 @@ class FoxgloveBridge:
         ----------
         ranges : (N,) float array — measured ranges in metres (inf/nan → 0)
         origin_xyz : [x, y, z] sensor origin in world frame
-        angle_min / angle_max : scan arc in radians
-        frame_id : coordinate frame for Foxglove rendering (e.g. ``"map"``)
+        angle_min / angle_max : scan arc in radians (relative to robot heading)
+        yaw : robot heading in radians (used to orient the scan in *frame_id*)
+        frame_id : coordinate frame for Foxglove rendering (default ``"map"``)
         robot_id : unique integer ID of the robot
         robot_name : human-readable robot label
         sensor_name : per-robot sensor identifier (e.g. ``"lidar_front"``)
@@ -741,7 +743,8 @@ class FoxgloveBridge:
             "robot_id": int(robot_id),
             "robot_name": str(robot_name),
             "sensor_name": str(sensor_name),
-            "pose": _pose(ox, oy, oz),
+            # pose positions the sensor in frame_id; yaw orients the angle sweep
+            "pose": _pose(ox, oy, oz, yaw),
             "start_angle": float(angle_min),
             "end_angle": float(angle_max),
             "ranges": [float(r) if np.isfinite(r) else 0.0 for r in ranges],
@@ -753,7 +756,7 @@ class FoxgloveBridge:
         self,
         points_xyz: np.ndarray,
         origin_xyz: list | np.ndarray,
-        frame_id: str = "lidar3d",
+        frame_id: str = "map",
         robot_id: int = 0,
         robot_name: str = "robot",
         sensor_name: str = "lidar3d_0",
@@ -764,19 +767,14 @@ class FoxgloveBridge:
         Parameters
         ----------
         points_xyz : (N, 3) float32 array of hit points in world frame
-        origin_xyz : [x, y, z] sensor origin
-        frame_id : coordinate frame for Foxglove rendering
+        origin_xyz : [x, y, z] sensor origin (unused for pose — points are in world frame)
+        frame_id : coordinate frame for Foxglove rendering (default ``"map"``)
         robot_id : unique integer ID of the robot
         robot_name : human-readable robot label
         sensor_name : per-robot sensor identifier (e.g. ``"vlp16_top"``)
         """
         ts_ns = time.time_ns()
         pts = np.asarray(points_xyz, dtype=np.float32)
-        ox, oy, oz = (
-            float(origin_xyz[0]),
-            float(origin_xyz[1]),
-            float(origin_xyz[2]) if len(origin_xyz) > 2 else 0.0,
-        )
 
         # Pack as contiguous float32 binary, base64-encode for JSON transport
         data_b64 = base64.b64encode(pts[:, :3].tobytes()).decode()
@@ -787,7 +785,8 @@ class FoxgloveBridge:
             "robot_id": int(robot_id),
             "robot_name": str(robot_name),
             "sensor_name": str(sensor_name),
-            "pose": _pose(ox, oy, oz),
+            # Identity pose: points are already in world (map) frame, no offset needed
+            "pose": _pose(0.0, 0.0, 0.0),
             "point_stride": _PC_STRIDE,
             "fields": _PC_FIELDS,
             "data": data_b64,

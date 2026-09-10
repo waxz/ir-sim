@@ -525,6 +525,7 @@ def main() -> None:
                     [rx, ry, 0.2],
                     float(scan["angle_min"]),
                     float(scan["angle_max"]),
+                    yaw=float(rth),
                     robot_id=0,
                     robot_name="robot_0",
                     sensor_name="lidar2d",
