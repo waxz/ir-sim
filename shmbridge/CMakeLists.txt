@@ -72,6 +72,7 @@ if(pybind11_FOUND)
     # Windows: WaitOnAddress / WakeByAddressAll from platform.hpp
     target_link_libraries(_core PRIVATE
         $<$<PLATFORM_ID:Windows>:Synchronization>
+        $<$<PLATFORM_ID:Linux>:rt>
     )
     install(TARGETS _core DESTINATION shmbridge)
 endif()
