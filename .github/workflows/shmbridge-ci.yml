@@ -155,9 +155,9 @@ jobs:
               f'Expected python ctypes fallback, got {shmbridge._BACKEND!r}'
           "
 
-      # Only the struct-size / layout tests run; they use ctypes.sizeof() and
-      # do not open any POSIX SHM segment, so they pass on Windows.
+      # Only pure struct-size and field-offset tests run; they use
+      # ctypes.sizeof() / .offset and never open a POSIX SHM segment.
       # -o "addopts=" clears the global addopts from pyproject.toml (which
       # inject --cov flags) so pytest doesn't fail when pytest-cov is absent.
       - name: Run struct-layout tests (no POSIX SHM required)
-        run: pytest shmbridge/tests/test_shmbridge.py -v -o "addopts=" -k "size or magic or schema or version"
+        run: pytest shmbridge/tests/test_shmbridge.py -v -o "addopts=" -k "size or offset"
