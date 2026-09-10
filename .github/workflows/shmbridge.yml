@@ -187,7 +187,7 @@ jobs:
           CIBW_BEFORE_BUILD: pip install "pybind11>=2.12"
           # Single-line test command — multi-line YAML blocks prepend a space
           # before the first statement, causing IndentationError in python -c.
-          CIBW_TEST_COMMAND: python -c "import shmbridge; assert shmbridge._BACKEND == 'cpp', shmbridge._BACKEND; print('ok: backend=' + shmbridge._BACKEND)"
+          CIBW_TEST_COMMAND: 'python -c "import shmbridge; assert shmbridge._BACKEND == ''cpp'', shmbridge._BACKEND; print(''ok backend='' + shmbridge._BACKEND)"'
 
       - name: List wheels
         shell: bash
