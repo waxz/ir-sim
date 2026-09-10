@@ -25,36 +25,30 @@
 
 #pragma once
 
-#include <cstdint>
+#include "platform.hpp"
+
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <string>
-#include <atomic>
-#include <algorithm>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#if defined(__linux__)
-#  include <syscall.h>
-#  include <linux/futex.h>
-#  include <climits>
-#endif
 
 /* ── arch fences (same as core.hpp) ─────────────────────────────────────── */
 #if defined(__x86_64__) || defined(_M_X64)
 #  define _SB_FENCE_W()  __asm__ volatile("" ::: "memory")
 #  define _SB_FENCE_R()  __asm__ volatile("" ::: "memory")
 #  define _SB_PAUSE()    __asm__ volatile("pause" ::: "memory")
+#elif defined(_M_X64) || defined(_M_IX86)
+#  define _SB_FENCE_W()  _mm_sfence()
+#  define _SB_FENCE_R()  _mm_lfence()
+#  define _SB_PAUSE()    _mm_pause()
 #elif defined(__aarch64__)
 #  define _SB_FENCE_W()  __asm__ volatile("dmb ishst" ::: "memory")
 #  define _SB_FENCE_R()  __asm__ volatile("dmb ish"   ::: "memory")
 #  define _SB_PAUSE()    __asm__ volatile("yield"      ::: "memory")
 #else
-#  include <atomic>
 #  define _SB_FENCE_W()  std::atomic_thread_fence(std::memory_order_release)
 #  define _SB_FENCE_R()  std::atomic_thread_fence(std::memory_order_acquire)
 #  define _SB_PAUSE()    ((void)0)
@@ -73,12 +67,7 @@ constexpr uint64_t fnv1a_const(const char* s, uint64_t h = 0xcbf29ce484222325ULL
         (h ^ static_cast<uint64_t>(static_cast<unsigned char>(*s))) * 0x100000001b3ULL);
 }
 
-inline uint64_t now_ns() noexcept {
-    struct timespec ts{};
-    ::clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL
-         + static_cast<uint64_t>(ts.tv_nsec);
-}
+inline uint64_t now_ns() noexcept { return platform::now_ns(); }
 
 } /* namespace detail */
 
@@ -233,21 +222,13 @@ public:
     Publisher(Publisher&&)                 = default;
     Publisher& operator=(Publisher&&)      = default;
 
-    TopicError open(const std::string& name, bool mlock = false) noexcept {
-        name_   = name;
-        std::string shm_name = to_shm_name(name);
+    TopicError open(const std::string& name, bool do_mlock = false) noexcept {
+        name_ = name;
         const std::size_t sz = topic_shm_size<T>();
-
-        int fd = ::shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
-        if (fd < 0) return TopicError::ShmFailed;
-        if (::ftruncate(fd, static_cast<off_t>(sz)) < 0) { ::close(fd); return TopicError::ShmFailed; }
-
-        base_ = ::mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
-        if (base_ == MAP_FAILED) { base_ = nullptr; return TopicError::ShmFailed; }
-
-        if (mlock) ::mlock(base_, sz);
-        std::memset(base_, 0, sz);
+        try {
+            base_ = platform::shm_create(to_shm_name(name), sz);
+        } catch (...) { return TopicError::ShmFailed; }
+        if (do_mlock) platform::mem_lock(base_, sz);
 
         /* Populate header */
         auto* hdr            = header();
@@ -268,9 +249,9 @@ public:
 
     void close() noexcept {
         if (!base_) return;
-        ::munmap(base_, topic_shm_size<T>());
+        platform::shm_unmap(base_, topic_shm_size<T>());
         base_ = nullptr;
-        ::shm_unlink(to_shm_name(name_).c_str());
+        platform::shm_destroy(to_shm_name(name_));
         name_.clear();
     }
 
@@ -280,16 +261,10 @@ public:
         detail::write_slot(slot(), msg, seq_ctr_, do_ts);
     }
 
-    /* Seqlock-write then broadcast via futex (wakes all waiting subscribers) */
+    /* Seqlock-write then broadcast to all waiting subscribers */
     void write_notify(const T& msg) noexcept {
         write(msg);
-#if defined(__linux__)
-        __atomic_fetch_add(const_cast<uint32_t*>(&header()->notify_seq),
-                           1u, __ATOMIC_RELEASE);
-        ::syscall(SYS_futex,
-                  const_cast<uint32_t*>(&header()->notify_seq),
-                  FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0);
-#endif
+        platform::notify_wake_all(&header()->notify_seq);
     }
 
     bool      is_open()     const noexcept { return base_ != nullptr; }
@@ -357,31 +332,25 @@ public:
      * does not match T (catches publisher/subscriber type bugs at startup).
      */
     TopicError attach(const std::string& name, int timeout_ms = 5000) noexcept {
-        name_          = name;
-        std::string sname = to_shm_name(name);
+        name_ = name;
         const std::size_t sz = topic_shm_size<T>();
+        long waited = 0;
+        long limit_ns = static_cast<long>(timeout_ms) * 1'000'000L;
 
-        /* Try once immediately; then poll if timeout allows */
-        int  fd = ::shm_open(sname.c_str(), O_RDWR, 0);
-        long waited = 0, limit_ns = static_cast<long>(timeout_ms) * 1'000'000L;
-        while (fd < 0 && waited < limit_ns) {
-            struct timespec sl{0, 5'000'000L};
-            ::nanosleep(&sl, nullptr);
+        /* Poll until the segment appears or timeout. */
+        while (true) {
+            try { base_ = platform::shm_attach(to_shm_name(name), sz); break; }
+            catch (...) {}
+            if (waited >= limit_ns) return TopicError::Timeout;
+            platform::sleep_ns(5'000'000LL);
             waited += 5'000'000L;
-            fd = ::shm_open(sname.c_str(), O_RDWR, 0);
         }
-        if (fd < 0) return TopicError::Timeout;
 
-        base_ = ::mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
-        if (base_ == MAP_FAILED) { base_ = nullptr; return TopicError::ShmFailed; }
-
-        /* Check ready once; poll only if timeout still allows */
+        /* Poll until publisher sets ready. */
         if (header()->ready == 0) {
             waited = 0;
             while (header()->ready == 0 && waited < limit_ns) {
-                struct timespec sl{0, 1'000'000L};
-                ::nanosleep(&sl, nullptr);
+                platform::sleep_ns(1'000'000LL);
                 waited += 1'000'000L;
             }
             if (header()->ready == 0) return TopicError::NotReady;
@@ -397,7 +366,7 @@ public:
 
     void detach() noexcept {
         if (!base_) return;
-        ::munmap(base_, topic_shm_size<T>());
+        platform::shm_unmap(base_, topic_shm_size<T>());
         base_ = nullptr;
         name_.clear();
     }
@@ -448,34 +417,11 @@ public:
      */
     std::optional<ReadResult<T>> wait(int timeout_ms = -1) noexcept {
         if (!base_) return std::nullopt;
-#if defined(__linux__)
-        const volatile uint32_t* word = &header()->notify_seq;
-        uint32_t val = __atomic_load_n(
-            const_cast<const uint32_t*>(word), __ATOMIC_ACQUIRE);
-        if (timeout_ms < 0) {
-            ::syscall(SYS_futex, const_cast<uint32_t*>(word),
-                      FUTEX_WAIT, val, nullptr, nullptr, 0);
-        } else {
-            struct timespec ts{
-                static_cast<time_t>(timeout_ms / 1000),
-                static_cast<long>(timeout_ms % 1000) * 1'000'000L
-            };
-            ::syscall(SYS_futex, const_cast<uint32_t*>(word),
-                      FUTEX_WAIT, val, &ts, nullptr, 0);
-        }
+        volatile uint32_t* word = &header()->notify_seq;
+        uint32_t val = reinterpret_cast<const std::atomic<uint32_t>*>(
+            const_cast<const uint32_t*>(word))->load(std::memory_order_acquire);
+        platform::notify_wait(word, val, timeout_ms);
         stats_.wait_wakeups++;
-#else
-        /* macOS poll fallback */
-        long waited = 0, limit = (timeout_ms < 0) ? LONG_MAX
-                                                   : (long)timeout_ms * 1'000'000L;
-        while (waited < limit) {
-            auto r = read_if_new();
-            if (r) return r;
-            struct timespec sl{0, 1'000'000L};
-            ::nanosleep(&sl, nullptr);
-            waited += 1'000'000L;
-        }
-#endif
         return spin();
     }
 

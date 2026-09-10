@@ -24,12 +24,8 @@
 
 #pragma once
 
+#include "platform.hpp"
 #include "types.h"
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <time.h>
-#include <unistd.h>
 
 #include <cstring>
 #include <optional>
@@ -59,14 +55,12 @@
 /* Spin-wait hint — cuts memory-bus contention and pipeline stalls in retry loops. */
 #if defined(__x86_64__) || defined(__i386__)
 #  define _SB_PAUSE() __builtin_ia32_pause()
+#elif defined(_M_X64) || defined(_M_IX86)
+#  define _SB_PAUSE() _mm_pause()
 #elif defined(__aarch64__) || defined(__ARM_ARCH_8A__)
 #  define _SB_PAUSE() __asm__ volatile("yield" ::: "memory")
 #else
 #  define _SB_PAUSE() ((void)0)
-#endif
-
-#ifdef __linux__
-#  include <sys/mman.h>  /* mlock */
 #endif
 
 namespace shmbridge {
@@ -97,12 +91,7 @@ struct RobotCmd {
 
 namespace detail {
 
-inline uint64_t now_ns() noexcept {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
-           static_cast<uint64_t>(ts.tv_nsec);
-}
+inline uint64_t now_ns() noexcept { return platform::now_ns(); }
 
 inline size_t raw_size(unsigned n, unsigned nc) noexcept {
     return 128u + 128u * n + 128u * n * nc;
@@ -261,27 +250,8 @@ public:
 
     /** Create and zero-init the shm segment. */
     void open(bool do_mlock = false) {
-        shm_unlink(name_.c_str());
-        int fd = shm_open(name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
-        if (fd < 0) throw std::system_error(errno, std::generic_category(),
-                                            "shm_open " + name_);
-        if (::ftruncate(fd, static_cast<off_t>(size_)) != 0) {
-            int e = errno; ::close(fd);
-            throw std::system_error(e, std::generic_category(), "ftruncate");
-        }
-        mem_ = mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
-        if (mem_ == MAP_FAILED) {
-            mem_ = nullptr;
-            throw std::system_error(errno, std::generic_category(), "mmap");
-        }
-        std::memset(mem_, 0, size_);
-        if (do_mlock) {
-#ifdef __linux__
-            if (::mlock(mem_, size_) != 0)
-                throw std::system_error(errno, std::generic_category(), "mlock");
-#endif
-        }
+        mem_ = platform::shm_create(name_, size_);
+        if (do_mlock) platform::mem_lock(mem_, size_);
         IrsimHeader* hdr = static_cast<IrsimHeader*>(mem_);
         hdr->magic          = SHMBRIDGE_MAGIC;
         hdr->schema_version = SHMBRIDGE_VERSION;
@@ -292,8 +262,8 @@ public:
 
     /** Unmap and unlink the segment. */
     void close() noexcept {
-        if (mem_) { munmap(mem_, size_); mem_ = nullptr; }
-        shm_unlink(name_.c_str());
+        if (mem_) { platform::shm_unmap(mem_, size_); mem_ = nullptr; }
+        platform::shm_destroy(name_);
     }
 
     bool is_open() const noexcept { return mem_ != nullptr; }
@@ -342,8 +312,7 @@ public:
                     detail::cmd_ptr(mem_, robot_idx, consumer_idx, nc_));
             if (cmd) return cmd;
             if (poll_sleep_ns > 0) {
-                struct timespec req{0, poll_sleep_ns};
-                nanosleep(&req, nullptr);
+                platform::sleep_ns(poll_sleep_ns);
             } else {
                 _SB_PAUSE();
             }
@@ -418,37 +387,28 @@ public:
      * timeout_ms elapses.
      */
     void attach(unsigned timeout_ms = 30000) {
-        int fd = shm_open(name_.c_str(), O_RDWR, 0666);
-        if (fd < 0) throw std::system_error(errno, std::generic_category(),
-                                            "shm_open " + name_);
-        /* Map header page first to read n_robots / n_consumers. */
-        void* hdr_page = mmap(nullptr, 4096, PROT_READ, MAP_SHARED, fd, 0);
-        if (hdr_page != MAP_FAILED) {
+        /* Probe with a 4096-byte view first to read n_robots / n_consumers. */
+        try {
+            void* hdr_page = platform::shm_attach(name_, 4096);
             IrsimHeader* h = static_cast<IrsimHeader*>(hdr_page);
             if (h->n_robots    > 0) n_  = h->n_robots;
             if (h->n_consumers > 0) nc_ = h->n_consumers;
-            munmap(hdr_page, 4096);
-        }
+            platform::shm_unmap(hdr_page, 4096);
+        } catch (...) { /* ignore probe failure — proceed with defaults */ }
         size_ = detail::aligned_size(n_, nc_);
-        mem_ = mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
-        if (mem_ == MAP_FAILED) {
-            mem_ = nullptr;
-            throw std::system_error(errno, std::generic_category(), "mmap");
-        }
+        mem_ = platform::shm_attach(name_, size_);
         /* Wait for ready signal. */
         IrsimHeader* hdr = static_cast<IrsimHeader*>(mem_);
         uint64_t deadline = detail::now_ns() + (uint64_t)timeout_ms * 1'000'000ULL;
         while (!hdr->ready) {
             if (detail::now_ns() > deadline) {
-                munmap(mem_, size_); mem_ = nullptr;
+                platform::shm_unmap(mem_, size_); mem_ = nullptr;
                 throw std::runtime_error("attach timeout: publisher not ready");
             }
-            struct timespec ts = {0, 500'000};
-            nanosleep(&ts, nullptr);
+            platform::sleep_ns(500'000LL);
         }
         if (hdr->magic != 0 && hdr->magic != SHMBRIDGE_MAGIC) {
-            munmap(mem_, size_); mem_ = nullptr;
+            platform::shm_unmap(mem_, size_); mem_ = nullptr;
             throw std::runtime_error("schema mismatch: unexpected magic");
         }
         /* Re-read final n_robots / n_consumers in case they changed. */
@@ -458,7 +418,7 @@ public:
     }
 
     void detach() noexcept {
-        if (mem_) { munmap(mem_, size_); mem_ = nullptr; }
+        if (mem_) { platform::shm_unmap(mem_, size_); mem_ = nullptr; }
     }
 
     bool is_attached() const noexcept { return mem_ != nullptr; }

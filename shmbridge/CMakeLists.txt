@@ -48,6 +48,11 @@ target_compile_definitions(shmbridge INTERFACE
     $<$<NOT:$<BOOL:${SHMBRIDGE_NOTIFY}>>:SB_ENABLE_NOTIFY=0>
 )
 
+# Windows: link Synchronization.lib for WaitOnAddress / WakeByAddressAll
+target_link_libraries(shmbridge INTERFACE
+    $<$<PLATFORM_ID:Windows>:Synchronization>
+)
+
 # ── pybind11 extension module ─────────────────────────────────────────────────
 # POSIX-only: shm_open / mmap are not available on Windows, so the extension
 # is only built on Unix-like systems where the underlying APIs exist.
