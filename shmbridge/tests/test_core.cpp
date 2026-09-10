@@ -230,6 +230,137 @@ TEST(SubscriberOrdering, AttachTimeoutWhenNoPublisher) {
     EXPECT_FALSE(sub.is_attached());
 }
 
+/* ── §7  Publisher restart / reconnect loop ─────────────────────────────── */
+
+TEST(PublisherRestart, ReattachAfterPublisherClose) {
+    auto name = unique_name("restart");
+
+    /* Round 1 */
+    {
+        ShmPublisher pub(name, 1, 1);
+        pub.open();
+
+        ShmSubscriber sub(name);
+        ASSERT_NO_THROW(sub.attach(2000));
+
+        pub.write_state(0, make_state(1));
+        auto r = sub.read_state_spin(0);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->step, 10u);
+
+        sub.detach();
+        /* pub closes and unlinks the segment here */
+    }
+
+    /* Round 2: publisher restarts with a fresh segment */
+    {
+        ShmPublisher pub(name, 1, 1);
+        pub.open();
+
+        ShmSubscriber sub(name);
+        ASSERT_NO_THROW(sub.attach(2000));  /* re-attach to new segment */
+
+        pub.write_state(0, make_state(2));
+        auto r = sub.read_state_spin(0);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->step, 20u);
+
+        sub.detach();
+    }
+}
+
+TEST(PublisherRestart, AttachAutoDetachesPreviousMapping) {
+    auto name = unique_name("auto_detach");
+
+    ShmPublisher pub(name, 1, 1);
+    pub.open();
+
+    ShmSubscriber sub(name);
+    ASSERT_NO_THROW(sub.attach(2000));
+    EXPECT_TRUE(sub.is_attached());
+
+    /* Call attach() again without an explicit detach() — must not leak or throw. */
+    ASSERT_NO_THROW(sub.attach(2000));
+    EXPECT_TRUE(sub.is_attached());
+
+    pub.write_state(0, make_state(7));
+    auto r = sub.read_state_spin(0);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->step, make_state(7).step);
+
+    sub.detach();
+}
+
+TEST(PublisherRestart, ReconnectLoopTwoRuns) {
+    auto name = unique_name("reconnect_loop");
+    std::vector<uint64_t> steps;
+
+    for (int run = 0; run < 2; ++run) {
+        ShmPublisher pub(name, 1, 1);
+        pub.open();
+
+        ShmSubscriber sub(name);
+        sub.attach(2000);
+
+        RobotState s;
+        s.step = static_cast<uint64_t>((run + 1) * 10);
+        pub.write_state(0, s);
+
+        auto r = sub.read_state_spin(0);
+        ASSERT_TRUE(r.has_value()) << "run " << run;
+        steps.push_back(r->step);
+
+        sub.detach();
+        /* pub closes; segment is unlinked before the next iteration */
+    }
+
+    ASSERT_EQ(steps.size(), 2u);
+    EXPECT_EQ(steps[0], 10u);
+    EXPECT_EQ(steps[1], 20u);
+}
+
+TEST(PublisherRestart, SubscriberReattachesWhenPublisherRestartsLate) {
+    auto name = unique_name("late_restart");
+    std::atomic<bool> done{false};
+
+    /* Publisher: run, pause 300 ms, restart. */
+    std::thread pub_thread([&] {
+        for (int run = 0; run < 2; ++run) {
+            ShmPublisher pub(name, 1, 1);
+            pub.open();
+            RobotState s;
+            s.step = static_cast<uint64_t>((run + 1) * 10);
+            pub.write_state(0, s);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            /* pub closes and unlinks here */
+            if (run == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        done.store(true);
+    });
+
+    std::vector<uint64_t> steps;
+    ShmSubscriber sub(name);
+    for (int i = 0; i < 2; ++i) {
+        /* attach() auto-detaches any previous mapping */
+        ASSERT_NO_THROW(sub.attach(5000)) << "iteration " << i;
+        auto r = sub.read_state_spin(0, 128);
+        ASSERT_TRUE(r.has_value()) << "iteration " << i;
+        steps.push_back(r->step);
+
+        /* wait for publisher to go away */
+        while (sub.is_publisher_alive(500)) {
+            platform::sleep_ns(50'000'000LL);
+        }
+        sub.detach();
+    }
+
+    pub_thread.join();
+    ASSERT_EQ(steps.size(), 2u);
+    EXPECT_EQ(steps[0], 10u);
+    EXPECT_EQ(steps[1], 20u);
+}
+
 /* ── §8  Multi-robot ─────────────────────────────────────────────────────── */
 
 TEST(MultiRobot, WriteReadFourRobots) {

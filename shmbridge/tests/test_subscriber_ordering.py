@@ -278,3 +278,112 @@ def test_subscriber_timeout_when_publisher_never_starts() -> None:
     assert elapsed < 3.0, f"subscriber took too long to timeout: {elapsed:.1f} s"
     if not q.empty():
         assert q.get_nowait() is False
+
+
+# ── publisher-restart tests ────────────────────────────────────────────────────
+
+
+class TestPublisherRestart:
+    """attach() is safe to call again after publisher exits and restarts."""
+
+    def test_reattach_after_publisher_restart(self) -> None:
+        """Subscriber can re-attach to a fresh segment after publisher restarts."""
+        name = _shm_name("restart")
+        from shmbridge import RobotState
+        from shmbridge.bridge import _PyShmSubscriber
+
+        sub = _PyShmSubscriber(name, n_robots=1)
+
+        # ── round 1 ──────────────────────────────────────────────────────────
+        pub1 = ShmPublisher(name, n_robots=1)
+        pub1.open()
+        sub.attach(timeout_ms=2000)
+        s = RobotState()
+        s.step = 1
+        pub1.write_state(0, s)
+        state1 = sub.read_state_spin(0)
+        assert state1 is not None
+        assert state1.step == 1
+        pub1.close()
+        sub.detach()
+
+        # ── round 2: publisher restarts with new segment ──────────────────
+        pub2 = ShmPublisher(name, n_robots=1)
+        pub2.open()
+        sub.attach(timeout_ms=2000)  # re-attach to new segment
+        s2 = RobotState()
+        s2.step = 2
+        pub2.write_state(0, s2)
+        state2 = sub.read_state_spin(0)
+        assert state2 is not None
+        assert state2.step == 2
+        sub.detach()
+        pub2.close()
+
+    def test_attach_auto_detaches_previous_mapping(self) -> None:
+        """Calling attach() without detach() releases the old mapping first."""
+        name = _shm_name("auto_detach")
+        from shmbridge import RobotState
+        from shmbridge.bridge import _PyShmSubscriber
+
+        pub = ShmPublisher(name, n_robots=1)
+        pub.open()
+        sub = _PyShmSubscriber(name, n_robots=1)
+
+        sub.attach(timeout_ms=2000)
+        assert sub.is_attached()
+
+        # Call attach() again without detach() — should not raise or leak
+        sub.attach(timeout_ms=2000)
+        assert sub.is_attached()
+
+        s = RobotState()
+        s.step = 99
+        pub.write_state(0, s)
+        state = sub.read_state_spin(0)
+        assert state is not None
+        assert state.step == 99
+
+        sub.detach()
+        pub.close()
+
+    def test_reconnect_loop_across_publisher_restart(self) -> None:
+        """Simulate the reconnect loop: publisher exits and subscriber re-attaches."""
+        import threading
+
+        name = _shm_name("reconnect_loop")
+        from shmbridge import RobotState
+        from shmbridge.bridge import _PyShmSubscriber
+
+        results: list[int] = []
+
+        def publisher_lifecycle() -> None:
+            for run in range(2):
+                pub = ShmPublisher(name, n_robots=1)
+                pub.open()
+                s = RobotState()
+                s.step = run + 1
+                pub.write_state(0, s)
+                time.sleep(0.1)  # hold segment open briefly
+                pub.close()
+                if run == 0:
+                    time.sleep(0.2)  # gap between publisher runs
+
+        pub_thread = threading.Thread(target=publisher_lifecycle)
+        pub_thread.start()
+
+        sub = _PyShmSubscriber(name, n_robots=1)
+        for _ in range(2):
+            # attach() auto-detaches previous mapping
+            sub.attach(timeout_ms=3000)
+            state = sub.read_state_spin(0)
+            if state is not None:
+                results.append(state.step)
+            # wait for publisher to exit
+            while sub.is_publisher_alive(max_age_ms=300):
+                time.sleep(0.05)
+            sub.detach()
+
+        pub_thread.join(timeout=5)
+
+        assert results == [1, 2], f"expected [1, 2], got {results}"

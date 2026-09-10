@@ -390,9 +390,20 @@ public:
      * up to timeout_ms for the segment to appear, then another full timeout_ms
      * for the ready flag.  Pass timeout_ms=0 for a non-blocking single attempt.
      *
+     * Calling attach() when already attached silently detaches first so the
+     * caller can re-attach after a publisher restart without an explicit
+     * detach() call:
+     *
+     *   while (true) {
+     *     sub.attach(30000);          // waits up to 30 s for publisher
+     *     while (sub.is_publisher_alive(500)) { /* read … *\/ }
+     *     // publisher gone — loop back; attach() will detach the old mapping
+     *   }
+     *
      * @param timeout_ms  Maximum wait in milliseconds (float-friendly for Python).
      */
     void attach(double timeout_ms = 30000.0) {
+        detach();  /* release old mapping before (re-)attaching */
         uint64_t deadline = detail::now_ns() +
                             static_cast<uint64_t>(timeout_ms * 1e6);
 

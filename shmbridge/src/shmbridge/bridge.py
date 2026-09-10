@@ -564,7 +564,18 @@ class _PyShmSubscriber:
         Safe to call before the publisher has started: the subscriber retries
         until the segment appears (up to *timeout_ms* ms), then waits another
         cycle for the ready flag.  Pass timeout_ms=0 for a single attempt.
+
+        Calling attach() when already attached silently detaches first, so the
+        reconnect loop needs no explicit detach()::
+
+            while True:
+                sub.attach(30_000)          # waits up to 30 s for publisher
+                while sub.is_publisher_alive(max_age_ms=500):
+                    state = sub.read_state_spin(0)
+                    ...
+                # publisher gone — loop back; attach() releases old mapping
         """
+        self.detach()  # release old mapping before (re-)attaching
         from ._types import _IrsimHeader
 
         if sys.platform == "win32":
