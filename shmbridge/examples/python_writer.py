@@ -1,15 +1,17 @@
 """
-python_writer.py - example: drive a fake robot state into shmbridge and read
-back a cmd, without needing ir-sim installed.
+python_writer.py — publish robot state and read back velocity commands.
 
-Run:
+Pairs with controller.cpp (or any ShmSubscriber-based controller).
+Run either in any order — the controller waits for the publisher to appear.
+
+Usage:
     pip install -e ../../   # install shmbridge package
     python python_writer.py
 """
 
 import time
 
-from shmbridge import RobotState, ShmBridge
+from shmbridge import RobotState, ShmPublisher
 
 try:
     from shmbridge._core import LoopSleeper  # precise 100 Hz timing
@@ -17,59 +19,63 @@ try:
 except ImportError:
     _HAS_LOOP_SLEEPER = False
 
+SHM_NAME = "/irsim_bridge_v2"
+N_STEPS  = 500
+GOAL_X   = 5.0
+GOAL_Y   = 0.0
 
-def main():
-    bridge = ShmBridge()
-    bridge.open()
-    print("Segment open. Waiting for C++ controller to attach …")
+
+def main() -> None:
+    pub = ShmPublisher(SHM_NAME, n_robots=1, n_consumers=1, heartbeat_every=1)
+    pub.open()
+    print(f"[pub] segment '{SHM_NAME}' open — writing at 100 Hz")
+    print("[pub] waiting for C++ controller to attach …")
 
     if _HAS_LOOP_SLEEPER:
         sleeper = LoopSleeper(100.0)
-        print("Using LoopSleeper for precise 100 Hz timing.")
-    else:
-        print("C++ extension not available; falling back to time.sleep.")
+        print("[pub] using LoopSleeper for precise 100 Hz timing")
 
-    step = 0
     try:
-        while True:
+        for step in range(N_STEPS):
             if _HAS_LOOP_SLEEPER:
                 sleeper.start()
 
-            t = step * 0.01  # 100 Hz sim
-            state = RobotState(
-                x=0.1 * step,
-                y=0.0,
-                heading=0.0,
-                goal_x=5.0,
-                goal_y=0.0,
-                goal_dist=max(0.0, 5.0 - 0.1 * step),
-                step=step,
-                sim_time=t,
-            )
-            bridge.write_state_obj(state, step=step, sim_time=t)
+            t = step * 0.01
+            s = RobotState()
+            s.x         = 0.1 * step
+            s.y         = 0.0
+            s.heading   = 0.0
+            s.goal_x    = GOAL_X
+            s.goal_y    = GOAL_Y
+            s.goal_dist = max(0.0, GOAL_X - 0.1 * step)
+            s.step      = step
+            s.sim_time  = t
+            pub.write_state(0, s)
 
-            cmd = bridge.read_cmd()
-            if cmd is not None:
-                print(
-                    f"step {step:5d}  cmd linear={cmd.linear:.3f}  "
-                    f"angular={cmd.angular:.3f}  seq={cmd.seq}"
-                )
-            else:
-                print(f"step {step:5d}  no cmd")
+            cmd = pub.read_best_cmd(0)
+            if step % 50 == 0:
+                if cmd is not None:
+                    print(
+                        f"[pub] step={step:5d}  cmd"
+                        f" lin={cmd.linear:.3f}  ang={cmd.angular:.3f}"
+                        f"  seq={cmd.seq}"
+                    )
+                else:
+                    print(f"[pub] step={step:5d}  no cmd yet")
 
-            if not bridge.is_controller_alive(max_age_ms=200):
-                print("WARNING: controller appears stale (> 200 ms)")
+            if not pub.is_controller_alive(max_age_ms=200):
+                print("[pub] WARNING: controller stale (> 200 ms)")
 
-            step += 1
             if _HAS_LOOP_SLEEPER:
                 sleeper.sleep()
             else:
                 time.sleep(0.01)
+
     except KeyboardInterrupt:
-        pass
+        print("\n[pub] interrupted")
     finally:
-        bridge.close()
-        print("Bridge closed.")
+        pub.close()
+        print("[pub] segment closed")
 
 
 if __name__ == "__main__":

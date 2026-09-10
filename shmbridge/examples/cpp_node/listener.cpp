@@ -1,57 +1,92 @@
 /*
- * listener.cpp — receives Pose2d messages from talker using the MessageQueue API.
+ * listener.cpp — receives robot state and writes velocity commands.
  *
- * Demonstrates create_queue<T>(): spin_once() pushes messages into the queue;
- * the control loop drains at its own rate — decoupling transport timing from
- * processing timing.
+ * Demonstrates the reconnect loop: attach() auto-detaches any previous
+ * mapping so it is safe to call repeatedly when the publisher restarts.
  *
- * Run (start talker first):
+ * Build:
+ *   cmake -B build && cmake --build build
+ *
+ * Run (either order; listener re-attaches each time talker restarts):
  *   ./build/listener
+ *
+ * Reconnect pattern:
+ *   while (running) {
+ *       sub.attach(30000);          // waits up to 30 s for publisher
+ *       while (sub.is_publisher_alive(500)) { ... read + write_cmd ... }
+ *       sub.detach();               // publisher gone — loop back
+ *   }
  */
 
-#include <shmbridge/node.hpp>
-#include <shmbridge/messages.hpp>
+#include <shmbridge/core.hpp>
 
-#include <csignal>
-#include <cstdio>
 #include <chrono>
+#include <csignal>
+#include <cmath>
+#include <cstdio>
 #include <thread>
 
-namespace sb  = shmbridge::ros_compat;
-namespace msg = shmbridge::msg;
+using namespace shmbridge;
+
+static volatile bool g_running = true;
 
 int main() {
-    std::signal(SIGINT,  [](int) { sb::g_ok = false; });
-    std::signal(SIGTERM, [](int) { sb::g_ok = false; });
+    std::signal(SIGINT,  [](int) { g_running = false; });
+    std::signal(SIGTERM, [](int) { g_running = false; });
 
-    sb::init();
-    auto node = sb::make_node("listener");
+    const std::string name    = "/sb_demo";
+    const unsigned consumer   = 0;
+    uint64_t       frames     = 0;
 
-    /* create_queue returns {subscription_handle, shared_ptr<MessageQueue<T>>}.
-     * SensorDataQoS (depth=1) → seqlock transport, keep-latest. */
-    auto [sub, queue] = node->create_queue<msg::Pose2d>("robot/pose",
-                                                         sb::SensorDataQoS());
-    (void)sub; /* handle kept alive by node; unused directly */
+    ShmSubscriber sub(name, /*n_robots=*/1);
 
-    std::printf("listener: waiting for robot/pose (publisher may start later)\n");
+    std::printf("listener: will connect to '%s' (publisher may start later)\n",
+                name.c_str());
 
-    uint64_t count = 0;
-    while (sb::g_ok.load()) {
-        /* spin_once: non-blocking; attaches lazily when publisher appears */
-        node->spin_once();
-
-        /* Drain queue: pop_latest() keeps only the freshest message */
-        if (auto pose = queue->pop_latest()) {
-            uint64_t age_us = (shmbridge::detail::now_ns() - pose->stamp_ns) / 1000;
-            if (count % 100 == 0)
-                std::printf("listener: x=%.2f m  age=%llu µs\n",
-                            pose->x, (unsigned long long)age_us);
-            ++count;
+    while (g_running) {
+        /* attach() silently detaches any previous mapping before re-attaching */
+        try {
+            sub.attach(30000.0);
+        } catch (const std::exception& e) {
+            std::printf("listener: %s — giving up\n", e.what());
+            break;
         }
+        std::printf("listener: attached — reading state\n");
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        while (g_running) {
+            auto state = sub.read_state_spin(0);
+            if (state) {
+                /* Proportional heading controller aimed at origin */
+                double err_x = -state->x;
+                double err_y = -state->y;
+                double dist  = std::hypot(err_x, err_y);
+                double desired = std::atan2(err_y, err_x);
+                double hd_err  = desired - state->heading;
+                while (hd_err >  M_PI) hd_err -= 2.0 * M_PI;
+                while (hd_err < -M_PI) hd_err += 2.0 * M_PI;
+
+                float linear  = static_cast<float>(std::min(0.5 * dist, 1.0));
+                float angular = static_cast<float>(1.5 * hd_err);
+                sub.write_cmd(0, consumer, linear, angular);
+                ++frames;
+
+                if (frames % 100 == 0)
+                    std::printf("listener: step=%llu  x=%+.3f y=%+.3f"
+                                "  → lin=%.2f ang=%.2f\n",
+                                (unsigned long long)state->step,
+                                state->x, state->y, linear, angular);
+            }
+
+            if (!sub.is_publisher_alive(500.0)) {
+                std::printf("listener: publisher went away — waiting for restart\n");
+                sub.detach();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 
-    sb::shutdown();
-    std::printf("listener: received %llu messages\n", (unsigned long long)count);
+    std::printf("listener: stopped (%llu frames received)\n",
+                (unsigned long long)frames);
+    return 0;
 }

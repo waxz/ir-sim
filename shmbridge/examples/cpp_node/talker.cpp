@@ -1,54 +1,61 @@
 /*
- * talker.cpp — publishes Pose2d at 100 Hz using the shmbridge Node API.
+ * talker.cpp — publishes robot state at 100 Hz using ShmPublisher.
  *
  * Build:
- *   cmake -B build -DSHMBRIDGE_BUILD_EXAMPLES=ON && cmake --build build
+ *   cmake -B build && cmake --build build
  *
- * Run (start talker first, then listener in a second terminal):
+ * Run (start before or after listener — either order works):
  *   ./build/talker
+ *
+ * The publisher writes a circular-motion trajectory and prints any velocity
+ * commands it receives from listener.
  */
 
-#include <shmbridge/node.hpp>
-#include <shmbridge/messages.hpp>
+#include <shmbridge/core.hpp>
 
-#include <csignal>
-#include <cstdio>
 #include <chrono>
+#include <csignal>
+#include <cmath>
+#include <cstdio>
 #include <thread>
 
-namespace sb  = shmbridge::ros_compat;
-namespace msg = shmbridge::msg;
+using namespace shmbridge;
+
+static volatile bool g_running = true;
 
 int main() {
-    std::signal(SIGINT,  [](int) { sb::g_ok = false; });
-    std::signal(SIGTERM, [](int) { sb::g_ok = false; });
+    std::signal(SIGINT,  [](int) { g_running = false; });
+    std::signal(SIGTERM, [](int) { g_running = false; });
 
-    sb::init();
-    auto node = sb::make_node("talker");
+    const std::string name = "/sb_demo";
+    ShmPublisher pub(name, /*n_robots=*/1, /*n_consumers=*/1, /*heartbeat_every=*/1);
 
-    /* SensorDataQoS: depth=1, keep-latest → seqlock transport */
-    auto pub = node->create_publisher<msg::Pose2d>("robot/pose", sb::SensorDataQoS());
+    std::printf("talker: opening segment '%s' at 100 Hz\n", name.c_str());
+    pub.open();
+    std::printf("talker: publishing — Ctrl-C to stop\n");
 
-    std::printf("talker: publishing robot/pose at 100 Hz\n");
-
-    msg::Pose2d pose;
     unsigned step = 0;
+    while (g_running) {
+        const double t = step * 0.01;
+        RobotState s;
+        s.x        = std::cos(2.0 * M_PI * t / 5.0);
+        s.y        = std::sin(2.0 * M_PI * t / 5.0);
+        s.heading  = std::fmod(2.0 * M_PI * t / 5.0, 2.0 * M_PI);
+        s.step     = step;
+        s.sim_time = t;
+        pub.write_state(0, s);
 
-    while (sb::g_ok.load()) {
-        pose.x        = step * 0.01;   /* move 1 cm per step */
-        pose.y        = 0.0;
-        pose.heading  = 0.0;
-        pose.stamp_ns = shmbridge::detail::now_ns();
-
-        pub->publish(pose);            /* zero-overhead direct handle path */
-
-        if (step % 100 == 0)
-            std::printf("talker: step=%u  x=%.2f m\n", step, pose.x);
+        auto cmd = pub.read_best_cmd(0);
+        if (cmd && step % 100 == 0)
+            std::printf("talker: step=%4u  x=%+.2f y=%+.2f"
+                        "  cmd(lin=%.2f ang=%.2f)\n",
+                        step, s.x, s.y, cmd->linear, cmd->angular);
 
         ++step;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    sb::shutdown();
-    std::printf("talker: stopped\n");
+    pub.close();
+    std::printf("talker: stopped (%u steps published)\n", step);
+    return 0;
 }

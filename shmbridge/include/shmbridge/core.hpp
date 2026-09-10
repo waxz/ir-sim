@@ -396,7 +396,7 @@ public:
      *
      *   while (true) {
      *     sub.attach(30000);          // waits up to 30 s for publisher
-     *     while (sub.is_publisher_alive(500)) { /* read … *\/ }
+     *     while (sub.is_publisher_alive(500)) { ... read ... }
      *     // publisher gone — loop back; attach() will detach the old mapping
      *   }
      *
