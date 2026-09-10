@@ -157,5 +157,7 @@ jobs:
 
       # Only the struct-size / layout tests run; they use ctypes.sizeof() and
       # do not open any POSIX SHM segment, so they pass on Windows.
+      # -p no:cov disables the coverage plugin (not installed here) that
+      # pyproject.toml addopts would otherwise inject.
       - name: Run struct-layout tests (no POSIX SHM required)
-        run: pytest shmbridge/tests/test_shmbridge.py -v -k "size or magic or schema or version"
+        run: pytest shmbridge/tests/test_shmbridge.py -v -p no:cov -k "size or magic or schema or version"
