@@ -1,12 +1,11 @@
 name: shmbridge C++ Demos
 
-# Builds the standalone C++ demos (talker, listener, controller) with the
-# current ShmPublisher / ShmSubscriber API and uploads them as downloadable
-# binaries for Ubuntu and Windows.
+# Builds all standalone C++ demos (talker/listener, controller, pipeline)
+# on Ubuntu, macOS, and Windows, and uploads them as downloadable binaries.
 #
-# Triggers:
-#   • push / PR that touches C++ sources, headers, or this workflow file
-#   • manual dispatch (workflow_dispatch)
+# Triggered by:
+#   • push / PR touching any example source, header, or this file
+#   • manual dispatch (Actions → Run workflow)
 
 on:
   push:
@@ -15,6 +14,7 @@ on:
       - 'shmbridge/examples/cpp_controller/**'
       - 'shmbridge/examples/cpp_pipeline/**'
       - 'shmbridge/include/**'
+      - 'shmbridge/src/**'
       - '.github/workflows/shmbridge-cpp-demos.yml'
   pull_request:
     branches: [main]
@@ -23,6 +23,7 @@ on:
       - 'shmbridge/examples/cpp_controller/**'
       - 'shmbridge/examples/cpp_pipeline/**'
       - 'shmbridge/include/**'
+      - 'shmbridge/src/**'
       - '.github/workflows/shmbridge-cpp-demos.yml'
   workflow_dispatch:
 
@@ -32,18 +33,28 @@ concurrency:
 
 jobs:
   build:
-    name: C++ demos · ${{ matrix.os }}
+    name: Build · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: macos-latest
+            label: macos-arm64
+          - os: windows-latest
+            label: windows-x86_64
 
     steps:
       - uses: actions/checkout@v4
 
+      # All three example trees build into a single flat dist/ directory.
+      # CMAKE_RUNTIME_OUTPUT_DIRECTORY        — GCC / Clang (single-config)
+      # CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE — MSVC (multi-config)
+
       # ── talker + listener ────────────────────────────────────────────────
-      - name: Configure cpp_node (talker + listener)
+      - name: Configure cpp_node
         run: >
           cmake -B shmbridge/examples/cpp_node/build
           -S shmbridge/examples/cpp_node
@@ -52,9 +63,7 @@ jobs:
           -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
 
       - name: Build cpp_node
-        run: >
-          cmake --build shmbridge/examples/cpp_node/build
-          --config Release --parallel
+        run: cmake --build shmbridge/examples/cpp_node/build --config Release --parallel
 
       # ── controller ───────────────────────────────────────────────────────
       - name: Configure cpp_controller
@@ -66,11 +75,9 @@ jobs:
           -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
 
       - name: Build cpp_controller
-        run: >
-          cmake --build shmbridge/examples/cpp_controller/build
-          --config Release --parallel
+        run: cmake --build shmbridge/examples/cpp_controller/build --config Release --parallel
 
-      # ── pipeline: sensor_node + planner_node + control_node ────────────
+      # ── pipeline (sensor_node + planner_node + control_node) ─────────────
       - name: Configure cpp_pipeline
         run: >
           cmake -B shmbridge/examples/cpp_pipeline/build
@@ -80,21 +87,19 @@ jobs:
           -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
 
       - name: Build cpp_pipeline
-        run: >
-          cmake --build shmbridge/examples/cpp_pipeline/build
-          --config Release --parallel
+        run: cmake --build shmbridge/examples/cpp_pipeline/build --config Release --parallel
 
-      # ── list what was built ──────────────────────────────────────────────
+      # ── list what was built ───────────────────────────────────────────────
       - name: Show binaries
         shell: bash
         run: ls -lh dist/
 
-      # ── write step summary ───────────────────────────────────────────────
+      # ── step summary ──────────────────────────────────────────────────────
       - name: Write build summary
         if: always()
         shell: bash
         run: |
-          echo "## C++ demo binaries — ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## shmbridge C++ demo binaries — ${{ matrix.label }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Binary | Size |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
@@ -103,11 +108,11 @@ jobs:
             echo "| \`$(basename "$f")\` | $size |" >> "$GITHUB_STEP_SUMMARY"
           done
 
-      # ── upload ───────────────────────────────────────────────────────────
-      - name: Upload artifact
+      # ── upload downloadable artifact ──────────────────────────────────────
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
-          name: shmbridge-cpp-demos-${{ matrix.os }}
+          name: shmbridge-cpp-demos-${{ matrix.label }}
           path: dist/
           if-no-files-found: error
           retention-days: 30

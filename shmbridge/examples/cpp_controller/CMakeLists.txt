@@ -16,6 +16,7 @@ add_executable(controller controller.cpp)
 target_link_libraries(controller PRIVATE shmbridge::shmbridge)
 target_compile_options(controller PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
+    $<$<CXX_COMPILER_ID:MSVC>:/W3>
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
