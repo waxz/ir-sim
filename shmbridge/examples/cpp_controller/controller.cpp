@@ -1,5 +1,5 @@
 /*
- * controller.cpp — proportional heading + speed controller using ShmSubscriber.
+ * controller.cpp -- proportional heading + speed controller using ShmSubscriber.
  *
  * Connects to a shmbridge publisher (e.g. a running IR-SIM instance or the
  * Python publisher_demo.py), reads robot state, and writes velocity commands.
@@ -46,13 +46,17 @@ int main(int argc, char** argv) {
     ShmSubscriber sub(name, /*n_robots=*/1);
 
     while (g_running) {
-        /* attach() auto-detaches any previous mapping before re-attaching */
-        try {
-            sub.attach(30000.0);
-        } catch (const std::exception& e) {
-            std::printf("controller: %s — exiting\n", e.what());
-            break;
+        std::printf("controller: waiting for publisher...\n");
+
+        /* Retry attach in 1-second chunks so Ctrl-C is responded to promptly */
+        bool attached = false;
+        while (g_running && !attached) {
+            try {
+                sub.attach(1000.0);
+                attached = true;
+            } catch (const std::exception&) { /* timeout -- keep waiting */ }
         }
+        if (!attached) break;
 
         std::printf("controller: attached\n");
         uint64_t last_step = UINT64_MAX;
@@ -74,7 +78,7 @@ int main(int argc, char** argv) {
             if (!sub.is_publisher_alive(200.0))
                 std::printf("WARN: publisher stale (> 200 ms)\n");
 
-            /* Goal reached → send stop and break out */
+            /* Goal reached -- send stop and break out */
             if (state->reached || state->goal_dist < GOAL_RADIUS) {
                 sub.write_cmd(0, 0, 0.0f, 0.0f);
                 std::printf("controller: goal reached at step %llu\n",
@@ -106,7 +110,7 @@ int main(int argc, char** argv) {
                             linear, angular);
 
             if (!sub.is_publisher_alive(500.0)) {
-                std::printf("controller: publisher went away — waiting for restart\n");
+                std::printf("controller: publisher went away -- waiting for restart\n");
                 sub.detach();
                 break;
             }

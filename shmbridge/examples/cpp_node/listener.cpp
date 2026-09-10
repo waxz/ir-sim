@@ -1,5 +1,5 @@
 /*
- * listener.cpp — receives robot state and writes velocity commands.
+ * listener.cpp -- receives robot state and writes velocity commands.
  *
  * Demonstrates the reconnect loop: attach() auto-detaches any previous
  * mapping so it is safe to call repeatedly when the publisher restarts.
@@ -12,9 +12,10 @@
  *
  * Reconnect pattern:
  *   while (running) {
- *       sub.attach(30000);          // waits up to 30 s for publisher
+ *       // retry attach in 1-second chunks so Ctrl-C is processed promptly
+ *       while (running) { try { sub.attach(1000); break; } catch (...) {} }
  *       while (sub.is_publisher_alive(500)) { ... read + write_cmd ... }
- *       sub.detach();               // publisher gone — loop back
+ *       sub.detach();               // publisher gone -- loop back
  *   }
  */
 
@@ -44,18 +45,20 @@ int main() {
 
     ShmSubscriber sub(name, /*n_robots=*/1);
 
-    std::printf("listener: will connect to '%s' (publisher may start later)\n",
-                name.c_str());
-
     while (g_running) {
-        /* attach() silently detaches any previous mapping before re-attaching */
-        try {
-            sub.attach(30000.0);
-        } catch (const std::exception& e) {
-            std::printf("listener: %s — giving up\n", e.what());
-            break;
+        std::printf("listener: waiting for publisher '%s'...\n", name.c_str());
+
+        /* Retry attach in 1-second chunks so Ctrl-C is responded to promptly */
+        bool attached = false;
+        while (g_running && !attached) {
+            try {
+                sub.attach(1000.0);
+                attached = true;
+            } catch (const std::exception&) { /* timeout -- keep waiting */ }
         }
-        std::printf("listener: attached — reading state\n");
+        if (!attached) break;
+
+        std::printf("listener: attached -- reading state\n");
 
         while (g_running) {
             auto state = sub.read_state_spin(0);
@@ -76,13 +79,13 @@ int main() {
 
                 if (frames % 100 == 0)
                     std::printf("listener: step=%llu  x=%+.3f y=%+.3f"
-                                "  → lin=%.2f ang=%.2f\n",
+                                "  -> lin=%.2f ang=%.2f\n",
                                 (unsigned long long)state->step,
                                 state->x, state->y, linear, angular);
             }
 
             if (!sub.is_publisher_alive(500.0)) {
-                std::printf("listener: publisher went away — waiting for restart\n");
+                std::printf("listener: publisher went away -- waiting for restart\n");
                 sub.detach();
                 break;
             }
