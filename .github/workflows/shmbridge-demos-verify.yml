@@ -20,6 +20,7 @@ on:
       - 'shmbridge/include/**'
       - 'shmbridge/src/**'
       - '.github/workflows/shmbridge-demos-verify.yml'
+      - '.github/workflows/shmbridge-cpp-demos.yml'
   pull_request:
     branches: [main]
     paths:
@@ -27,6 +28,7 @@ on:
       - 'shmbridge/include/**'
       - 'shmbridge/src/**'
       - '.github/workflows/shmbridge-demos-verify.yml'
+      - '.github/workflows/shmbridge-cpp-demos.yml'
   workflow_dispatch:
 
 concurrency:
@@ -105,6 +107,13 @@ jobs:
                 -DCMAKE_BUILD_TYPE=Release
           cmake --build shmbridge/examples/cpp_controller/build --parallel $(nproc)
 
+      - name: Build pipeline (sensor_node + planner_node + control_node)
+        run: |
+          cmake -B shmbridge/examples/cpp_pipeline/build \
+                -S shmbridge/examples/cpp_pipeline \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build shmbridge/examples/cpp_pipeline/build --parallel $(nproc)
+
       - name: Smoke test — talker + listener (5 s)
         run: |
           set -e
@@ -136,12 +145,51 @@ jobs:
           cat /tmp/listener.log
           echo "Smoke test passed"
 
+      - name: Smoke test -- pipeline (sensor + planner + control, 8 s)
+        run: |
+          set -e
+          SENSOR=shmbridge/examples/cpp_pipeline/build/sensor_node
+          PLANNER=shmbridge/examples/cpp_pipeline/build/planner_node
+          CONTROL=shmbridge/examples/cpp_pipeline/build/control_node
+
+          "$SENSOR"  > /tmp/sensor.log  2>&1 &  SENSOR_PID=$!
+          "$PLANNER" > /tmp/planner.log 2>&1 &  PLANNER_PID=$!
+          "$CONTROL" > /tmp/control.log 2>&1 &  CONTROL_PID=$!
+
+          # Give nodes time to connect and exchange a few cycles
+          sleep 3
+
+          for name in sensor planner control; do
+            eval PID=\$${name^^}_PID
+            if ! kill -0 $PID 2>/dev/null; then
+              echo "ERROR: ${name}_node exited early"
+              cat /tmp/${name}.log
+              exit 1
+            fi
+          done
+          echo "All three pipeline nodes alive after 3 s -- running 5 s more"
+
+          sleep 5
+          kill $SENSOR_PID $PLANNER_PID $CONTROL_PID 2>/dev/null || true
+          wait $SENSOR_PID  2>/dev/null || true
+          wait $PLANNER_PID 2>/dev/null || true
+          wait $CONTROL_PID 2>/dev/null || true
+
+          echo "--- sensor_node output ---"
+          cat /tmp/sensor.log
+          echo "--- planner_node output ---"
+          cat /tmp/planner.log
+          echo "--- control_node output ---"
+          cat /tmp/control.log
+          echo "Pipeline smoke test passed"
+
       - name: Write summary
         if: always()
         shell: bash
         run: |
-          echo "## C++ demo smoke — ubuntu-latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "## C++ demo smoke -- ubuntu-latest" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Binary pair | Duration | Result |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| talker + listener | 5 s | completed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sensor + planner + control | 8 s | completed |" >> "$GITHUB_STEP_SUMMARY"
