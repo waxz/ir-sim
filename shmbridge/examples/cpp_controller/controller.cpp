@@ -23,6 +23,10 @@
 #include <cstdio>
 #include <thread>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 using namespace shmbridge;
 
 static constexpr double KP_HEADING  = 1.5;
