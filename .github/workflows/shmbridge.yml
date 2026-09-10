@@ -1,0 +1,387 @@
+name: shmbridge
+
+# Single workflow covering all shmbridge CI:
+#
+#   cpp-tests      C++ unit tests on Ubuntu 22.04 + 24.04
+#   python-tests   Python package (pybind11 ext) on Ubuntu + Windows
+#   build-demos    Build all C++ demo binaries; upload as downloadable artifacts
+#   demo-smoke     Python in-process demo + C++ talker/listener + pipeline ring
+#   bench          IPC latency benchmark (manual dispatch only)
+#
+# Triggers:
+#   push / PR touching any shmbridge source or this file
+#   manual dispatch (all jobs)
+#   manual dispatch with quick=true  → bench runs in quick mode
+
+on:
+  push:
+    paths:
+      - 'shmbridge/**'
+      - '.github/workflows/shmbridge.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'shmbridge/**'
+      - '.github/workflows/shmbridge.yml'
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: 'Quick mode for bench (fewer iterations)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ── C++ unit tests ──────────────────────────────────────────────────────────
+  cpp-tests:
+    name: C++ tests · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTest
+        run: sudo apt-get install -y libgtest-dev
+
+      - name: Configure
+        run: |
+          cmake -B shmbridge/build -S shmbridge \
+            -DSHMBRIDGE_BUILD_TESTS=ON \
+            -DSHMBRIDGE_BUILD_BENCH=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build shmbridge/build --parallel $(nproc)
+
+      - name: Run unit tests
+        run: |
+          ./shmbridge/build/test_topic
+          ./shmbridge/build/test_migration
+
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## C++ unit tests — ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for t in test_topic test_migration; do
+            if ./shmbridge/build/$t > /dev/null 2>&1; then
+              echo "| \`$t\` | passed |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$t\` | FAILED |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+  # ── Python package (pybind11 C++ extension) ─────────────────────────────────
+  python-tests:
+    name: Python ${{ matrix.python-version }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+            use_uv: true
+          - os: ubuntu-latest
+            python-version: "3.11"
+            use_uv: true
+          - os: ubuntu-latest
+            python-version: "3.12"
+            use_uv: true
+          - os: ubuntu-latest
+            python-version: "3.13"
+            use_uv: true
+          - os: windows-latest
+            python-version: "3.11"
+            use_uv: false
+          - os: windows-latest
+            python-version: "3.12"
+            use_uv: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (Ubuntu)
+        if: matrix.use_uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Set up Python (Windows)
+        if: "!matrix.use_uv"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies + shmbridge (uv)
+        if: matrix.use_uv
+        run: |
+          uv venv
+          uv pip install "scikit-build-core>=0.8" "pybind11>=2.12" pytest
+          cd shmbridge && uv pip install -e . --no-build-isolation
+
+      - name: Install build dependencies + shmbridge (pip)
+        if: "!matrix.use_uv"
+        run: |
+          pip install "scikit-build-core>=0.8" "pybind11>=2.12" pytest
+          pip install --no-build-isolation ./shmbridge
+
+      - name: Verify C++ backend
+        shell: bash
+        run: |
+          PY=$( [ "${{ matrix.use_uv }}" = "true" ] && echo "uv run python" || echo "python" )
+          $PY -c "
+          import shmbridge
+          print(f'shmbridge {shmbridge.__version__}  backend={shmbridge._BACKEND}')
+          assert shmbridge._BACKEND == 'cpp', f'expected cpp backend, got {shmbridge._BACKEND!r}'
+          "
+
+      - name: Run Python tests (uv)
+        if: matrix.use_uv
+        run: uv run pytest shmbridge/tests/test_shmbridge.py -v
+
+      - name: Run Python tests (pip)
+        if: "!matrix.use_uv"
+        # addopts= clears --cov flags from pyproject.toml (pytest-cov not installed)
+        run: pytest shmbridge/tests/test_shmbridge.py -v -o "addopts="
+
+  # ── Build demo binaries + upload ────────────────────────────────────────────
+  build-demos:
+    name: Build demos · ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: macos-latest
+            label: macos-arm64
+          - os: windows-latest
+            label: windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure cpp_node
+        run: >
+          cmake -B shmbridge/examples/cpp_node/build
+          -S shmbridge/examples/cpp_node
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/dist
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
+
+      - name: Build cpp_node
+        run: cmake --build shmbridge/examples/cpp_node/build --config Release --parallel
+
+      - name: Configure cpp_controller
+        run: >
+          cmake -B shmbridge/examples/cpp_controller/build
+          -S shmbridge/examples/cpp_controller
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/dist
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
+
+      - name: Build cpp_controller
+        run: cmake --build shmbridge/examples/cpp_controller/build --config Release --parallel
+
+      - name: Configure cpp_pipeline
+        run: >
+          cmake -B shmbridge/examples/cpp_pipeline/build
+          -S shmbridge/examples/cpp_pipeline
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/dist
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
+
+      - name: Build cpp_pipeline
+        run: cmake --build shmbridge/examples/cpp_pipeline/build --config Release --parallel
+
+      - name: Show binaries
+        shell: bash
+        run: ls -lh dist/
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Demo binaries — ${{ matrix.label }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Binary | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for f in dist/*; do
+            size=$(du -sh "$f" | cut -f1)
+            echo "| \`$(basename "$f")\` | $size |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: shmbridge-demos-${{ matrix.label }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── Demo end-to-end smoke tests (Ubuntu only) ───────────────────────────────
+  demo-smoke:
+    name: Demo smoke tests · ubuntu-latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Python in-process demo ──────────────────────────────────────────────
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install shmbridge Python package
+        run: |
+          pip install "scikit-build-core>=0.8" "pybind11>=2.12"
+          pip install --no-build-isolation ./shmbridge
+
+      - name: Verify C++ backend
+        run: |
+          python -c "
+          import shmbridge
+          print('shmbridge', shmbridge.__version__, 'backend=' + shmbridge._BACKEND)
+          assert shmbridge._BACKEND == 'cpp', f'expected cpp, got {shmbridge._BACKEND!r}'
+          "
+
+      - name: Python demo (publisher restart + subscriber reconnect)
+        timeout-minutes: 2
+        run: python shmbridge/examples/python_node_demo.py
+
+      # ── C++ demos ───────────────────────────────────────────────────────────
+      - name: Build talker + listener
+        run: |
+          cmake -B shmbridge/examples/cpp_node/build \
+                -S shmbridge/examples/cpp_node -DCMAKE_BUILD_TYPE=Release
+          cmake --build shmbridge/examples/cpp_node/build --parallel $(nproc)
+
+      - name: Build pipeline nodes
+        run: |
+          cmake -B shmbridge/examples/cpp_pipeline/build \
+                -S shmbridge/examples/cpp_pipeline -DCMAKE_BUILD_TYPE=Release
+          cmake --build shmbridge/examples/cpp_pipeline/build --parallel $(nproc)
+
+      - name: Smoke test — talker + listener (5 s)
+        run: |
+          set -e
+          shmbridge/examples/cpp_node/build/talker   > /tmp/talker.log   2>&1 &  TALKER_PID=$!
+          shmbridge/examples/cpp_node/build/listener > /tmp/listener.log 2>&1 &  LISTENER_PID=$!
+          sleep 2
+          kill -0 $TALKER_PID   || { echo "ERROR: talker exited early";   cat /tmp/talker.log;   exit 1; }
+          kill -0 $LISTENER_PID || { echo "ERROR: listener exited early"; cat /tmp/listener.log; exit 1; }
+          echo "Both alive after 2 s -- running 3 s more"
+          sleep 3
+          kill $TALKER_PID $LISTENER_PID 2>/dev/null || true
+          wait $TALKER_PID $LISTENER_PID 2>/dev/null || true
+          echo "--- talker ---";   cat /tmp/talker.log
+          echo "--- listener ---"; cat /tmp/listener.log
+
+      - name: Smoke test — pipeline ring (8 s)
+        run: |
+          set -e
+          BUILD=shmbridge/examples/cpp_pipeline/build
+          "$BUILD/sensor_node"  > /tmp/sensor.log  2>&1 &  SENSOR_PID=$!
+          "$BUILD/planner_node" > /tmp/planner.log 2>&1 &  PLANNER_PID=$!
+          "$BUILD/control_node" > /tmp/control.log 2>&1 &  CONTROL_PID=$!
+          sleep 3
+          for name in sensor planner control; do
+            eval PID=\$${name^^}_PID
+            kill -0 $PID 2>/dev/null || { echo "ERROR: ${name}_node exited early"; cat /tmp/${name}.log; exit 1; }
+          done
+          echo "All three pipeline nodes alive after 3 s -- running 5 s more"
+          sleep 5
+          kill $SENSOR_PID $PLANNER_PID $CONTROL_PID 2>/dev/null || true
+          wait $SENSOR_PID $PLANNER_PID $CONTROL_PID 2>/dev/null || true
+          echo "--- sensor ---";  cat /tmp/sensor.log
+          echo "--- planner ---"; cat /tmp/planner.log
+          echo "--- control ---"; cat /tmp/control.log
+
+      - name: Write summary
+        if: always()
+        run: |
+          echo "## Demo smoke tests — ubuntu-latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test | Duration |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Python node demo (publisher restart) | ~6 s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| talker + listener | 5 s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| sensor + planner + control pipeline | 8 s |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── IPC latency benchmark (manual dispatch only) ────────────────────────────
+  bench:
+    name: IPC benchmark · ubuntu-latest
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies + shmbridge
+        run: |
+          uv venv
+          uv pip install scikit_build_core pybind11 pyzmq numpy
+          cd shmbridge && uv pip install -e . --no-build-isolation
+
+      - name: Show CPU topology
+        run: lscpu && nproc
+
+      - name: Run benchmark
+        run: |
+          uv run python shmbridge/tests/bench_ipc.py \
+            --json bench_ipc.json \
+            ${{ (inputs.quick == true || inputs.quick == 'true') && '--quick' || '' }}
+
+      - name: Write summary
+        run: |
+          uv run python - <<'PY'
+          import json, os
+          data   = json.load(open("bench_ipc.json"))
+          bmarks = data.get("benchmarks", {})
+          rows = [
+            ("C++ in-proc write",       "cpp_inproc_write"),
+            ("C++ cross-proc seqlock",  "cpp_xproc"),
+            ("Atomic uint64",           "atomic_cache"),
+            ("ZMQ PUSH/PULL TCP",       "zmq_tcp"),
+          ]
+          lines = [
+            f"## IPC Benchmark — ubuntu-latest",
+            f"> backend={data.get('backend','?')}  n_iter={data.get('n_iter','?')}  duration={data.get('duration','?')}s",
+            "",
+            "| Benchmark | p50 µs | p95 µs | p99 µs |",
+            "|-----------|--------|--------|--------|",
+          ]
+          for label, key in rows:
+            s = bmarks.get(key)
+            if s:
+              lines.append(f"| {label} | {s['p50']:.2f} | {s['p95']:.2f} | {s['p99']:.2f} |")
+            else:
+              lines.append(f"| {label} | — | — | — |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-ipc-${{ github.sha }}
+          path: bench_ipc.json
+          retention-days: 30
