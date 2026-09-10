@@ -198,7 +198,7 @@ def _synthetic_wheels(v, omega_z, dt):
 
 def _build_occupancy_grid(env, resolution=0.1):
     """Return (grid, origin_xy) from the env's static obstacle geometries."""
-    world = env.world
+    world = env._world
     W = float(world.width)
     H = float(world.height)
     cols = int(W / resolution)
@@ -208,7 +208,7 @@ def _build_occupancy_grid(env, resolution=0.1):
     oy = -H / 2.0
 
     # Mark cells occupied by static obstacle boundaries
-    for obj in world.obstacle_list:
+    for obj in env.obstacle_list:
         if not obj.static:
             continue
         geom = obj._geometry
@@ -327,7 +327,7 @@ def main():
 
     robot = env.robot_list[0]
     obstacles = env.obstacle_list
-    DT = float(env.world.step_time)
+    DT = float(env._world.step_time)
 
     # Publish static occupancy map once (and refresh every 50 steps for dynamic map)
     grid, origin_xy = _build_occupancy_grid(env, resolution=0.1)
