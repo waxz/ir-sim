@@ -4,12 +4,6 @@ project(cpp_pipeline CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Flat binary output so the CI can find binaries with a fixed path on both
-# single-config (GCC/Clang) and multi-config (MSVC) generators.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY         "${CMAKE_BINARY_DIR}/dist")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/dist")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_BINARY_DIR}/dist")
-
 # ── Locate shmbridge ──────────────────────────────────────────────────────────
 # Search order:
 #   1. Parent build tree (monorepo: shmbridge built as part of the repo)
