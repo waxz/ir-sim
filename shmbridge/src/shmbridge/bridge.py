@@ -20,6 +20,7 @@ import math
 import mmap
 import os
 import struct
+import sys
 import time
 from dataclasses import dataclass
 
@@ -126,36 +127,43 @@ class ShmBridge:
 
     def open(self, mlock: bool = False) -> None:
         """
-        Create and zero-init the POSIX shm segment.
+        Create and zero-init the shared-memory segment.
 
         Parameters
         ----------
         mlock : bool
             If True, call mlock() to pin the segment in RAM.  Eliminates
             minor page-fault latency on first-access writes (~10-50 µs per page).
-            Requires sufficient RLIMIT_MEMLOCK (or CAP_IPC_LOCK).
+            Requires sufficient RLIMIT_MEMLOCK (or CAP_IPC_LOCK). No-op on Windows.
         """
-        _libc.shm_unlink(self._name)
-        fd = _libc.shm_open(self._name, O_CREAT | O_RDWR | O_EXCL, 0o666)
-        if fd < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err), self._name.decode())
-        if _libc.ftruncate(fd, self._size) != 0:
-            err = ctypes.get_errno()
-            os.close(fd)
-            raise OSError(err, os.strerror(err))
-        self._mm = mmap.mmap(
-            fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
-        )
-        os.close(fd)
-        self._mm.write(b"\x00" * self._size)
-        self._mm.seek(0)
-        self._blk = self._blk_type.from_buffer(self._mm)
-        if mlock:
-            addr = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
-            if _libc.mlock(addr, self._size) != 0:
+        if sys.platform == "win32":
+            tag = self._name.decode().lstrip("/")
+            self._mm = mmap.mmap(-1, self._size, tagname=tag, access=mmap.ACCESS_WRITE)
+            self._mm.seek(0)
+            self._mm.write(b"\x00" * self._size)
+            self._mm.seek(0)
+        else:
+            _libc.shm_unlink(self._name)
+            fd = _libc.shm_open(self._name, O_CREAT | O_RDWR | O_EXCL, 0o666)
+            if fd < 0:
                 err = ctypes.get_errno()
-                raise OSError(err, os.strerror(err), "mlock")
+                raise OSError(err, os.strerror(err), self._name.decode())
+            if _libc.ftruncate(fd, self._size) != 0:
+                err = ctypes.get_errno()
+                os.close(fd)
+                raise OSError(err, os.strerror(err))
+            self._mm = mmap.mmap(
+                fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+            )
+            os.close(fd)
+            self._mm.write(b"\x00" * self._size)
+            self._mm.seek(0)
+            if mlock:
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
+                if _libc.mlock(addr, self._size) != 0:
+                    err = ctypes.get_errno()
+                    raise OSError(err, os.strerror(err), "mlock")
+        self._blk = self._blk_type.from_buffer(self._mm)
         # write header
         hdr = self._blk.header
         hdr.magic = MAGIC
@@ -167,14 +175,18 @@ class ShmBridge:
 
     def attach(self) -> None:
         """Attach to an existing segment as a secondary reader/writer."""
-        fd = _libc.shm_open(self._name, O_RDWR, 0o666)
-        if fd < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err), self._name.decode())
-        self._mm = mmap.mmap(
-            fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
-        )
-        os.close(fd)
+        if sys.platform == "win32":
+            tag = self._name.decode().lstrip("/")
+            self._mm = mmap.mmap(-1, self._size, tagname=tag, access=mmap.ACCESS_WRITE)
+        else:
+            fd = _libc.shm_open(self._name, O_RDWR, 0o666)
+            if fd < 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err), self._name.decode())
+            self._mm = mmap.mmap(
+                fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+            )
+            os.close(fd)
         self._blk = self._blk_type.from_buffer(self._mm)
         hdr = self._blk.header
         if hdr.magic and hdr.magic != MAGIC:
@@ -217,7 +229,8 @@ class ShmBridge:
         if self._mm is not None:
             self._mm.close()
             self._mm = None
-        _libc.shm_unlink(self._name)
+        if sys.platform != "win32":
+            _libc.shm_unlink(self._name)
 
     def __enter__(self) -> ShmBridge:
         self.open()
@@ -547,28 +560,42 @@ class _PyShmSubscriber:
 
     def attach(self, timeout_ms: float = 30000.0) -> None:
         """Attach to an existing segment; blocks until ready or timeout."""
-        from ._platform import O_RDWR as _O_RDWR
-
-        fd = _libc.shm_open(self._name, _O_RDWR, 0o666)
-        if fd < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err), self._name.decode())
-        # Map header page to read n_robots / n_consumers
-        hdr_mm = mmap.mmap(fd, 128, mmap.MAP_SHARED, mmap.PROT_READ)
         from ._types import _IrsimHeader
 
-        hdr_peek = _IrsimHeader.from_buffer_copy(hdr_mm)
-        hdr_mm.close()
-        if hdr_peek.n_robots > 0:
-            self._n = hdr_peek.n_robots
-        if hdr_peek.n_consumers > 0:
-            self._nc = hdr_peek.n_consumers
-        self._blk_type = make_block_type(self._n, self._nc)
-        size = _shm_size(self._n, self._nc)
-        self._mm = mmap.mmap(
-            fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
-        )
-        os.close(fd)
+        if sys.platform == "win32":
+            tag = self._name.decode().lstrip("/")
+            # Probe header to discover n_robots/n_consumers before full map
+            hdr_mm = mmap.mmap(-1, 128, tagname=tag, access=mmap.ACCESS_WRITE)
+            hdr_peek = _IrsimHeader.from_buffer_copy(hdr_mm)
+            hdr_mm.close()
+            if hdr_peek.n_robots > 0:
+                self._n = hdr_peek.n_robots
+            if hdr_peek.n_consumers > 0:
+                self._nc = hdr_peek.n_consumers
+            self._blk_type = make_block_type(self._n, self._nc)
+            size = _shm_size(self._n, self._nc)
+            self._mm = mmap.mmap(-1, size, tagname=tag, access=mmap.ACCESS_WRITE)
+        else:
+            from ._platform import O_RDWR as _O_RDWR
+
+            fd = _libc.shm_open(self._name, _O_RDWR, 0o666)
+            if fd < 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err), self._name.decode())
+            # Map header page to read n_robots / n_consumers
+            hdr_mm = mmap.mmap(fd, 128, mmap.MAP_SHARED, mmap.PROT_READ)
+            hdr_peek = _IrsimHeader.from_buffer_copy(hdr_mm)
+            hdr_mm.close()
+            if hdr_peek.n_robots > 0:
+                self._n = hdr_peek.n_robots
+            if hdr_peek.n_consumers > 0:
+                self._nc = hdr_peek.n_consumers
+            self._blk_type = make_block_type(self._n, self._nc)
+            size = _shm_size(self._n, self._nc)
+            self._mm = mmap.mmap(
+                fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+            )
+            os.close(fd)
         self._blk = self._blk_type.from_buffer(self._mm)
         # Wait for ready
         deadline = time.monotonic() + timeout_ms * 1e-3
