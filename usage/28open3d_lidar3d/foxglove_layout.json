@@ -1,0 +1,76 @@
+{
+  "configById": {
+    "ThreeDeeRender!irsim": {
+      "cameraState": {
+        "distance": 28,
+        "perspective": true,
+        "phi": 55,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "targetOrientation": [0, 0, 0, 1],
+        "thetaOffset": 25,
+        "fovy": 45,
+        "near": 0.01,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "map",
+      "scene": {
+        "enableStats": false,
+        "backgroundColor": "#1a1a2e",
+        "labelScaleFactor": 1,
+        "ignoreColladaUpAxis": false,
+        "meshUpAxis": "Y_UP",
+        "transforms": {
+          "editable": false,
+          "showLabel": false,
+          "labelSize": 0.1,
+          "lineWidth": 1.5,
+          "lineColor": "#ffffff7d",
+          "axisScale": 1
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/irsim/map": {
+          "visible": true
+        },
+        "/irsim/lidar3d": {
+          "visible": true,
+          "pointSize": 3,
+          "pointShape": "circle",
+          "decayTime": 0,
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "colorFieldName": "intensity",
+          "minValue": 0.0,
+          "maxValue": 3.0,
+          "explicitAlpha": 1
+        },
+        "/irsim/lidar2d": {
+          "visible": true
+        },
+        "/irsim/pose": {
+          "visible": true,
+          "type": "arrow",
+          "arrowScale": [0.5, 0.08, 0.08]
+        }
+      },
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/irsim/cmd_pose",
+        "pointTopic": "/irsim/cmd_pose",
+        "poseEstimateTopic": "/irsim/cmd_pose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.1
+      },
+      "imageMode": {}
+    }
+  },
+  "layout": "ThreeDeeRender!irsim",
+  "playbackConfig": {
+    "speed": 1
+  }
+}

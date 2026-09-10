@@ -358,12 +358,14 @@ _SCHEMA_NAMES = {
 }
 
 # PackedElementField numeric type: 7 = FLOAT32
+# 4 fields: x, y, z (world frame) + intensity (z-height, for color-by-value in Foxglove)
 _PC_FIELDS = [
     {"name": "x", "offset": 0, "type": 7},
     {"name": "y", "offset": 4, "type": 7},
     {"name": "z", "offset": 8, "type": 7},
+    {"name": "intensity", "offset": 12, "type": 7},
 ]
-_PC_STRIDE = 12  # 3 x float32
+_PC_STRIDE = 16  # 4 x float32
 
 # ---------------------------------------------------------------------------
 # Service schemas (Studio → sim)
@@ -776,8 +778,12 @@ class FoxgloveBridge:
         ts_ns = time.time_ns()
         pts = np.asarray(points_xyz, dtype=np.float32)
 
-        # Pack as contiguous float32 binary, base64-encode for JSON transport
-        data_b64 = base64.b64encode(pts[:, :3].tobytes()).decode()
+        # Pack x, y, z, intensity (z-height copy) as float32 for color-by-value in Foxglove.
+        # Using z as intensity means the 3D panel can be set to "Color by intensity" to
+        # colour the cloud by height, making it far more visible than a flat single-colour cloud.
+        intensity = pts[:, 2:3]  # (N, 1)
+        xyzw = np.concatenate([pts[:, :3], intensity], axis=1)  # (N, 4) float32
+        data_b64 = base64.b64encode(xyzw.tobytes()).decode()
 
         msg = {
             "timestamp": _ts(ts_ns),
