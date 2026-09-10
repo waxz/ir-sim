@@ -302,10 +302,28 @@ def main() -> None:
                 kb.env_ref = env
                 env.keyboard = kb
                 env._world_param.control_mode = "keyboard"
-                print(
-                    "  Keyboard: w/s=fwd/back  a/d=turn  x=toggle-auto  "
-                    "space=pause  r=reset  esc=quit"
-                )
+
+                # Wrap _update_key_vel so every key-press prints to console.
+                _orig_update = kb._update_key_vel
+
+                def _debug_update() -> None:
+                    _orig_update()
+                    kv = kb.key_vel.ravel()
+                    if any(kv != 0):
+                        print(f"  [KB] key_vel=({kv[0]:.1f}, {kv[1]:.1f})")
+
+                kb._update_key_vel = _debug_update  # type: ignore[method-assign]
+
+                if kb.listener is None:
+                    print(
+                        "  WARNING: pynput not available — keyboard disabled."
+                        "  Install with:  pip install ir-sim[keyboard]"
+                    )
+                else:
+                    print(
+                        "  Keyboard: w/s=fwd/back  a/d=turn  x=toggle-auto  "
+                        "space=pause  r=reset  esc=quit"
+                    )
             except Exception as exc:
                 print(f"  WARNING: keyboard unavailable ({exc})")
 
@@ -389,7 +407,7 @@ def main() -> None:
             [rx, ry, SENSOR_HEIGHT], profile=args.profile, range_max=args.range
         )
 
-        if step % 100 == 0:
+        if step % 20 == 0:
             mode = getattr(env._world_param, "control_mode", "?")
             kb_info = ""
             if kb is not None:
