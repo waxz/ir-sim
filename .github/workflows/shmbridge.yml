@@ -181,13 +181,13 @@ jobs:
           package-dir: ./shmbridge
           output-dir: wheelhouse
         env:
-          # Quick sanity-check: import the package and confirm the C++ backend loaded.
-          CIBW_TEST_COMMAND: >-
-            python -c "
-            import shmbridge;
-            print('wheel ok: shmbridge', shmbridge.__version__, 'backend=' + shmbridge._BACKEND);
-            assert shmbridge._BACKEND == 'cpp', shmbridge._BACKEND
-            "
+          # pybind11 must be present in the build venv so scikit-build-core can
+          # locate the headers; inject it explicitly via CIBW_BEFORE_BUILD so it
+          # is available regardless of how the build frontend seeds the venv.
+          CIBW_BEFORE_BUILD: pip install "pybind11>=2.12"
+          # Single-line test command — multi-line YAML blocks prepend a space
+          # before the first statement, causing IndentationError in python -c.
+          CIBW_TEST_COMMAND: python -c "import shmbridge; assert shmbridge._BACKEND == 'cpp', shmbridge._BACKEND; print('ok: backend=' + shmbridge._BACKEND)"
 
       - name: List wheels
         shell: bash
