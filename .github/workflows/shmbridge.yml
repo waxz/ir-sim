@@ -4,6 +4,7 @@ name: shmbridge
 #
 #   cpp-tests      C++ unit tests on Ubuntu 22.04 + 24.04
 #   python-tests   Python package (pybind11 ext) on Ubuntu + Windows
+#   wheels         Build + test + upload pip wheels (Ubuntu manylinux + Windows)
 #   build-demos    Build all C++ demo binaries; upload as downloadable artifacts
 #   demo-smoke     Python in-process demo + C++ talker/listener + pipeline ring
 #   bench          IPC latency benchmark (manual dispatch only)
@@ -155,6 +156,63 @@ jobs:
         if: "!matrix.use_uv"
         # addopts= clears --cov flags from pyproject.toml (pytest-cov not installed)
         run: pytest shmbridge/tests/test_shmbridge.py -v -o "addopts="
+
+  # ── Pip wheels (build + test + upload) ─────────────────────────────────────
+  # cibuildwheel reads [tool.cibuildwheel] from shmbridge/pyproject.toml:
+  #   builds cp310-cp313, skips win32 / musl / PyPy
+  #   Linux: manylinux_2_28 (glibc 2.28 + GCC 12, good C++17 support)
+  #   Windows: MSVC
+  # Each wheel is installed and import-tested inside the build container before
+  # it is collected into wheelhouse/.
+  wheels:
+    name: Wheels · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23.0
+        with:
+          package-dir: ./shmbridge
+          output-dir: wheelhouse
+        env:
+          # Quick sanity-check: import the package and confirm the C++ backend loaded.
+          CIBW_TEST_COMMAND: >-
+            python -c "
+            import shmbridge;
+            print('wheel ok: shmbridge', shmbridge.__version__, 'backend=' + shmbridge._BACKEND);
+            assert shmbridge._BACKEND == 'cpp', shmbridge._BACKEND
+            "
+
+      - name: List wheels
+        shell: bash
+        run: ls -lh wheelhouse/
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Wheels — ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Wheel | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for f in wheelhouse/*.whl; do
+            size=$(du -sh "$f" | cut -f1)
+            echo "| \`$(basename "$f")\` | $size |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: shmbridge-wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 30
 
   # ── Build demo binaries + upload ────────────────────────────────────────────
   build-demos:
