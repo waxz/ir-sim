@@ -1,0 +1,97 @@
+name: shmbridge C++ Demos
+
+# Builds the standalone C++ demos (talker, listener, controller) with the
+# current ShmPublisher / ShmSubscriber API and uploads them as downloadable
+# binaries for Ubuntu and Windows.
+#
+# Triggers:
+#   • push / PR that touches C++ sources, headers, or this workflow file
+#   • manual dispatch (workflow_dispatch)
+
+on:
+  push:
+    paths:
+      - 'shmbridge/examples/cpp_node/**'
+      - 'shmbridge/examples/cpp_controller/**'
+      - 'shmbridge/include/**'
+      - '.github/workflows/shmbridge-cpp-demos.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'shmbridge/examples/cpp_node/**'
+      - 'shmbridge/examples/cpp_controller/**'
+      - 'shmbridge/include/**'
+      - '.github/workflows/shmbridge-cpp-demos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: C++ demos · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── talker + listener ────────────────────────────────────────────────
+      - name: Configure cpp_node (talker + listener)
+        run: >
+          cmake -B shmbridge/examples/cpp_node/build
+          -S shmbridge/examples/cpp_node
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/dist
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
+
+      - name: Build cpp_node
+        run: >
+          cmake --build shmbridge/examples/cpp_node/build
+          --config Release --parallel
+
+      # ── controller ───────────────────────────────────────────────────────
+      - name: Configure cpp_controller
+        run: >
+          cmake -B shmbridge/examples/cpp_controller/build
+          -S shmbridge/examples/cpp_controller
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/dist
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=${{ github.workspace }}/dist
+
+      - name: Build cpp_controller
+        run: >
+          cmake --build shmbridge/examples/cpp_controller/build
+          --config Release --parallel
+
+      # ── list what was built ──────────────────────────────────────────────
+      - name: Show binaries
+        shell: bash
+        run: ls -lh dist/
+
+      # ── write step summary ───────────────────────────────────────────────
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## C++ demo binaries — ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Binary | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for f in dist/*; do
+            size=$(du -sh "$f" | cut -f1)
+            echo "| \`$(basename "$f")\` | $size |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      # ── upload ───────────────────────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shmbridge-cpp-demos-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
