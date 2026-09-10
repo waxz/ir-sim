@@ -340,7 +340,10 @@ _SCHEMAS: dict[str, str] = {
             },
         }
     ),
-    "/irsim/scene": json.dumps(
+    # "/irsim/scene" is temporarily disabled to avoid Foxglove SceneUpdate
+    # schema parsing errors.  Re-enable by un-commenting this block and the
+    # matching entry in _SCHEMA_NAMES.
+    "__disabled__/irsim/scene": json.dumps(
         {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "foxglove.SceneUpdate",
@@ -464,7 +467,7 @@ _SCHEMA_NAMES = {
     "/irsim/encoder": "irsim.Encoder",
     "/irsim/motor": "irsim.Motor",
     "/irsim/map": "foxglove.Grid",
-    "/irsim/scene": "foxglove.SceneUpdate",
+    # "/irsim/scene": "foxglove.SceneUpdate",  # temporarily disabled
 }
 
 # PackedElementField numeric type: 7 = FLOAT32

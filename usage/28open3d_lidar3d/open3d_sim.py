@@ -326,30 +326,8 @@ def main() -> None:
             bridge.update_map(grid, resolution=0.2, origin_xy=origin_xy)
             print(f"{grid.shape[1]}x{grid.shape[0]} cells at 0.2 m/cell")
 
-            # Publish static obstacle scene markers once
-            for obs in env.obstacle_list:
-                st = obs.state
-                sx, sy, sth = float(st[0, 0]), float(st[1, 0]), float(st[2, 0])
-                if obs.shape == "rectangle":
-                    bridge.update_box_marker(
-                        entity_id=f"obs_{obs.id}",
-                        x=sx,
-                        y=sy,
-                        theta=sth,
-                        length=float(obs.length),
-                        width=float(obs.width),
-                        height=2.0,
-                        color=(0.55, 0.50, 0.45, 0.8),
-                    )
-                else:
-                    bridge.update_circle_marker(
-                        entity_id=f"obs_{obs.id}",
-                        x=sx,
-                        y=sy,
-                        radius=float(obs.radius),
-                        height=2.0,
-                        color=(0.50, 0.55, 0.60, 0.8),
-                    )
+            # /irsim/scene channel is temporarily disabled in FoxgloveBridge.
+            # Obstacle scene markers will be published once it is re-enabled.
 
     # ── Open3D window ─────────────────────────────────────────────────────────
     vis = arrow_geom = robot_sphere = pcd = None
@@ -400,11 +378,6 @@ def main() -> None:
             prev_y = float(robot.state[1, 0])
             print(f"  [step {step}] manual reset")
 
-        # Apply keyboard velocity directly; env.step() with action=None and
-        # control_mode="keyboard" can raise TypeError via _assign_keyboard_action.
-        if kb is not None and getattr(env._world_param, "control_mode", "") == "keyboard":
-            robot.set_velocity(kb.key_vel[:2])
-
         env.step()
 
         rx = float(robot.state[0, 0])
@@ -418,8 +391,13 @@ def main() -> None:
 
         if step % 100 == 0:
             mode = getattr(env._world_param, "control_mode", "?")
+            kb_info = ""
+            if kb is not None:
+                kv = kb.key_vel.ravel()
+                listener_ok = getattr(kb, "listener", None) is not None
+                kb_info = f"  kb_vel=({kv[0]:.1f},{kv[1]:.1f})  listener={'on' if listener_ok else 'off(mpl)'}"
             print(
-                f"  step {step:6d}  ({rx:6.2f},{ry:6.2f})  3d={len(pts):,}  mode={mode}"
+                f"  step {step:6d}  ({rx:6.2f},{ry:6.2f})  3d={len(pts):,}  mode={mode}{kb_info}"
             )
 
         # ── Foxglove publish ──────────────────────────────────────────────────
@@ -474,17 +452,6 @@ def main() -> None:
                     robot_name="robot_0",
                     sensor_name="lidar3d",
                 )
-
-            bridge.update_robot_marker(
-                rx,
-                ry,
-                rth,
-                robot_id=0,
-                robot_name="robot_0",
-                radius=ROBOT_RADIUS,
-                height=0.5,
-                color=(0.9, 0.2, 0.15, 1.0),
-            )
 
         if args.headless:
             continue
