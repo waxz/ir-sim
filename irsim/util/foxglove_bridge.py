@@ -711,7 +711,13 @@ class FoxgloveBridge:
     def _bg(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve())
+        except (RuntimeError, asyncio.CancelledError):
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                self._loop.close()
 
     async def _serve(self) -> None:
         server = _FoxgloveServer(
