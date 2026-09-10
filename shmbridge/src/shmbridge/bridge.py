@@ -559,13 +559,31 @@ class _PyShmSubscriber:
         self._cmd_seqs: list[list[int]] = []
 
     def attach(self, timeout_ms: float = 30000.0) -> None:
-        """Attach to an existing segment; blocks until ready or timeout."""
+        """Attach to an existing segment; blocks until ready or timeout.
+
+        Safe to call before the publisher has started: the subscriber retries
+        until the segment appears (up to *timeout_ms* ms), then waits another
+        cycle for the ready flag.  Pass timeout_ms=0 for a single attempt.
+        """
         from ._types import _IrsimHeader
 
         if sys.platform == "win32":
             tag = self._name.decode().lstrip("/")
-            # Probe header to discover n_robots/n_consumers before full map
-            hdr_mm = mmap.mmap(-1, 128, tagname=tag, access=mmap.ACCESS_WRITE)
+            deadline = time.monotonic() + timeout_ms * 1e-3
+            # Wait for publisher to create the segment.
+            # mmap.ACCESS_READ uses OpenFileMappingA which fails cleanly if the
+            # mapping doesn't exist yet (unlike ACCESS_WRITE which creates one).
+            while True:
+                try:
+                    hdr_mm = mmap.mmap(-1, 128, tagname=tag, access=mmap.ACCESS_READ)
+                    break
+                except OSError as exc:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"attach timeout: segment '{tag}' not found "
+                            "— is the publisher running?"
+                        ) from exc
+                    time.sleep(0.05)
             hdr_peek = _IrsimHeader.from_buffer_copy(hdr_mm)
             hdr_mm.close()
             if hdr_peek.n_robots > 0:
@@ -574,14 +592,27 @@ class _PyShmSubscriber:
                 self._nc = hdr_peek.n_consumers
             self._blk_type = make_block_type(self._n, self._nc)
             size = _shm_size(self._n, self._nc)
+            # ACCESS_WRITE uses CreateFileMappingA which opens an existing mapping
             self._mm = mmap.mmap(-1, size, tagname=tag, access=mmap.ACCESS_WRITE)
         else:
             from ._platform import O_RDWR as _O_RDWR
 
-            fd = _libc.shm_open(self._name, _O_RDWR, 0o666)
-            if fd < 0:
+            deadline = time.monotonic() + timeout_ms * 1e-3
+            # Wait for publisher to create the segment.
+            while True:
+                fd = _libc.shm_open(self._name, _O_RDWR, 0o666)
+                if fd >= 0:
+                    break
                 err = ctypes.get_errno()
-                raise OSError(err, os.strerror(err), self._name.decode())
+                import errno as _errno
+                if err not in (_errno.ENOENT, _errno.EACCES):
+                    raise OSError(err, os.strerror(err), self._name.decode())
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"attach timeout: segment '{self._name.decode()}' not found "
+                        "— is the publisher running?"
+                    )
+                time.sleep(0.05)
             # Map header page to read n_robots / n_consumers
             hdr_mm = mmap.mmap(fd, 128, mmap.MAP_SHARED, mmap.PROT_READ)
             hdr_peek = _IrsimHeader.from_buffer_copy(hdr_mm)

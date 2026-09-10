@@ -156,8 +156,8 @@ PYBIND11_MODULE(_core, m) {
         .def(py::init<std::string, unsigned>(),
              py::arg("name")     = SHMBRIDGE_SHM_NAME,
              py::arg("n_robots") = 1u)
-        .def("attach", &ShmSubscriber::attach, py::arg("timeout_ms") = 30000u,
-             "Attach to an existing segment; blocks until ready.")
+        .def("attach", &ShmSubscriber::attach, py::arg("timeout_ms") = 30000.0,
+             "Attach to an existing segment; retries if publisher not started yet.")
         .def("detach",      &ShmSubscriber::detach)
         .def("is_attached", &ShmSubscriber::is_attached)
         .def("__enter__", [](ShmSubscriber& self) -> ShmSubscriber& {

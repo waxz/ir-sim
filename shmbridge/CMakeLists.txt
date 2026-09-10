@@ -95,6 +95,13 @@ if(UNIX AND SHMBRIDGE_BUILD_TESTS)
         $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -g -Wall -Wextra>
     )
     add_test(NAME test_migration COMMAND test_migration)
+
+    add_executable(test_core tests/test_core.cpp)
+    target_link_libraries(test_core PRIVATE shmbridge::shmbridge GTest::gtest_main rt pthread)
+    target_compile_options(test_core PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-O2 -g -Wall -Wextra>
+    )
+    add_test(NAME test_core COMMAND test_core)
 endif()
 
 # ── C++ microbenchmarks ───────────────────────────────────────────────────────

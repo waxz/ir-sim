@@ -383,23 +383,43 @@ public:
     ShmSubscriber& operator=(const ShmSubscriber&) = delete;
 
     /**
-     * Attach to an existing segment.  Blocks until header.ready == 1 or
-     * timeout_ms elapses.
+     * Attach to an existing segment.  Retries until the publisher creates the
+     * segment, then blocks until header.ready == 1, or timeout_ms elapses.
+     *
+     * Safe to call before the publisher has started: the subscriber will wait
+     * up to timeout_ms for the segment to appear, then another full timeout_ms
+     * for the ready flag.  Pass timeout_ms=0 for a non-blocking single attempt.
+     *
+     * @param timeout_ms  Maximum wait in milliseconds (float-friendly for Python).
      */
-    void attach(unsigned timeout_ms = 30000) {
-        /* Probe with a 4096-byte view first to read n_robots / n_consumers. */
-        try {
-            void* hdr_page = platform::shm_attach(name_, 4096);
-            IrsimHeader* h = static_cast<IrsimHeader*>(hdr_page);
-            if (h->n_robots    > 0) n_  = h->n_robots;
-            if (h->n_consumers > 0) nc_ = h->n_consumers;
-            platform::shm_unmap(hdr_page, 4096);
-        } catch (...) { /* ignore probe failure — proceed with defaults */ }
+    void attach(double timeout_ms = 30000.0) {
+        uint64_t deadline = detail::now_ns() +
+                            static_cast<uint64_t>(timeout_ms * 1e6);
+
+        /* Probe header with retry — wait for publisher to create the segment. */
+        for (;;) {
+            try {
+                void* hdr_page = platform::shm_attach(name_, 4096);
+                IrsimHeader* h = static_cast<IrsimHeader*>(hdr_page);
+                if (h->n_robots    > 0) n_  = h->n_robots;
+                if (h->n_consumers > 0) nc_ = h->n_consumers;
+                platform::shm_unmap(hdr_page, 4096);
+                break;  /* probe succeeded */
+            } catch (...) {
+                if (detail::now_ns() > deadline)
+                    throw std::runtime_error(
+                        "attach timeout: segment '" + name_ + "' not found — "
+                        "is the publisher running? (waited "
+                        + std::to_string(static_cast<int>(timeout_ms)) + " ms)");
+                platform::sleep_ns(50'000'000LL);  /* 50 ms between retries */
+            }
+        }
+
         size_ = detail::aligned_size(n_, nc_);
         mem_ = platform::shm_attach(name_, size_);
+
         /* Wait for ready signal. */
         IrsimHeader* hdr = static_cast<IrsimHeader*>(mem_);
-        uint64_t deadline = detail::now_ns() + (uint64_t)timeout_ms * 1'000'000ULL;
         while (!hdr->ready) {
             if (detail::now_ns() > deadline) {
                 platform::shm_unmap(mem_, size_); mem_ = nullptr;
