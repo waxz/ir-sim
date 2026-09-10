@@ -148,9 +148,9 @@ jobs:
       - name: Smoke test -- pipeline (sensor + planner + control, 8 s)
         run: |
           set -e
-          SENSOR=shmbridge/examples/cpp_pipeline/build/sensor_node
-          PLANNER=shmbridge/examples/cpp_pipeline/build/planner_node
-          CONTROL=shmbridge/examples/cpp_pipeline/build/control_node
+          SENSOR=shmbridge/examples/cpp_pipeline/build/dist/sensor_node
+          PLANNER=shmbridge/examples/cpp_pipeline/build/dist/planner_node
+          CONTROL=shmbridge/examples/cpp_pipeline/build/dist/control_node
 
           "$SENSOR"  > /tmp/sensor.log  2>&1 &  SENSOR_PID=$!
           "$PLANNER" > /tmp/planner.log 2>&1 &  PLANNER_PID=$!
