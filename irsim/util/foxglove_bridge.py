@@ -741,6 +741,7 @@ class FoxgloveBridge:
                     "topic": topic,
                     "encoding": "json",
                     "schemaName": _SCHEMA_NAMES[topic],
+                    "schemaEncoding": "jsonschema",
                     "schema": schema,
                 }
             )
