@@ -65,7 +65,7 @@ world:
   height: 20
   width: 20
   step_time: 0.05
-  collision_mode: stop
+  collision_mode: reactive
   plot:
     no_axis: True
 
@@ -338,7 +338,13 @@ def main():
     print(f"Running simulation (step_time={DT:.3f} s, Ctrl-C to stop) …")
 
     try:
-        while not env.done():
+        while True:
+            if env.done():
+                env.reset()
+                grid, origin_xy = _build_occupancy_grid(env, resolution=0.1)
+                bridge.update_map(grid, resolution=0.1, origin_xy=origin_xy)
+                print(f"  [step {step}] episode done — resetting environment")
+
             t0 = time.perf_counter()
 
             # ── Handle remote pause ──────────────────────────────────────────
