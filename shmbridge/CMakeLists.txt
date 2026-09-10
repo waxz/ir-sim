@@ -58,7 +58,7 @@ target_link_libraries(shmbridge INTERFACE
 # is only built on Unix-like systems where the underlying APIs exist.
 find_package(pybind11 CONFIG QUIET)
 
-if(UNIX AND pybind11_FOUND)
+if(pybind11_FOUND)
     pybind11_add_module(_core csrc/py_bindings.cpp)
     target_include_directories(_core PRIVATE include)
     target_compile_options(_core PRIVATE
@@ -68,6 +68,10 @@ if(UNIX AND pybind11_FOUND)
             -fvisibility=hidden
         >
         $<$<CXX_COMPILER_ID:MSVC>:/O2>
+    )
+    # Windows: WaitOnAddress / WakeByAddressAll from platform.hpp
+    target_link_libraries(_core PRIVATE
+        $<$<PLATFORM_ID:Windows>:Synchronization>
     )
     install(TARGETS _core DESTINATION shmbridge)
 endif()

@@ -116,14 +116,13 @@ jobs:
         run: uv run pytest shmbridge/tests/test_shmbridge.py -v
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Job 3 — Python package, ctypes fallback  (Windows)
-# POSIX shm_open is unavailable on Windows, so the C++ extension is skipped
-# (pybind11 is intentionally not installed).  The package falls back to the
-# pure-Python ctypes implementation.  Only the struct-layout tests run because
-# they exercise the ctypes types without opening any SHM segment.
+# Job 3 — Python package with C++ extension  (Windows)
+# platform.hpp maps shm_open/mmap → CreateFileMapping/MapViewOfFile and
+# nanosleep → Sleep, so the pybind11 extension now builds on Windows with MSVC.
+# All Python tests run because shared-memory segments are available via Win32.
 # ──────────────────────────────────────────────────────────────────────────────
   python-windows:
-    name: Python ${{ matrix.python-version }} · windows-latest (ctypes fallback)
+    name: Python ${{ matrix.python-version }} · windows-latest
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -137,27 +136,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # Install scikit-build-core but NOT pybind11.
-      # CMakeLists.txt: find_package(pybind11 QUIET) → not found → C++ extension
-      # target is skipped → only Python source files are installed.
-      - name: Install scikit-build-core (no pybind11 → skips C++ extension)
-        run: pip install "scikit-build-core>=0.8" pytest
+      - name: Install build dependencies
+        run: pip install "scikit-build-core>=0.8" "pybind11>=2.12" pytest
 
-      - name: Install shmbridge (ctypes fallback)
+      - name: Install shmbridge with C++ extension
         run: pip install --no-build-isolation ./shmbridge
 
-      - name: Verify ctypes fallback active
+      - name: Verify C++ backend loaded
         run: |
           python -c "
           import shmbridge
           print(f'shmbridge {shmbridge.__version__}  backend={shmbridge._BACKEND}')
-          assert shmbridge._BACKEND == 'python', \
-              f'Expected python ctypes fallback, got {shmbridge._BACKEND!r}'
+          assert shmbridge._BACKEND == 'cpp', \
+              f'Expected cpp backend, got {shmbridge._BACKEND!r}'
           "
 
-      # Only pure struct-size and field-offset tests run; they use
-      # ctypes.sizeof() / .offset and never open a POSIX SHM segment.
       # -o "addopts=" clears the global addopts from pyproject.toml (which
       # inject --cov flags) so pytest doesn't fail when pytest-cov is absent.
-      - name: Run struct-layout tests (no POSIX SHM required)
-        run: pytest shmbridge/tests/test_shmbridge.py -v -o "addopts=" -k "size or offset"
+      - name: Run Python tests
+        run: pytest shmbridge/tests/test_shmbridge.py -v -o "addopts="

@@ -11,15 +11,18 @@
  * high_resolution_clock for lower jitter.
  */
 
-#include <cstdint>
+#include "platform.hpp"
+
 #include <cmath>
-#include <ctime>
+#include <cstdint>
 
 /* CPU spin-wait hint — reduce pipeline stalls and memory traffic.
  * Guard avoids redefinition if core.hpp is also included. */
 #ifndef _SB_PAUSE
 #  if defined(__x86_64__) || defined(__i386__)
 #    define _SB_PAUSE() __builtin_ia32_pause()
+#  elif defined(_M_X64) || defined(_M_IX86)
+#    define _SB_PAUSE() _mm_pause()
 #  elif defined(__aarch64__) || defined(__ARM_ARCH_8A__)
 #    define _SB_PAUSE() __asm__ volatile("yield" ::: "memory")
 #  else
@@ -29,12 +32,17 @@
 
 namespace shmbridge {
 
-/* Returns nanoseconds from CLOCK_MONOTONIC_RAW.
- * Single vDSO call on Linux — faster than std::chrono. */
+/* Returns monotonic nanoseconds.
+ * Linux uses CLOCK_MONOTONIC_RAW (immune to NTP); other platforms use
+ * platform::now_ns() which selects the best available clock. */
 inline int64_t now_ns_mono() noexcept {
+#if defined(__linux__)
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
+#else
+    return static_cast<int64_t>(platform::now_ns());
+#endif
 }
 
 /* Precise hybrid sleep: nanosleep bulk + spin tail.
@@ -55,11 +63,10 @@ inline void spin_sleep_ns(int64_t ns) noexcept {
 
     int64_t remaining = ns;
 
-    /* Coarse phase: 1 ms nanosleep while remaining > estimated overhead. */
+    /* Coarse phase: 1 ms sleep while remaining > estimated overhead. */
     while (remaining > static_cast<int64_t>(estimate)) {
         int64_t t0 = now_ns_mono();
-        struct timespec req{0, 1'000'000L};
-        nanosleep(&req, nullptr);
+        platform::sleep_ns(1'000'000LL);
         int64_t actual = now_ns_mono() - t0;
         remaining -= actual;
 
