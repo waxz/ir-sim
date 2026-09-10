@@ -1,22 +1,44 @@
 """
-open3d_sim.py — IR-SIM + Scene3D + Open3D real-time 3D LiDAR visualisation.
+open3d_sim.py — IR-SIM + Scene3D + Open3D 3D LiDAR demo
+               with 2D LiDAR / IMU / encoder / motor sensors,
+               keyboard driving, and Foxglove Studio integration.
 
-Two systems run in lock-step:
-  • irsim (YAML-driven)  — robot kinematics, collision, navigation behaviour
-  • Scene3D (Embree BVH) — 3D geometry matching the YAML obstacles, VLP-16 raycasting
+Systems running in lock-step:
+  irsim          — YAML-driven robot kinematics, collision, dash behaviour
+  Scene3D        — Embree BVH 3D geometry, VLP-16/OS-64/OS-128 raycasting
+  FoxgloveBridge — WebSocket publisher  (ws://localhost:8765)
+  KeyboardControl — pynput global listener for manual driving
 
-Open3D Visualizer shows:
-  • Static 3D scene (coloured meshes)
-  • Dynamic LiDAR point cloud (height-coloured, updated every step)
-  • Robot sphere and heading arrow (updated every step)
+Published Foxglove topics:
+  /irsim/pose     robot pose
+  /irsim/lidar2d  2D 360-deg LiDAR scan
+  /irsim/lidar3d  3D LiDAR point cloud
+  /irsim/imu      IMU (angular velocity + linear acceleration)
+  /irsim/encoder  wheel encoder ticks / angles
+  /irsim/motor    motor command vs actual velocities
+  /irsim/scene    3D robot marker (cylinder + arrow)
+  /irsim/map      static occupancy grid
+
+Keyboard (pynput — focus any window then type):
+  w / s    forward / backward
+  a / d    turn left / right
+  x        toggle keyboard <-> auto (dash) control
+  space    pause / resume
+  r        reset to start
+  esc      quit
 
 Requirements:
-    pip install ir-sim[lidar3d]   # open3d + embree
+    pip install ir-sim[lidar3d,keyboard]    # open3d + embree + pynput
+
+Foxglove Studio:
+    Open ws://localhost:8765
 
 Usage:
     python usage/28open3d_lidar3d/open3d_sim.py
-    python usage/28open3d_lidar3d/open3d_sim.py --headless     # save PNG, no window
+    python usage/28open3d_lidar3d/open3d_sim.py --headless
     python usage/28open3d_lidar3d/open3d_sim.py --profile os64
+    python usage/28open3d_lidar3d/open3d_sim.py --no-foxglove
+    python usage/28open3d_lidar3d/open3d_sim.py --no-keyboard
 """
 
 from __future__ import annotations
@@ -26,8 +48,8 @@ import math
 import os
 
 import numpy as np
+from shapely.geometry import Point
 
-# ── ir-sim ──────────────────────────────────────────────────────────────────
 import irsim
 
 try:
@@ -36,80 +58,65 @@ try:
     from irsim.world.env3d import Scene3D
 except ImportError as exc:
     raise SystemExit(
-        "open3d is required.  Install with:  pip install ir-sim[lidar3d]"
+        "open3d / embree is required.  Install with:  pip install ir-sim[lidar3d]"
     ) from exc
 
-# ── constants ────────────────────────────────────────────────────────────────
-SENSOR_HEIGHT = 0.8  # LiDAR mount height above ground (m)
+try:
+    from irsim.util.foxglove_bridge import FoxgloveBridge
+
+    _FOXGLOVE_OK = True
+except ImportError:
+    _FOXGLOVE_OK = False
+
+try:
+    from irsim.gui.keyboard_control import KeyboardControl
+
+    _KEYBOARD_OK = True
+except ImportError:
+    _KEYBOARD_OK = False
+
+# ── constants ─────────────────────────────────────────────────────────────────
+SENSOR_HEIGHT = 0.8  # LiDAR mount height (m)
 ROBOT_RADIUS = 0.25  # matches world.yaml
-WORLD_HALF = 10.0  # half-extent of the 20x20 m world
-WALL_H = 3.0  # outer wall height (m)
-WALL_T = 0.15  # wall thickness (m)
+WORLD_HALF = 10.0
+WALL_H = 3.0
+WALL_T = 0.15
+FOXGLOVE_PORT = 8765
 
 HERE = os.path.dirname(__file__)
 
 
-# ── Scene3D builder ──────────────────────────────────────────────────────────
+# ── Scene3D builder ───────────────────────────────────────────────────────────
 
 
 def build_scene() -> Scene3D:
-    """
-    Build the 3D geometry that matches world.yaml obstacles.
-
-    Outer boundary walls + 3D versions of every YAML obstacle.
-    The 2D footprint of each 3D object should cover the corresponding
-    irsim shape so that LiDAR hits correlate with actual collisions.
-    """
+    """Build 3D geometry that mirrors world.yaml obstacle footprints."""
     s = Scene3D()
 
-    # Ground
     s.add_ground(
         -WORLD_HALF, WORLD_HALF, -WORLD_HALF, WORLD_HALF, color=(0.28, 0.32, 0.22)
     )
 
-    # Outer boundary walls (match irsim's implicit world boundary)
-    s.add_wall(
-        [-WORLD_HALF, -WORLD_HALF],
-        [WORLD_HALF, -WORLD_HALF],
-        height=WALL_H,
-        thickness=WALL_T,
-    )
-    s.add_wall(
-        [WORLD_HALF, -WORLD_HALF],
-        [WORLD_HALF, WORLD_HALF],
-        height=WALL_H,
-        thickness=WALL_T,
-    )
-    s.add_wall(
-        [WORLD_HALF, WORLD_HALF],
-        [-WORLD_HALF, WORLD_HALF],
-        height=WALL_H,
-        thickness=WALL_T,
-    )
-    s.add_wall(
-        [-WORLD_HALF, WORLD_HALF],
-        [-WORLD_HALF, -WORLD_HALF],
-        height=WALL_H,
-        thickness=WALL_T,
-    )
+    for a, b in [
+        ([-WORLD_HALF, -WORLD_HALF], [WORLD_HALF, -WORLD_HALF]),
+        ([WORLD_HALF, -WORLD_HALF], [WORLD_HALF, WORLD_HALF]),
+        ([WORLD_HALF, WORLD_HALF], [-WORLD_HALF, WORLD_HALF]),
+        ([-WORLD_HALF, WORLD_HALF], [-WORLD_HALF, -WORLD_HALF]),
+    ]:
+        s.add_wall(a, b, height=WALL_H, thickness=WALL_T)
 
-    # Pillar near centre (1x1 m base, 2.5 m tall)
     s.add_box(
         center=[0.0, 0.0, 1.25],
         size=[1.0, 1.0, 2.5],
         color=(0.55, 0.50, 0.45),
         label="pillar",
     )
-
-    # Crate (1.5x0.8 m base, 1.0 m tall)
     s.add_box(
         center=[4.0, -3.0, 0.5],
         size=[1.5, 0.8, 1.0],
         color=(0.45, 0.32, 0.18),
         label="crate",
     )
-
-    # Barrier wall segment (4 m long, 1.5 m tall)
     s.add_wall(
         [-2.0, 2.0],
         [2.0, 2.0],
@@ -118,8 +125,6 @@ def build_scene() -> Scene3D:
         color=(0.62, 0.56, 0.50),
         label="barrier",
     )
-
-    # Tall column (cylinder-like via a box, r~0.4 m, 0.8x0.8 m footprint, 2.8 m tall)
     s.add_box(
         center=[-4.0, 4.0, 1.4],
         size=[0.8, 0.8, 2.8],
@@ -131,25 +136,41 @@ def build_scene() -> Scene3D:
     return s
 
 
-# ── Open3D helpers ───────────────────────────────────────────────────────────
+# ── occupancy grid ────────────────────────────────────────────────────────────
+
+
+def build_occupancy_grid(env, resolution: float = 0.2):
+    """Return (grid, origin_xy) from obstacle Shapely geometries."""
+    cols = int(2 * WORLD_HALF / resolution)
+    rows = int(2 * WORLD_HALF / resolution)
+    grid = np.zeros((rows, cols), dtype=np.float32)
+    xs = np.linspace(-WORLD_HALF + resolution / 2, WORLD_HALF - resolution / 2, cols)
+    ys = np.linspace(-WORLD_HALF + resolution / 2, WORLD_HALF - resolution / 2, rows)
+    for obs in env.obstacle_list:
+        geom = obs.geometry
+        for i, y in enumerate(ys):
+            for j, x in enumerate(xs):
+                if geom.contains(Point(x, y)):
+                    grid[i, j] = 100.0
+    return grid, np.array([-WORLD_HALF, -WORLD_HALF])
+
+
+# ── Open3D helpers ────────────────────────────────────────────────────────────
 
 
 def _color_by_height(pts: np.ndarray) -> np.ndarray:
-    """Map z-values to a blue→green→yellow color ramp. Returns (N,3) float64."""
     z = pts[:, 2]
-    z_lo, z_hi = float(z.min()), float(z.max())
-    t = (z - z_lo) / max(z_hi - z_lo, 1e-6)
-    colors = np.zeros((len(pts), 3))
-    colors[:, 0] = np.clip(2 * t - 0.5, 0, 1)  # R: rises above 0.25
-    colors[:, 1] = np.clip(1 - np.abs(2 * t - 1), 0, 1)  # G: peak at mid
-    colors[:, 2] = np.clip(1 - 2 * t, 0, 1)  # B: falls from 1
-    return colors
+    t = (z - z.min()) / max(z.max() - z.min(), 1e-6)
+    c = np.zeros((len(pts), 3))
+    c[:, 0] = np.clip(2 * t - 0.5, 0, 1)
+    c[:, 1] = np.clip(1 - np.abs(2 * t - 1), 0, 1)
+    c[:, 2] = np.clip(1 - 2 * t, 0, 1)
+    return c
 
 
 def _make_arrow_mesh(
     origin: np.ndarray, direction: np.ndarray, length: float = 0.6
 ) -> o3d.geometry.TriangleMesh:
-    """Return a small arrow mesh pointing from origin along direction."""
     arrow = o3d.geometry.TriangleMesh.create_arrow(
         cylinder_radius=0.06,
         cone_radius=0.12,
@@ -157,7 +178,6 @@ def _make_arrow_mesh(
         cone_height=length * 0.3,
     )
     arrow.paint_uniform_color([1.0, 0.55, 0.0])
-    # Default arrow points along +Z; rotate to direction
     d = direction / (np.linalg.norm(direction) + 1e-9)
     z = np.array([0.0, 0.0, 1.0])
     axis = np.cross(z, d)
@@ -172,7 +192,6 @@ def _make_arrow_mesh(
 
 
 def _scene_meshes(scene: Scene3D) -> list[o3d.geometry.TriangleMesh]:
-    """Extract coloured legacy meshes from a Scene3D for static display."""
     meshes = []
     idx = 0
     for rec in scene._grounds:
@@ -184,8 +203,7 @@ def _scene_meshes(scene: Scene3D) -> list[o3d.geometry.TriangleMesh]:
         meshes.append(m)
         idx += 1
     for rec in scene._boxes:
-        m = scene._meshes[idx]
-        mc = o3d.geometry.TriangleMesh(m)  # copy
+        mc = o3d.geometry.TriangleMesh(scene._meshes[idx])
         mc.paint_uniform_color(list(rec.color))
         mc.compute_vertex_normals()
         meshes.append(mc)
@@ -193,124 +211,271 @@ def _scene_meshes(scene: Scene3D) -> list[o3d.geometry.TriangleMesh]:
     return meshes
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── sensor helpers ────────────────────────────────────────────────────────────
+
+
+def _find_sensor(robot, sensor_type: str):
+    for s in getattr(robot, "sensors", []):
+        if getattr(s, "sensor_type", None) == sensor_type:
+            return s
+    return None
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="IR-SIM Open3D 3D LiDAR demo")
     ap.add_argument(
-        "--headless",
-        action="store_true",
-        help="Skip interactive window; save one PNG per episode end",
+        "--headless", action="store_true", help="No Open3D window; run in terminal only"
     )
     ap.add_argument(
         "--profile",
         default="vlp16",
         choices=list(Scene3D.PROFILES.keys()),
-        help="LiDAR profile (default: vlp16)",
+        help="3D LiDAR profile (default: vlp16)",
     )
     ap.add_argument(
-        "--steps", type=int, default=2000, help="Max simulation steps (default: 2000)"
+        "--steps",
+        type=int,
+        default=100_000,
+        help="Max simulation steps (default: 100000)",
     )
     ap.add_argument(
         "--range",
         type=float,
         default=20.0,
-        help="LiDAR range_max in metres (default: 20)",
+        help="3D LiDAR range_max in metres (default: 20)",
+    )
+    ap.add_argument(
+        "--no-foxglove", action="store_true", help="Disable Foxglove bridge"
+    )
+    ap.add_argument(
+        "--no-keyboard", action="store_true", help="Disable keyboard control"
+    )
+    ap.add_argument(
+        "--fps", type=int, default=20, help="Foxglove publish rate Hz (default: 20)"
     )
     args = ap.parse_args()
 
-    # ── build Scene3D ────────────────────────────────────────────────────────
-    print("Building Scene3D …")
+    # ── Scene3D ───────────────────────────────────────────────────────────────
+    print("Building Scene3D ...")
     scene = build_scene()
-    n_channels, n_beams, e_lo, e_hi = Scene3D.PROFILES[args.profile]
-    print(
-        f"  Embree BVH ready.  Profile: {args.profile} "
-        f"({n_channels} ch x {n_beams} beams, "
-        f"elev [{e_lo}°, {e_hi}°])"
-    )
+    n_ch, n_b, e_lo, e_hi = Scene3D.PROFILES[args.profile]
+    print(f"  {args.profile}: {n_ch} ch x {n_b} beams, elev [{e_lo},{e_hi}] deg")
 
-    # ── irsim environment ────────────────────────────────────────────────────
-    yaml_path = os.path.join(HERE, "world.yaml")
-    env = irsim.make(yaml_path, headless=True)
+    # ── irsim ─────────────────────────────────────────────────────────────────
+    env = irsim.make(os.path.join(HERE, "world.yaml"), headless=True)
     robot = env.robot_list[0]
-    print("IR-SIM environment started.")
+    print("IR-SIM ready.")
 
-    # ── Open3D setup ─────────────────────────────────────────────────────────
+    lidar2d = _find_sensor(robot, "lidar2d")
+    imu_sensor = _find_sensor(robot, "imu")
+    if lidar2d:
+        print(
+            f"  2D LiDAR: {lidar2d.number} beams, range [0.05, {lidar2d.range_max}] m, 360 deg"
+        )
+    if imu_sensor:
+        print("  IMU: mpu6050 profile, noise=true")
+
+    # ── keyboard ──────────────────────────────────────────────────────────────
+    kb = None
+    if not args.no_keyboard:
+        if not _KEYBOARD_OK:
+            print(
+                "  WARNING: pynput not found; skip keyboard.  pip install ir-sim[keyboard]"
+            )
+        else:
+            try:
+                kb = KeyboardControl(
+                    env, key_lv_max=2.0, key_ang_max=1.5, backend="pynput"
+                )
+                # Attach to env so env.step() routes keyboard velocity
+                env.keyboard = kb
+                env._world_param.control_mode = "keyboard"
+                print(
+                    "  Keyboard: w/s=fwd/back  a/d=turn  x=toggle-auto  "
+                    "space=pause  r=reset  esc=quit"
+                )
+            except Exception as exc:
+                print(f"  WARNING: keyboard unavailable ({exc})")
+
+    # ── Foxglove bridge ───────────────────────────────────────────────────────
+    bridge = None
+    if not args.no_foxglove:
+        if not _FOXGLOVE_OK:
+            print("  WARNING: foxglove_websocket not installed; bridge disabled.")
+        else:
+            bridge = FoxgloveBridge(
+                port=FOXGLOVE_PORT, publish_hz=float(args.fps)
+            ).start()
+            print(
+                f"  Foxglove: ws://0.0.0.0:{FOXGLOVE_PORT}  (connect Foxglove Studio)"
+            )
+            print("  Building occupancy grid ...", end=" ", flush=True)
+            grid, origin_xy = build_occupancy_grid(env, resolution=0.2)
+            bridge.update_map(grid, resolution=0.2, origin_xy=origin_xy)
+            print(f"{grid.shape[1]}x{grid.shape[0]} cells at 0.2 m/cell")
+
+            # Publish static obstacle scene markers once
+            for obs in env.obstacle_list:
+                st = obs.state
+                sx, sy, sth = float(st[0, 0]), float(st[1, 0]), float(st[2, 0])
+                if obs.shape == "rectangle":
+                    bridge.update_box_marker(
+                        entity_id=f"obs_{obs.id}",
+                        x=sx,
+                        y=sy,
+                        theta=sth,
+                        length=float(obs.length),
+                        width=float(obs.width),
+                        height=2.0,
+                        color=(0.55, 0.50, 0.45, 0.8),
+                    )
+                else:
+                    bridge.update_circle_marker(
+                        entity_id=f"obs_{obs.id}",
+                        x=sx,
+                        y=sy,
+                        radius=float(obs.radius),
+                        height=2.0,
+                        color=(0.50, 0.55, 0.60, 0.8),
+                    )
+
+    # ── Open3D window ─────────────────────────────────────────────────────────
+    vis = arrow_geom = robot_sphere = pcd = None
+    prev_x = float(robot.state[0, 0])
+    prev_y = float(robot.state[1, 0])
+
     if not args.headless:
         vis = o3d.visualization.Visualizer()
         vis.create_window(window_name="IR-SIM 3D LiDAR", width=1280, height=720)
 
-        # Static scene geometry
         for m in _scene_meshes(scene):
             vis.add_geometry(m)
 
-        # Goal marker (green sphere)
-        goal_x, goal_y = 7.0, 7.0
-        goal_sphere = o3d.geometry.TriangleMesh.create_sphere(0.35)
-        goal_sphere.paint_uniform_color([0.1, 0.85, 0.2])
-        goal_sphere.compute_vertex_normals()
-        goal_sphere.translate([goal_x, goal_y, 0.35])
-        vis.add_geometry(goal_sphere)
+        goal_s = o3d.geometry.TriangleMesh.create_sphere(0.35)
+        goal_s.paint_uniform_color([0.1, 0.85, 0.2])
+        goal_s.compute_vertex_normals()
+        goal_s.translate([7.0, 7.0, 0.35])
+        vis.add_geometry(goal_s)
 
-        # Dynamic point cloud
         pcd = o3d.geometry.PointCloud()
         vis.add_geometry(pcd)
 
-        # Robot sphere (updated per step)
         robot_sphere = o3d.geometry.TriangleMesh.create_sphere(ROBOT_RADIUS)
         robot_sphere.paint_uniform_color([0.9, 0.2, 0.15])
         robot_sphere.compute_vertex_normals()
-        robot_sphere.translate(
-            [float(robot.state[0, 0]), float(robot.state[1, 0]), ROBOT_RADIUS]
-        )
+        robot_sphere.translate([prev_x, prev_y, ROBOT_RADIUS])
         vis.add_geometry(robot_sphere)
 
-        # Heading arrow (rebuilt each step via remove + add)
-        arrow_geom: o3d.geometry.TriangleMesh | None = None
-
-        # Camera: look down from above at a slight angle
         vc = vis.get_view_control()
         vc.set_zoom(0.45)
         vc.set_front([0.3, -0.6, 0.75])
         vc.set_up([0, 0, 1])
         vc.set_lookat([0, 0, 0])
 
-    # ── simulation loop ──────────────────────────────────────────────────────
-    prev_x = float(robot.state[0, 0])
-    prev_y = float(robot.state[1, 0])
-    episode = 0
-
-    print(f"Running {args.steps} steps (Ctrl-C to stop) …")
+    # ── simulation loop ───────────────────────────────────────────────────────
+    print(f"Running (max {args.steps} steps) — Ctrl-C to stop ...")
 
     for step in range(args.steps):
-        # Reset on episode end
-        if env.done():
-            episode += 1
+        if getattr(env, "quit_flag", False):
+            print("  Quit via keyboard.")
+            break
+
+        # Keyboard-triggered reset (r key)
+        if getattr(env, "reset_flag", False):
             env.reset()
+            env.reset_flag = False
             prev_x = float(robot.state[0, 0])
             prev_y = float(robot.state[1, 0])
-            print(f"  episode {episode} done at step {step}")
+            print(f"  [step {step}] manual reset")
 
-        # Step simulation
         env.step()
 
-        # Robot state
         rx = float(robot.state[0, 0])
         ry = float(robot.state[1, 0])
         rth = float(robot.state[2, 0])
 
-        # Cast 3D LiDAR
-        origin_3d = [rx, ry, SENSOR_HEIGHT]
-        pts = scene.cast_3d_lidar(origin_3d, profile=args.profile, range_max=args.range)
+        # 3D LiDAR raycast
+        pts = scene.cast_3d_lidar(
+            [rx, ry, SENSOR_HEIGHT], profile=args.profile, range_max=args.range
+        )
 
-        if step % 50 == 0:
-            print(f"  step {step:4d}  pos=({rx:.2f},{ry:.2f})  lidar hits={len(pts):,}")
+        if step % 100 == 0:
+            mode = getattr(env._world_param, "control_mode", "?")
+            print(
+                f"  step {step:6d}  ({rx:6.2f},{ry:6.2f})  3d={len(pts):,}  mode={mode}"
+            )
+
+        # ── Foxglove publish ──────────────────────────────────────────────────
+        if bridge is not None:
+            bridge.update_pose(rx, ry, rth, robot_id=0, robot_name="robot_0")
+
+            if lidar2d is not None:
+                scan = lidar2d.get_scan()
+                bridge.update_lidar2d(
+                    np.asarray(scan["ranges"], dtype=np.float32),
+                    [rx, ry, 0.2],
+                    float(scan["angle_min"]),
+                    float(scan["angle_max"]),
+                    robot_id=0,
+                    robot_name="robot_0",
+                    sensor_name="lidar2d",
+                )
+
+            if imu_sensor is not None:
+                meas = imu_sensor.get_measurement()
+                bridge.update_imu(
+                    meas["angular_velocity"],
+                    meas["linear_acceleration"],
+                    robot_id=0,
+                    robot_name="robot_0",
+                    sensor_name="imu",
+                )
+
+            try:
+                enc = robot.encoder_readings
+                if enc:
+                    bridge.update_encoder(
+                        enc, robot_id=0, robot_name="robot_0", sensor_name="encoder"
+                    )
+            except Exception:
+                pass
+
+            try:
+                mot = robot.wheel_states
+                if mot:
+                    bridge.update_motor(
+                        mot, robot_id=0, robot_name="robot_0", sensor_name="motor"
+                    )
+            except Exception:
+                pass
+
+            if len(pts) > 0:
+                bridge.update_lidar3d(
+                    pts[:, :3].astype(np.float32),
+                    [rx, ry, SENSOR_HEIGHT],
+                    robot_id=0,
+                    robot_name="robot_0",
+                    sensor_name="lidar3d",
+                )
+
+            bridge.update_robot_marker(
+                rx,
+                ry,
+                rth,
+                robot_id=0,
+                robot_name="robot_0",
+                radius=ROBOT_RADIUS,
+                height=0.5,
+                color=(0.9, 0.2, 0.15, 1.0),
+            )
 
         if args.headless:
             continue
 
-        # ── update point cloud ───────────────────────────────────────────────
+        # ── Open3D update ─────────────────────────────────────────────────────
         if len(pts) > 0:
             pcd.points = o3d.utility.Vector3dVector(pts[:, :3].astype(np.float64))
             pcd.colors = o3d.utility.Vector3dVector(_color_by_height(pts))
@@ -318,12 +483,10 @@ def main() -> None:
             pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
         vis.update_geometry(pcd)
 
-        # ── update robot sphere ──────────────────────────────────────────────
         robot_sphere.translate([rx - prev_x, ry - prev_y, 0.0])
         vis.update_geometry(robot_sphere)
         prev_x, prev_y = rx, ry
 
-        # ── rebuild heading arrow ────────────────────────────────────────────
         if arrow_geom is not None:
             vis.remove_geometry(arrow_geom, reset_bounding_box=False)
         arrow_geom = _make_arrow_mesh(
@@ -332,16 +495,17 @@ def main() -> None:
         )
         vis.add_geometry(arrow_geom, reset_bounding_box=False)
 
-        # ── render ───────────────────────────────────────────────────────────
         if not vis.poll_events():
             print("Window closed.")
             break
         vis.update_renderer()
 
-    # ── cleanup ──────────────────────────────────────────────────────────────
+    # ── cleanup ───────────────────────────────────────────────────────────────
     env.end()
-    if not args.headless:
+    if vis is not None:
         vis.destroy_window()
+    if bridge is not None:
+        bridge.stop()
     print("Done.")
 
 

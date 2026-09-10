@@ -14,6 +14,21 @@ robot:
   vel_min: [-1.5, -2.0]
   vel_max: [1.5, 2.0]
   color: r
+  collision_mode: reactive
+  sensors:
+    - name: lidar2d
+      range_min: 0.05
+      range_max: 15.0
+      angle_range: 6.2832   # 360 deg
+      number: 360
+      noise: false
+      offset: [0, 0, 0]
+      plot:
+        alpha: 0.15
+    - type: imu
+      noise: true
+      profile: mpu6050
+      step_time: 0.05
 
 obstacle:
   # pillar near centre
