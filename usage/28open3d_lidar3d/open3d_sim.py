@@ -287,10 +287,19 @@ def main() -> None:
             )
         else:
             try:
+                # env_ref=None so the pynput listener starts unconditionally
+                # (headless env has display=False which would otherwise skip it).
+                # global_hook=True disables MPL focus gating so keys are
+                # captured on any OS window including the Open3D viewport.
                 kb = KeyboardControl(
-                    env, key_lv_max=2.0, key_ang_max=1.5, backend="pynput"
+                    env_ref=None,
+                    key_lv_max=2.0,
+                    key_ang_max=1.5,
+                    backend="pynput",
+                    global_hook=True,
                 )
-                # Attach to env so env.step() routes keyboard velocity
+                # Attach env_ref after construction for r/space/x/esc commands.
+                kb.env_ref = env
                 env.keyboard = kb
                 env._world_param.control_mode = "keyboard"
                 print(
