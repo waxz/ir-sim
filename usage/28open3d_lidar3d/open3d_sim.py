@@ -19,13 +19,15 @@ Published Foxglove topics:
   /irsim/scene    3D robot marker (cylinder + arrow)
   /irsim/map      static occupancy grid
 
-Keyboard (pynput — focus any window then type):
+Keyboard (Open3D GLFW callbacks — focus the 3D window):
   w / s    forward / backward
   a / d    turn left / right
   x        toggle keyboard <-> auto (dash) control
   space    pause / resume
   r        reset to start
   esc      quit
+
+  Headless mode falls back to pynput for keyboard input.
 
 Requirements:
     pip install ir-sim[lidar3d,keyboard]    # open3d + embree + pynput
@@ -211,6 +213,60 @@ def _scene_meshes(scene: Scene3D) -> list[o3d.geometry.TriangleMesh]:
     return meshes
 
 
+# ── Open3D keyboard helpers ───────────────────────────────────────────────────
+
+
+def _setup_o3d_keyboard(vis, env, kb) -> dict[str, bool]:
+    """Register GLFW key callbacks on *vis* (must be VisualizerWithKeyCallback).
+
+    Returns a live key-state dict ``{"w": bool, "s": bool, "a": bool, "d": bool}``
+    that is updated by the callbacks on every ``vis.poll_events()`` call.
+    Motion keys use *register_key_action_callback* so held keys fire continuously.
+    Command keys use *register_key_callback* (press-only).
+
+    Returns an empty dict if the required API is absent.
+    """
+    if not hasattr(vis, "register_key_action_callback"):
+        return {}
+
+    state: dict[str, bool] = dict.fromkeys("wsad", False)
+
+    # Motion keys — track press (action=1/repeat=2) vs release (action=0)
+    for char, glfw_key in (("w", 87), ("s", 83), ("a", 65), ("d", 68)):
+
+        def _motion_cb(_vis, action: int, _mods: int, c: str = char) -> bool:
+            state[c] = action != 0  # True while held
+            return False
+
+        vis.register_key_action_callback(glfw_key, _motion_cb)
+
+    # Command keys — press-only
+    def _on_space(_vis) -> bool:
+        if kb is not None and kb.env_ref is not None:
+            kb._toggle_pause()
+        return False
+
+    def _on_r(_vis) -> bool:
+        env.reset_flag = True
+        return False
+
+    def _on_x(_vis) -> bool:
+        if kb is not None:
+            kb._toggle_control_mode()
+        return False
+
+    def _on_esc(_vis) -> bool:
+        env.quit_flag = True
+        return False
+
+    vis.register_key_callback(32, _on_space)  # GLFW_KEY_SPACE
+    vis.register_key_callback(82, _on_r)  # R
+    vis.register_key_callback(88, _on_x)  # X
+    vis.register_key_callback(256, _on_esc)  # GLFW_KEY_ESCAPE
+
+    return state
+
+
 # ── sensor helpers ────────────────────────────────────────────────────────────
 
 
@@ -353,7 +409,9 @@ def main() -> None:
     prev_y = float(robot.state[1, 0])
 
     if not args.headless:
-        vis = o3d.visualization.Visualizer()
+        # VisualizerWithKeyCallback adds register_key_callback /
+        # register_key_action_callback on top of the standard Visualizer API.
+        vis = o3d.visualization.VisualizerWithKeyCallback()
         vis.create_window(window_name="IR-SIM 3D LiDAR", width=1280, height=720)
 
         for m in _scene_meshes(scene):
@@ -380,6 +438,24 @@ def main() -> None:
         vc.set_up([0, 0, 1])
         vc.set_lookat([0, 0, 0])
 
+    # ── Open3D key callbacks (replaces pynput when visualizer is active) ──────
+    # register_key_action_callback fires on press/repeat/release so held keys
+    # update the state dict continuously — much more reliable on Windows than
+    # pynput when an Open3D window is present.
+    o3d_keys: dict[str, bool] = {}
+    if vis is not None and kb is not None:
+        o3d_keys = _setup_o3d_keyboard(vis, env, kb)
+        if o3d_keys:
+            # Stop pynput listener to avoid duplicate / racing updates.
+            if getattr(kb, "listener", None) is not None:
+                kb.listener.stop()
+                kb.listener = None
+            print(
+                "  Keyboard (O3D): w/s=fwd/back  a/d=turn  "
+                "space=pause  r=reset  x=toggle  esc=quit"
+            )
+            print("  Focus the 3D window to drive.")
+
     # ── simulation loop ───────────────────────────────────────────────────────
     print(f"Running (max {args.steps} steps) — Ctrl-C to stop ...")
 
@@ -395,6 +471,26 @@ def main() -> None:
             prev_x = float(robot.state[0, 0])
             prev_y = float(robot.state[1, 0])
             print(f"  [step {step}] manual reset")
+
+        # Apply O3D key state to keyboard velocity before stepping.
+        # Key callbacks fired during the previous vis.poll_events(); one-step
+        # lag is imperceptible at normal simulation rates.
+        if o3d_keys and kb is not None and env._world_param.control_mode == "keyboard":
+            lv = (
+                kb.key_lv_max
+                if o3d_keys["w"]
+                else -kb.key_lv_max
+                if o3d_keys["s"]
+                else 0.0
+            )
+            ang = (
+                kb.key_ang_max
+                if o3d_keys["a"]
+                else -kb.key_ang_max
+                if o3d_keys["d"]
+                else 0.0
+            )
+            kb.key_vel = np.array([[lv], [ang], [0.0]])
 
         env.step()
 
