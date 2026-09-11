@@ -1,0 +1,54 @@
+# Slamtec RPLiDAR A3 — 360 deg, 10 Hz, 25 m, 0.5 deg resolution
+world:
+  height: 30
+  width: 30
+  step_time: 0.1     # 10 Hz scan rate
+  sample_time: 0.1
+  collision_mode: 'stop'
+  control_mode: 'auto'
+
+robot:
+  - kinematics: {name: 'diff'}
+    shape: {name: 'circle', radius: 0.2}
+    state: [1, 1, 0]
+    goal: [28, 28, 0]
+    behavior: {name: 'dash'}
+    sensors:
+      - name: 'lidar2d'
+        range_min: 0.1       # 10 cm dead zone
+        range_max: 25.0      # 25 m max range
+        angle_range: 6.2832  # 360 deg full sweep
+        number: 720          # 0.5 deg angular resolution
+        noise: True
+        std: 0.02            # 20 mm range noise (1-sigma)
+        angle_std: 0.009     # ~0.5 deg angular noise
+        offset: [0, 0, 0]
+        plot:
+          alpha: 0.3
+
+obstacle:
+  # Perimeter boundary wall
+  - shape: {name: 'linestring', vertices: [[0.2, 0.2], [29.8, 0.2], [29.8, 29.8], [0.2, 29.8], [0.2, 0.2]]}
+    state: [0, 0, 0]
+  # Room dividers — horizontal
+  - shape: {name: 'linestring', vertices: [[0.2, 14], [13, 14]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[16, 14], [29.8, 14]]}
+    state: [0, 0, 0]
+  # Room dividers — vertical
+  - shape: {name: 'linestring', vertices: [[14, 0.2], [14, 10]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[14, 14], [14, 29.8]]}
+    state: [0, 0, 0]
+  # Furniture / equipment blocks
+  - shape: {name: 'rectangle', length: 3.0, width: 1.5}
+    state: [5, 20, 0.4]
+  - shape: {name: 'rectangle', length: 2.0, width: 3.0}
+    state: [22, 7, 0.8]
+  - shape: {name: 'rectangle', length: 4.0, width: 1.0}
+    state: [20, 24, 0]
+  # Pillars
+  - shape: {name: 'circle', radius: 0.8}
+    state: [7, 7, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [22, 22, 0]

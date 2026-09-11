@@ -1,0 +1,55 @@
+# YDLiDAR G4 — 360 deg, 9 Hz, 16 m, 0.5 deg resolution
+world:
+  height: 20
+  width: 20
+  step_time: 0.111   # 9 Hz scan rate
+  sample_time: 0.111
+  collision_mode: 'stop'
+  control_mode: 'auto'
+
+robot:
+  - kinematics: {name: 'diff'}
+    shape: {name: 'circle', radius: 0.2}
+    state: [1, 1, 0]
+    goal: [18, 18, 0]
+    behavior: {name: 'dash'}
+    sensors:
+      - name: 'lidar2d'
+        range_min: 0.28      # 28 cm dead zone
+        range_max: 16.0      # 16 m max range
+        angle_range: 6.2832  # 360 deg full sweep
+        number: 720          # 0.5 deg angular resolution
+        noise: True
+        std: 0.02            # 20 mm range noise (1-sigma)
+        angle_std: 0.009     # ~0.5 deg angular noise
+        offset: [0, 0, 0]
+        plot:
+          alpha: 0.3
+
+obstacle:
+  # Perimeter boundary wall
+  - shape: {name: 'linestring', vertices: [[0.2, 0.2], [19.8, 0.2], [19.8, 19.8], [0.2, 19.8], [0.2, 0.2]]}
+    state: [0, 0, 0]
+  # Room dividers
+  - shape: {name: 'linestring', vertices: [[0.2, 9], [10, 9]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[13, 9], [19.8, 9]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[9, 0.2], [9, 6]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[9, 10], [9, 19.8]]}
+    state: [0, 0, 0]
+  # Furniture / objects
+  - shape: {name: 'rectangle', length: 2.5, width: 1.0}
+    state: [4, 14, 0.4]
+  - shape: {name: 'rectangle', length: 1.5, width: 2.0}
+    state: [15, 5, 0.8]
+  - shape: {name: 'rectangle', length: 3.0, width: 0.8}
+    state: [14, 16, 0]
+  # Pillars
+  - shape: {name: 'circle', radius: 0.6}
+    state: [4, 3, 0]
+  - shape: {name: 'circle', radius: 0.5}
+    state: [12, 4, 0]
+  - shape: {name: 'circle', radius: 0.7}
+    state: [17, 11, 0]

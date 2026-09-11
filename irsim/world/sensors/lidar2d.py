@@ -1,5 +1,5 @@
 from math import cos, pi, sin
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import matplotlib.transforms as mtransforms
 import numpy as np
@@ -31,6 +31,11 @@ if TYPE_CHECKING:
 class Lidar2D:
     """
     Simulates a 2D Lidar sensor for detecting obstacles in the environment.
+
+    A set of named product profiles matching widely available 2D LiDAR hardware
+    is available via :attr:`PROFILES` and :meth:`from_profile`::
+
+        sensor = Lidar2D.from_profile("rplidar_a1m8", state=robot.state, obj_id=robot.id)
 
     Args:
         state (np.ndarray): Initial state of the sensor.
@@ -77,6 +82,149 @@ class Lidar2D:
         - plot_line_list (list): List storing plot lines for visualization purposes.
         - plot_text_list (list): List storing plot text elements for visualization purposes.
     """
+
+    # Named product profiles: {name: {range_min, range_max, angle_range, number, scan_time, std, description}}
+    PROFILES: ClassVar[dict[str, dict[str, Any]]] = {
+        # Slamtec RPLiDAR
+        "rplidar_a1m8": {
+            "range_min": 0.15,
+            "range_max": 12.0,
+            "angle_range": 2 * pi,
+            "number": 360,
+            "scan_time": 0.182,
+            "std": 0.03,
+            "description": "Slamtec RPLiDAR A1M8 — 360° / 12 m / 5.5 Hz",
+        },
+        "rplidar_a3": {
+            "range_min": 0.1,
+            "range_max": 25.0,
+            "angle_range": 2 * pi,
+            "number": 720,
+            "scan_time": 0.1,
+            "std": 0.02,
+            "description": "Slamtec RPLiDAR A3 — 360° / 25 m / 10 Hz",
+        },
+        "rplidar_s2": {
+            "range_min": 0.05,
+            "range_max": 30.0,
+            "angle_range": 2 * pi,
+            "number": 720,
+            "scan_time": 0.067,
+            "std": 0.015,
+            "description": "Slamtec RPLiDAR S2 — 360° / 30 m / 15 Hz",
+        },
+        # Hokuyo
+        "hokuyo_urg04lx": {
+            "range_min": 0.06,
+            "range_max": 4.095,
+            "angle_range": 4.189,  # 240 deg
+            "number": 682,
+            "scan_time": 0.1,
+            "std": 0.03,
+            "description": "Hokuyo URG-04LX — 240° / 4 m / 10 Hz",
+        },
+        "hokuyo_utm30lx": {
+            "range_min": 0.1,
+            "range_max": 30.0,
+            "angle_range": 4.712,  # 270 deg
+            "number": 1081,
+            "scan_time": 0.025,
+            "std": 0.03,
+            "description": "Hokuyo UTM-30LX — 270° / 30 m / 40 Hz",
+        },
+        # SICK
+        "sick_lms111": {
+            "range_min": 0.5,
+            "range_max": 20.0,
+            "angle_range": 4.712,  # 270 deg
+            "number": 541,
+            "scan_time": 0.04,
+            "std": 0.015,
+            "description": "SICK LMS111 — 270° / 20 m / 25 Hz",
+        },
+        "sick_lms511": {
+            "range_min": 0.1,
+            "range_max": 80.0,
+            "angle_range": 3.316,  # 190 deg
+            "number": 761,
+            "scan_time": 0.04,
+            "std": 0.025,
+            "description": "SICK LMS511 — 190° / 80 m / 25 Hz",
+        },
+        "sick_tim571": {
+            "range_min": 0.05,
+            "range_max": 25.0,
+            "angle_range": 4.712,  # 270 deg
+            "number": 811,
+            "scan_time": 0.067,
+            "std": 0.02,
+            "description": "SICK TIM571 — 270° / 25 m / 15 Hz",
+        },
+        "sick_nav310": {
+            "range_min": 0.5,
+            "range_max": 250.0,
+            "angle_range": 2 * pi,  # 360 deg
+            "number": 720,
+            "scan_time": 0.125,
+            "std": 0.025,
+            "description": "SICK NAV310 — 360° / 250 m / 8 Hz",
+        },
+        # YDLiDAR
+        "ydlidar_x4": {
+            "range_min": 0.12,
+            "range_max": 10.0,
+            "angle_range": 2 * pi,
+            "number": 720,
+            "scan_time": 0.1,
+            "std": 0.02,
+            "description": "YDLiDAR X4 — 360° / 10 m / 6-12 Hz",
+        },
+        "ydlidar_tg15": {
+            "range_min": 0.02,
+            "range_max": 15.0,
+            "angle_range": 2 * pi,
+            "number": 720,
+            "scan_time": 0.067,
+            "std": 0.02,
+            "description": "YDLiDAR TG15 — 360° / 15 m / 10-20 Hz",
+        },
+        "ydlidar_g4": {
+            "range_min": 0.28,
+            "range_max": 16.0,
+            "angle_range": 2 * pi,
+            "number": 720,
+            "scan_time": 0.111,
+            "std": 0.02,
+            "description": "YDLiDAR G4 — 360° / 16 m / 9 Hz",
+        },
+    }
+
+    @classmethod
+    def from_profile(
+        cls,
+        name: str,
+        state: "np.ndarray | None" = None,
+        obj_id: int = 0,
+        **overrides: Any,
+    ) -> "Lidar2D":
+        """Construct a Lidar2D from a named product profile.
+
+        Args:
+            name: Profile key from :attr:`PROFILES` (e.g. ``"rplidar_a1m8"``).
+            state: Initial state of the parent object.
+            obj_id: ID of the associated object.
+            **overrides: Override any profile parameter (e.g. ``range_max=8.0``).
+
+        Returns:
+            A new :class:`Lidar2D` initialised with the profile's parameters.
+        """
+        if name not in cls.PROFILES:
+            raise ValueError(
+                f"Unknown lidar2d profile {name!r}. Available: {list(cls.PROFILES)}"
+            )
+        params = {k: v for k, v in cls.PROFILES[name].items() if k != "description"}
+        params.update(overrides)
+        return cls(state=state, obj_id=obj_id, **params)
 
     def __init__(
         self,

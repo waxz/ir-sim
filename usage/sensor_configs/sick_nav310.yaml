@@ -1,0 +1,48 @@
+# SICK NAV310 — 360 deg, 8 Hz, 250 m, 0.5 deg resolution (outdoor navigation)
+world:
+  height: 50
+  width: 50
+  step_time: 0.125   # 8 Hz scan rate
+  sample_time: 0.125
+  collision_mode: 'stop'
+  control_mode: 'auto'
+
+robot:
+  - kinematics: {name: 'diff'}
+    shape: {name: 'circle', radius: 0.4}
+    state: [2, 2, 0]
+    goal: [48, 48, 0]
+    behavior: {name: 'dash'}
+    sensors:
+      - name: 'lidar2d'
+        range_min: 0.5       # 50 cm dead zone
+        range_max: 80.0      # practical range in simulator (full 250 m exceeds world size)
+        angle_range: 6.2832  # 360 deg full sweep
+        number: 720          # 0.5 deg angular resolution
+        noise: True
+        std: 0.025           # 25 mm range noise (1-sigma)
+        angle_std: 0.009     # ~0.5 deg angular noise
+        offset: [0, 0, 0]
+        plot:
+          alpha: 0.2
+
+obstacle:
+  # Perimeter boundary wall
+  - shape: {name: 'linestring', vertices: [[0.5, 0.5], [49.5, 0.5], [49.5, 49.5], [0.5, 49.5], [0.5, 0.5]]}
+    state: [0, 0, 0]
+  # Wide-area feature markers (reflectors / walls)
+  - shape: {name: 'linestring', vertices: [[10, 0.5], [10, 20]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[30, 30], [30, 49.5]]}
+    state: [0, 0, 0]
+  - shape: {name: 'linestring', vertices: [[20, 25], [40, 25]]}
+    state: [0, 0, 0]
+  # Large structures
+  - shape: {name: 'rectangle', length: 6.0, width: 3.0}
+    state: [40, 10, 0.2]
+  - shape: {name: 'rectangle', length: 4.0, width: 4.0}
+    state: [12, 40, 0.5]
+  - shape: {name: 'circle', radius: 2.0}
+    state: [25, 12, 0]
+  - shape: {name: 'circle', radius: 1.5}
+    state: [38, 38, 0]
