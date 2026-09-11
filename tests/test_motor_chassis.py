@@ -114,8 +114,35 @@ class TestMotorEncoder:
         m = Motor()
         m.step(0.5, dt=0.01)
         enc = m.get_encoder()
-        for key in ("ticks", "theta_output", "omega_output", "current", "omega_motor"):
+        for key in (
+            "ticks",
+            "theta_output",
+            "omega_output",
+            "current",
+            "omega_motor",
+            "tick_delta",
+            "velocity_estimate",
+        ):
             assert key in enc
+
+    def test_velocity_estimate_quantized(self):
+        m = Motor(profile="small_dc")
+        dt = 0.01
+        for _ in range(200):
+            m.step(0.8, dt=dt)
+        enc = m.get_encoder()
+        resolution = 2 * math.pi / (m.cpr * dt)
+        # velocity_estimate must be an integer multiple of the resolution
+        ratio = enc["velocity_estimate"] / resolution
+        assert abs(ratio - round(ratio)) < 1e-9
+
+    def test_velocity_estimate_reset(self):
+        m = Motor(profile="small_dc")
+        for _ in range(100):
+            m.step(1.0, dt=0.01)
+        m.reset()
+        assert m.velocity_estimate == 0.0
+        assert m._tick_delta == 0
 
     def test_reset_clears_encoder(self):
         m = Motor()

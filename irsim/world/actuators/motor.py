@@ -112,6 +112,9 @@ class Motor:
         omega_output (float): Current output-shaft angular velocity (rad/s).
         theta_output (float): Cumulative output-shaft angle (rad).
         encoder_ticks (int): Cumulative encoder tick count.
+        velocity_estimate (float): Tick-delta velocity estimate (rad/s, output shaft).
+            Quantised to ``2*pi / (cpr * dt)`` rad/s per tick -- mirrors real
+            encoder hardware that counts ticks between sample periods.
     """
 
     # ── Named motor presets ────────────────────────────────────────────────────
@@ -318,6 +321,11 @@ class Motor:
         # Derived (updated each step)
         self._omega_output_prev: float = 0.0
 
+        # Encoder velocity estimation (tick-delta method)
+        self._prev_ticks: int = 0
+        self._tick_delta: int = 0
+        self.velocity_estimate: float = 0.0  # output-shaft rad/s, from tick delta
+
     # ── Properties ────────────────────────────────────────────────────────────
 
     @property
@@ -354,6 +362,13 @@ class Motor:
         V = self._command_to_voltage(float(command), dt)
         V = float(np.clip(V, -self.V_max, self.V_max))
         self._integrate(V, dt)
+
+        # Tick-delta velocity estimation (matches real encoder hardware)
+        new_ticks = self.encoder_ticks
+        self._tick_delta = new_ticks - self._prev_ticks
+        self.velocity_estimate = self._tick_delta * _TWO_PI / (self.cpr * dt)
+        self._prev_ticks = new_ticks
+
         return self.omega_output
 
     def get_encoder(self) -> dict[str, float | int]:
@@ -362,11 +377,13 @@ class Motor:
         Returns:
             dict with keys:
 
-            * ``ticks``       — cumulative integer tick count.
-            * ``theta_output``— cumulative output-shaft angle (rad).
-            * ``omega_output``— output-shaft angular velocity (rad/s).
-            * ``current``     — armature current (A).
-            * ``omega_motor`` — motor-shaft angular velocity (rad/s).
+            * ``ticks``            — cumulative integer tick count.
+            * ``theta_output``     — cumulative output-shaft angle (rad).
+            * ``omega_output``     — output-shaft angular velocity (rad/s).
+            * ``current``          — armature current (A).
+            * ``omega_motor``      — motor-shaft angular velocity (rad/s).
+            * ``tick_delta``       — tick increment in the last step.
+            * ``velocity_estimate``— velocity from tick-delta method (rad/s).
         """
         return {
             "ticks": self.encoder_ticks,
@@ -374,6 +391,8 @@ class Motor:
             "omega_output": self.omega_output,
             "current": self.current,
             "omega_motor": self.omega,
+            "tick_delta": self._tick_delta,
+            "velocity_estimate": self.velocity_estimate,
         }
 
     def reset(self) -> None:
@@ -382,6 +401,9 @@ class Motor:
         self.omega = 0.0
         self._theta_motor = 0.0
         self._vel_pid.reset()
+        self._prev_ticks = 0
+        self._tick_delta = 0
+        self.velocity_estimate = 0.0
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
