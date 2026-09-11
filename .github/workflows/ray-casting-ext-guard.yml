@@ -4,7 +4,7 @@ name: Ray-Casting Extension Guard
 # - Linux x86-64: OMP + AVX2 both available
 # - macOS x86-64:  OMP + AVX2 both available (march=native enables AVX2)
 # - macOS arm64:   OMP available, AVX2 unavailable (no AVX2 on Apple Silicon)
-# - Windows x64:   OMP available, AVX2 unavailable (no /arch:AVX2 by default)
+# - Windows x64:   OMP + AVX2 both available (IsProcessorFeaturePresent detects AVX2)
 # - Fallback test: with NO compiler, both unavailable → NumPy kernel used
 
 on:
@@ -37,9 +37,9 @@ jobs:
             expect_omp: "true"
             expect_avx2: "false"
           - os: windows-latest
-            label: "Windows x64 (OMP only, no /arch:AVX2)"
+            label: "Windows x64 (OMP+AVX2 via IsProcessorFeaturePresent)"
             expect_omp: "true"
-            expect_avx2: "false"
+            expect_avx2: "true"
 
     steps:
       - uses: actions/checkout@v4
