@@ -39,9 +39,9 @@ dependencies = [
 
 [project.optional-dependencies]
 keyboard = ['pynput']
-lidar3d = ['open3d>=0.19.0', 'trimesh>=5.1.0', 'rtree>=1.4.1']
+lidar3d = ['open3d>=0.19.0']
 foxglove = ['foxglove-websocket>=0.1.4']
-all = ['pynput', 'imageio[ffmpeg]', 'pyrvo', 'open3d>=0.19.0', 'trimesh>=5.1.0', 'rtree>=1.4.1', 'foxglove-websocket>=0.1.4']
+all = ['pynput', 'imageio[ffmpeg]', 'pyrvo', 'open3d>=0.19.0', 'foxglove-websocket>=0.1.4']
 
 [dependency-groups]
 docs = [
