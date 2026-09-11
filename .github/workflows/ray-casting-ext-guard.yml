@@ -58,7 +58,9 @@ jobs:
         run: uv sync --dev
 
       - name: Build C extension
-        run: uv run python setup.py build_ext --inplace
+        run: |
+          uv pip install setuptools
+          uv run python setup.py build_ext --inplace
 
       - name: Verify OMP and AVX2 availability
         shell: python
