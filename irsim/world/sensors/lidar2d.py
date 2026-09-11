@@ -305,11 +305,18 @@ class Lidar2D:
 
         try:
             from irsim.lib.algorithm.ray_casting_2d_omp import (
+                cast_ray_segments_avx2,
                 cast_ray_segments_omp,
+                is_avx2_available,
                 is_omp_available,
             )
 
-            self._omp_cast = cast_ray_segments_omp if is_omp_available() else None
+            if is_avx2_available():
+                self._omp_cast = cast_ray_segments_avx2
+            elif is_omp_available():
+                self._omp_cast = cast_ray_segments_omp
+            else:
+                self._omp_cast = None
         except ImportError:
             self._omp_cast = None
 
