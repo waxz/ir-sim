@@ -198,7 +198,8 @@ void bench_mc_midpoint(int n_trials, int n_steps, double dt,
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    for (int trial = 0; trial < n_trials; trial++) {
+    int trial;
+    for (trial = 0; trial < n_trials; trial++) {
         State st = {0};
         double sq_sum = 0.0;
         for (int i = 0; i < n_steps; i++) {

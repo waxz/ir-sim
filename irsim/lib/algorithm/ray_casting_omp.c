@@ -81,8 +81,11 @@ void cast_ray_segments_omp(
     double *out_ranges,
     int64_t *out_hit
 ) {
+    #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 32)
-    for (int i = 0; i < N; i++) {
+    #endif
+    int i;
+    for (i = 0; i < N; i++) {
         double dx  = directions[2*i];
         double dy  = directions[2*i + 1];
         double pdx = -dy;   /* perpendicular to beam */
@@ -190,8 +193,11 @@ void cast_ray_segments_avx2_soa(
     /* AVX2 block: process 4 beams per iteration */
     int avx_n = N & ~3;  /* round down to multiple of 4 */
 
+    #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 8)
-    for (int base = 0; base < avx_n; base += 4) {
+    #endif
+    int base;
+    for (base = 0; base < avx_n; base += 4) {
         __m256d dx_v  = _mm256_loadu_pd(dir_dx + base);
         __m256d dy_v  = _mm256_loadu_pd(dir_dy + base);
         /* perpendicular to each beam: pdx = -dy, pdy = dx */
