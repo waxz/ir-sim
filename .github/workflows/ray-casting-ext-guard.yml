@@ -68,6 +68,9 @@ jobs:
       - name: Smoke-test cast_ray_segments_avx2 fallback
         run: uv run python .github/scripts/smoke_test_avx2.py
 
+      - name: Benchmark ray-casting kernels
+        run: uv run python .github/scripts/bench_ray_casting.py
+
   fallback-no-compiler:
     name: "Fallback (no compiler → NumPy only)"
     runs-on: ubuntu-latest
