@@ -191,6 +191,9 @@ def build_omp_lib(force: bool = False) -> bool:
         _OMP_AVAILABLE = _lib is not None
     else:
         _OMP_AVAILABLE = False
+    if not _OMP_AVAILABLE:
+        global _AVX2_AVAILABLE
+        _AVX2_AVAILABLE = False
     return bool(_OMP_AVAILABLE)
 
 
@@ -309,7 +312,7 @@ def cast_ray_segments_avx2(
         ``(ranges, hit_index)`` with the same semantics as
         :func:`~irsim.lib.algorithm.ray_casting_2d.cast_ray_segments`.
     """
-    if not _AVX2_AVAILABLE:
+    if not _AVX2_AVAILABLE or _lib is None:
         return cast_ray_segments_omp(origin, directions, seg_start, seg_end, max_range)
 
     if len(seg_start) == 0:

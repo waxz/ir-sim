@@ -1,28 +1,57 @@
 /*
  * ray_casting_omp.c - OpenMP-parallel 2D ray-segment intersection kernels.
  *
- * Compile:
+ * Compile (Linux/macOS — uses native CPU features):
  *   gcc -O3 -march=native -fopenmp -shared -fPIC -o ray_casting_omp.so \
+ *       ray_casting_omp.c -lm
+ *
+ * Compile (explicit AVX2, portable to any AVX2 x86-64 host):
+ *   gcc -O3 -mavx2 -fopenmp -shared -fPIC -o ray_casting_omp.so \
  *       ray_casting_omp.c -lm
  *
  * Called from ray_casting_2d_omp.py via ctypes.  The function signature is
  * a plain-C ABI so no Python headers are required.
  *
- * Two kernels are provided:
- *   cast_ray_segments_omp       – scalar, OpenMP beam-parallel (AoS layout)
- *   cast_ray_segments_avx2_soa  – AVX2 SIMD 4-wide, OpenMP group-parallel
- *                                 (SoA layout); compiled only when __AVX2__ is
- *                                 defined by the compiler (-march=native or
- *                                 -mavx2).  Collinear ray-segment overlap is
- *                                 not handled in the AVX2 path (rare in
- *                                 practice); the OMP kernel covers that case.
+ * Kernel selection and platform fallback:
+ *
+ *   Platform           Kernel compiled       Python fallback chain
+ *   ─────────────────  ────────────────────  ─────────────────────────────────
+ *   x86-64 with AVX2   OMP + AVX2 SoA        AVX2 > OMP > NumPy
+ *   x86-64 no AVX2     OMP only              OMP > NumPy
+ *   x86-64 Windows     OMP + AVX2 (MSVC      AVX2 > OMP > NumPy
+ *                       /arch:AVX2 required)
+ *   AArch64 / Apple M  OMP only              OMP > NumPy
+ *   Any (no compiler)  (not compiled)        NumPy
+ *
+ * cast_ray_segments_avx2_soa:
+ *   AVX2 SIMD 4-wide, OpenMP group-parallel (SoA layout).
+ *   Compiled only on x86/x86-64 with __AVX2__ defined.
+ *   Collinear ray-segment overlap (denom==0 && cross≈0) is not handled
+ *   in this path — the scalar OMP kernel covers that rare case.
  */
 
 #include <math.h>
 #include <stdint.h>
 #include <float.h>
 
-#ifdef __AVX2__
+/*
+ * AVX2 SIMD path — x86/x86-64 only.
+ *
+ * The compound guard checks both the ISA extension (__AVX2__) *and* the CPU
+ * architecture family so that <immintrin.h> is never included on non-x86
+ * targets (AArch64, RISC-V, PowerPC, WASM, …).  When the guard is false,
+ * cast_ray_segments_avx2_soa is absent from the compiled binary and
+ * ray_casting_2d_omp.py falls back to cast_ray_segments_omp automatically.
+ *
+ * To add NEON support for AArch64 in the future:
+ *   #elif defined(__ARM_NEON__) && defined(__aarch64__)
+ *   #include <arm_neon.h>
+ *   // … 2-wide float64x2_t implementation …
+ */
+#if defined(__AVX2__) && \
+    (defined(__x86_64__) || defined(_M_X64) || \
+     defined(__i386__)   || defined(_M_IX86))
+#define _IRSIM_AVX2 1
 #include <immintrin.h>
 #endif
 
@@ -115,7 +144,7 @@ void cast_ray_segments_omp(
     }
 }
 
-#ifdef __AVX2__
+#ifdef _IRSIM_AVX2
 /*
  * cast_ray_segments_avx2_soa
  *
@@ -273,4 +302,4 @@ void cast_ray_segments_avx2_soa(
         }
     }
 }
-#endif /* __AVX2__ */
+#endif /* _IRSIM_AVX2 */

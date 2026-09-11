@@ -7,10 +7,18 @@ fallback in ``ray_casting_2d_omp.py`` is used instead.
 
 Platform flags
 --------------
-Linux   : gcc  -O3 -march=native -fopenmp
-macOS   : clang -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
-          (falls back to serial -O3 when libomp is not installed)
-Windows : cl.exe /O2 /openmp
+Linux / POSIX : gcc  -O3 -march=native -mavx2 -fopenmp
+                (-march=native already enables AVX2 on capable CPUs;
+                 -mavx2 is added explicitly so the C guard _IRSIM_AVX2
+                 is always defined when the hardware supports it)
+macOS         : clang -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
+                (falls back to serial -O3 when libomp is not installed;
+                 -march=native enables AVX2 on Intel Macs automatically,
+                 AArch64/Apple-Silicon has no AVX2 so only OMP path fires)
+Windows       : cl.exe /O2 /openmp [/arch:AVX2]
+                Set IRSIM_ENABLE_AVX2=1 to add /arch:AVX2 (requires an
+                AVX2-capable CPU; the resulting .pyd will crash at startup
+                on older hardware if set incorrectly).
 """
 
 from __future__ import annotations
@@ -51,12 +59,15 @@ class _OmpBuildExt(build_ext):
 
     def _apply_omp_flags(self, ext: Extension) -> None:
         if sys.platform == "win32":
-            ext.extra_compile_args = ["/O2", "/openmp"]
+            avx2_args = ["/arch:AVX2"] if os.environ.get("IRSIM_ENABLE_AVX2") else []
+            ext.extra_compile_args = ["/O2", "/openmp", *avx2_args]
             ext.extra_link_args = []
         elif sys.platform == "darwin":
             root = next((r for r in _LIBOMP_ROOTS if os.path.isdir(r)), None)
             if root:
                 ext.extra_compile_args = [
+                    "-O3",
+                    "-march=native",
                     "-Xpreprocessor",
                     "-fopenmp",
                     f"-I{root}/include",
@@ -69,11 +80,15 @@ class _OmpBuildExt(build_ext):
                 ]
             else:
                 # Build without OpenMP: still correct, just serial
-                ext.extra_compile_args = ["-O3"]
+                ext.extra_compile_args = ["-O3", "-march=native"]
                 ext.extra_link_args = []
         else:
-            # Linux / other POSIX with gcc/clang + libgomp
-            ext.extra_compile_args = ["-O3", "-march=native", "-fopenmp"]
+            # Linux / other POSIX with gcc/clang + libgomp.
+            # -mavx2 is explicit so _IRSIM_AVX2 is always defined when the CPU
+            # supports it; -march=native subsumes it on capable hosts but the
+            # explicit flag ensures the preprocessor guard fires even when a
+            # cross-compile or toolchain sets -march to something lower.
+            ext.extra_compile_args = ["-O3", "-march=native", "-mavx2", "-fopenmp"]
             ext.extra_link_args = ["-fopenmp"]
 
 
