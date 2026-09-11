@@ -95,6 +95,56 @@ class TestMotorVelocityMode:
             m.step(0.0, dt=0.001)
         assert abs(m.omega_output) < 0.5
 
+    def test_set_mode_switches_command_mode(self):
+        m = Motor(profile="small_dc")
+        assert m.command_mode == "pwm"
+        m.set_mode("velocity")
+        assert m.command_mode == "velocity"
+
+    def test_set_mode_resets_pid(self):
+        m = Motor(profile="agv_hub_motor")
+        for _ in range(200):
+            m.step(5.0, dt=0.001)
+        m.set_mode("position")
+        assert m._vel_pid._integral == 0.0
+
+    def test_set_mode_unknown_raises(self):
+        m = Motor()
+        with pytest.raises(ValueError, match="Unknown command_mode"):
+            m.set_mode("cruise")
+
+    def test_pwm_motor_velocity_mode_after_set_mode(self):
+        """small_dc switched to velocity mode should reach the target."""
+        m = Motor(profile="small_dc")
+        m.set_mode("velocity")
+        target = 5.0  # rad/s output shaft (within ~13 rad/s no-load)
+        for _ in range(3000):
+            m.step(target, dt=0.001)
+        assert m.omega_output == pytest.approx(target, abs=0.5)
+
+    def test_all_profiles_velocity_mode_stable(self):
+        """Every profile should reach a non-zero speed in velocity mode."""
+        for name in Motor.PROFILES:
+            m = Motor(profile=name)
+            m.set_mode("velocity")
+            # Command 30% of no-load speed (rough estimate)
+            p = Motor.PROFILES[name]
+            Gdc = p["Kt"] / (p["Kt"] * p["Ke"] + p["Ra"] * p["b"]) / p["gear_ratio"]
+            target = 0.3 * Gdc * p["V_max"]
+            if target < 0.1:
+                continue
+            for _ in range(5000):
+                m.step(target, dt=0.001)
+            assert m.omega_output == pytest.approx(target, abs=target * 0.15 + 0.1), (
+                f"{name}: omega={m.omega_output:.3f} target={target:.3f}"
+            )
+
+    def test_pos_Kp_loaded_from_profile(self):
+        for name in Motor.PROFILES:
+            if "pos_Kp" in Motor.PROFILES[name]:
+                m = Motor(profile=name)
+                assert m._pos_Kp == pytest.approx(Motor.PROFILES[name]["pos_Kp"])
+
 
 class TestMotorEncoder:
     def test_encoder_ticks_increase_with_rotation(self):

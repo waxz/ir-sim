@@ -109,6 +109,7 @@ class Motor:
     Attributes:
         omega (float): Current motor-shaft angular velocity (rad/s).
         current (float): Current armature current (A).
+        command_mode (str): Active command mode; change via :meth:`set_mode`.
         omega_output (float): Current output-shaft angular velocity (rad/s).
         theta_output (float): Cumulative output-shaft angle (rad).
         encoder_ticks (int): Cumulative encoder tick count.
@@ -128,8 +129,10 @@ class Motor:
     PROFILES: ClassVar[dict[str, dict[str, Any]]] = {
         # ── small_dc ────────────────────────────────────────────────────────────
         # Generic 12 V brushed gearmotor (e.g., GA25-370, ~46:1).
-        # Motor shaft: ~6800 RPM no-load → ω_nl ≈ 712 rad/s.
+        # Motor shaft: ~6800 RPM no-load → omega_nl ~= 712 rad/s.
         # Output shaft: ~148 RPM, stall torque ~0.8 N·m.
+        # Velocity-mode PID (dt=1 ms): tau_m=71 ms >> dt; Kp_max ~= 129.
+        # Kp=10 targets z_cl ~= 0.83 (~15 ms settling).
         "small_dc": {
             "Ra": 4.8,
             "La": 4e-4,
@@ -142,16 +145,17 @@ class Motor:
             "gear_ratio": 46.0,
             "cpr": 2048,
             "command_mode": "pwm",
-            "pid_Kp": 1.5,
-            "pid_Ki": 0.4,
-            "pid_Kd": 0.02,
+            "pid_Kp": 10.0,
+            "pid_Ki": 2.0,
+            "pid_Kd": 0.05,
+            "pos_Kp": 5.0,
         },
         # ── agv_hub_motor ───────────────────────────────────────────────────────
         # BLDC hub motor, 24 V, direct drive (gear_ratio = 1).
         # Output shaft: ~300 RPM no-load, rated torque ~7 N·m.
         #
-        # PID note: tau_m ≈ 0.26 ms < dt; the plant looks like a pure gain
-        # G ≈ 1.315 rad/s/V.  Stability requires Kp < 1/G ≈ 0.76; use 0.3.
+        # Velocity-mode PID (dt=1 ms): tau_m ~= 0.26 ms < dt; pure-gain plant
+        # G ~= 1.315 rad/s/V.  Stability requires Kp < 1/G ~= 0.76; use 0.3.
         "agv_hub_motor": {
             "Ra": 0.3,
             "La": 2e-3,
@@ -167,10 +171,13 @@ class Motor:
             "pid_Kp": 0.3,
             "pid_Ki": 0.1,
             "pid_Kd": 0.0,
+            "pos_Kp": 10.0,
         },
         # ── forklift_drive ──────────────────────────────────────────────────────
         # Heavy 48 V brushed motor + 20:1 chain drive.
         # Output shaft: ~150 RPM, stall torque ~50 N·m.
+        # Velocity-mode PID (dt=1 ms): tau_m=32 ms >> dt; Kp_max ~= 200.
+        # Kp=15 targets z_cl ~= 0.66 (~10 ms settling).
         "forklift_drive": {
             "Ra": 0.15,
             "La": 5e-4,
@@ -183,13 +190,15 @@ class Motor:
             "gear_ratio": 20.0,
             "cpr": 500,
             "command_mode": "pwm",
-            "pid_Kp": 2.0,
-            "pid_Ki": 0.3,
-            "pid_Kd": 0.05,
+            "pid_Kp": 15.0,
+            "pid_Ki": 2.0,
+            "pid_Kd": 0.1,
+            "pos_Kp": 5.0,
         },
         # ── dynamixel_xl430 ─────────────────────────────────────────────────────
         # ROBOTIS XL430-W250-T, 12 V, 46.13:1 planetary gear.
         # Output shaft: ~61 RPM no-load, stall torque 1.5 N·m.
+        # Velocity-mode PID (dt=1 ms): tau_m=1.82 ms ~= dt; Kp_max ~= 7.2.
         "dynamixel_xl430": {
             "Ra": 3.5,
             "La": 2e-4,
@@ -204,11 +213,14 @@ class Motor:
             "command_mode": "velocity",
             "pid_Kp": 3.0,
             "pid_Ki": 0.5,
-            "pid_Kd": 0.05,
+            "pid_Kd": 0.0,
+            "pos_Kp": 3.0,
         },
         # ── pololu_37d_50 ───────────────────────────────────────────────────────
         # Pololu 37D metal gearmotor, 12 V, 50:1.
         # Output shaft: ~130 RPM, 64 CPR motor x 50 = 3200 CPR wheel.
+        # Velocity-mode PID (dt=1 ms): tau_m=25 ms >> dt; Kp_max ~= 40.
+        # Kp=8 targets z_cl ~= 0.65 (~10 ms settling).
         "pololu_37d_50": {
             "Ra": 2.4,
             "La": 4e-4,
@@ -221,13 +233,16 @@ class Motor:
             "gear_ratio": 50.4,
             "cpr": 3200,
             "command_mode": "pwm",
-            "pid_Kp": 1.5,
-            "pid_Ki": 0.4,
-            "pid_Kd": 0.02,
+            "pid_Kp": 8.0,
+            "pid_Ki": 1.5,
+            "pid_Kd": 0.0,
+            "pos_Kp": 5.0,
         },
         # ── maxon_ec45_43 ───────────────────────────────────────────────────────
         # Maxon EC 45 flat (brushless) + GP42C 43:1 gearhead, 24 V.
         # Motor shaft: ~7800 RPM; output ~181 RPM; 2048 CPR motor → ~4096 effective.
+        # Velocity-mode PID (dt=1 ms): tau_m=1.36 ms ~= dt; Kp_max ~= 2.17.
+        # Kp=0.7 targets z_cl ~= 0.0 (deadbeat, ~2 ms settling).
         "maxon_ec45_43": {
             "Ra": 0.316,
             "La": 4e-5,
@@ -240,9 +255,10 @@ class Motor:
             "gear_ratio": 43.0,
             "cpr": 4096,
             "command_mode": "voltage",
-            "pid_Kp": 2.0,
-            "pid_Ki": 0.5,
-            "pid_Kd": 0.01,
+            "pid_Kp": 0.7,
+            "pid_Ki": 0.1,
+            "pid_Kd": 0.0,
+            "pos_Kp": 8.0,
         },
     }
 
@@ -287,6 +303,7 @@ class Motor:
             pid_Kp = p.get("pid_Kp", pid_Kp)
             pid_Ki = p.get("pid_Ki", pid_Ki)
             pid_Kd = p.get("pid_Kd", pid_Kd)
+            pos_Kp = p.get("pos_Kp", pos_Kp)
 
         if command_mode not in ("voltage", "pwm", "velocity", "position"):
             raise ValueError(
@@ -404,6 +421,29 @@ class Motor:
         self._prev_ticks = 0
         self._tick_delta = 0
         self.velocity_estimate = 0.0
+
+    def set_mode(self, mode: str) -> None:
+        """Switch command mode at runtime and reset controller state.
+
+        All motors support all four modes regardless of their profile default.
+        Switching resets the velocity PID integrator so the new mode starts
+        from a clean state.
+
+        Args:
+            mode: One of ``"voltage"``, ``"pwm"``, ``"velocity"``,
+                ``"position"``.
+
+        Raises:
+            ValueError: If ``mode`` is not a recognised command mode.
+        """
+        if mode not in ("voltage", "pwm", "velocity", "position"):
+            raise ValueError(
+                f"Unknown command_mode {mode!r}. "
+                "Use 'voltage', 'pwm', 'velocity', or 'position'."
+            )
+        self.command_mode = mode
+        self._vel_pid.reset()
+        self._omega_output_prev = 0.0
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
