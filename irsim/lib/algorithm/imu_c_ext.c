@@ -129,6 +129,93 @@ void strap_update(StrapState *st, double omega, double ax, double ay, double dt)
 }
 
 /*
+ * ── Incremental sim-step entry-points ─────────────────────────────────────
+ *
+ * Each function runs n sub-steps of the named algorithm starting from an
+ * arbitrary initial 5-D state [px, py, vx, vy, theta] and writes the final
+ * state to state_out[5].
+ *
+ * Designed for the real-time simulation loop where the simulator ticks at a
+ * low rate (e.g. 20 Hz, sim_dt = 0.05 s) but the IMU must integrate at a
+ * high rate (e.g. 1000 Hz, imu_dt = 0.001 s):
+ *
+ *   n = sim_dt / imu_dt  (e.g. 50)
+ *
+ * The imu_strap_step variant carries an 8-element state [px, py, vx, vy,
+ * theta, prev_alpha_x, prev_alpha_y, prev_phi] so the sculling history
+ * remains continuous across consecutive sim steps.
+ */
+
+IRSIM_API void imu_euler_step(
+    const double *state_in,   /* [px, py, vx, vy, theta] */
+    int n, double dt,
+    const double *omega, const double *ax, const double *ay,
+    double *state_out         /* [px, py, vx, vy, theta] */
+) {
+    State st = {state_in[0], state_in[1], state_in[2], state_in[3], state_in[4]};
+    int i;
+    for (i = 0; i < n; i++)
+        euler_update(&st, omega[i], ax[i], ay[i], dt);
+    state_out[0] = st.px;  state_out[1] = st.py;
+    state_out[2] = st.vx;  state_out[3] = st.vy;
+    state_out[4] = st.theta;
+}
+
+IRSIM_API void imu_midpoint_step(
+    const double *state_in,
+    int n, double dt,
+    const double *omega, const double *ax, const double *ay,
+    double *state_out
+) {
+    State st = {state_in[0], state_in[1], state_in[2], state_in[3], state_in[4]};
+    int i;
+    for (i = 0; i < n; i++)
+        midpoint_update(&st, omega[i], ax[i], ay[i], dt);
+    state_out[0] = st.px;  state_out[1] = st.py;
+    state_out[2] = st.vx;  state_out[3] = st.vy;
+    state_out[4] = st.theta;
+}
+
+IRSIM_API void imu_rk4_step(
+    const double *state_in,
+    int n, double dt,
+    const double *omega, const double *ax, const double *ay,
+    double *state_out
+) {
+    State st = {state_in[0], state_in[1], state_in[2], state_in[3], state_in[4]};
+    int i;
+    for (i = 0; i < n; i++)
+        rk4_update(&st, omega[i], ax[i], ay[i], dt);
+    state_out[0] = st.px;  state_out[1] = st.py;
+    state_out[2] = st.vx;  state_out[3] = st.vy;
+    state_out[4] = st.theta;
+}
+
+IRSIM_API void imu_strap_step(
+    const double *state_in,   /* [px, py, vx, vy, theta, prev_alpha_x, prev_alpha_y, prev_phi] */
+    int n, double dt,
+    const double *omega, const double *ax, const double *ay,
+    double *state_out         /* same 8-element layout */
+) {
+    StrapState st;
+    st.base.px = state_in[0];  st.base.py = state_in[1];
+    st.base.vx = state_in[2];  st.base.vy = state_in[3];
+    st.base.theta  = state_in[4];
+    st.prev_alpha_x = state_in[5];
+    st.prev_alpha_y = state_in[6];
+    st.prev_phi     = state_in[7];
+    int i;
+    for (i = 0; i < n; i++)
+        strap_update(&st, omega[i], ax[i], ay[i], dt);
+    state_out[0] = st.base.px;    state_out[1] = st.base.py;
+    state_out[2] = st.base.vx;    state_out[3] = st.base.vy;
+    state_out[4] = st.base.theta;
+    state_out[5] = st.prev_alpha_x;
+    state_out[6] = st.prev_alpha_y;
+    state_out[7] = st.prev_phi;
+}
+
+/*
  * ── Batch benchmark entry-points ──────────────────────────────────────────
  *
  * Each function runs N steps of the given algorithm on pre-computed IMU data

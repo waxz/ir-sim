@@ -29,6 +29,20 @@ void bench_mc_midpoint(int n_trials, int n_steps, double dt,
                        const double *omega, const double *ax, const double *ay,
                        double *rmse_out);
 
+/* Incremental sim-step entry-points (initial state → final state). */
+void imu_euler_step(const double *state_in, int n, double dt,
+                    const double *omega, const double *ax, const double *ay,
+                    double *state_out);
+void imu_midpoint_step(const double *state_in, int n, double dt,
+                       const double *omega, const double *ax, const double *ay,
+                       double *state_out);
+void imu_rk4_step(const double *state_in, int n, double dt,
+                  const double *omega, const double *ax, const double *ay,
+                  double *state_out);
+void imu_strap_step(const double *state_in, int n, double dt,
+                    const double *omega, const double *ax, const double *ay,
+                    double *state_out);
+
 static struct PyModuleDef _mod = {
     PyModuleDef_HEAD_INIT,
     "_imu_c_ext",

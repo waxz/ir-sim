@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal
 
 import numpy as np
 
-from irsim.util.random import rng
+from irsim.util.random import _generator as _rng_generator
 
 if TYPE_CHECKING:
     from irsim.world.object_base import ObjectBase
@@ -140,6 +140,7 @@ class IMU:
         gyro_bias_walk_std: float = 1.75e-4,
         accel_bias_walk_std: float = 1.96e-4,
         step_time: float = 0.001,
+        imu_rate: int = 0,
         noise: bool = True,
         noise_model: Literal["ieee517", "gaussian"] = "ieee517",
         profile: str | None = None,
@@ -154,6 +155,17 @@ class IMU:
         self.noise = noise
         self.step_time = step_time
         self.gravity = float(gravity)
+
+        # Sub-stepping: how many IMU ticks fit inside one sim step.
+        # imu_rate=0 (default) keeps the original single-step behaviour.
+        # imu_rate=1000 with step_time=0.05 gives n_sub=50 IMU ticks per sim tick.
+        imu_rate = int(imu_rate)
+        if imu_rate > 0:
+            self._n_sub: int = max(1, round(step_time * imu_rate))
+            self._imu_dt: float = step_time / self._n_sub
+        else:
+            self._n_sub = 1
+            self._imu_dt = step_time
 
         if noise_model not in ("ieee517", "gaussian"):
             raise ValueError(
@@ -201,6 +213,9 @@ class IMU:
         # Outputs — 3-D: [ωx, ωy, ωz] and [ax, ay, az]
         self.angular_velocity: np.ndarray = np.zeros(3)
         self.linear_acceleration: np.ndarray = np.array([0.0, 0.0, self.gravity])
+        # Batch outputs (n_sub, 3) — populated when n_sub > 1; None otherwise.
+        self.angular_velocity_batch: np.ndarray | None = None
+        self.linear_acceleration_batch: np.ndarray | None = None
 
         # Visualisation / compatibility stubs
         self.parent: ObjectBase | None = None
@@ -215,61 +230,103 @@ class IMU:
     def step(self, state: np.ndarray) -> None:
         """Update IMU measurements from the current parent state.
 
+        When ``imu_rate > 0`` was given at construction the step generates
+        ``n_sub`` independent noisy measurements by distributing the
+        ground-truth signal uniformly across all sub-steps and drawing
+        independent noise at the IMU rate.  The full batch is stored in
+        ``angular_velocity_batch`` / ``linear_acceleration_batch`` (shape
+        ``(n_sub, 3)``), and the scalar ``angular_velocity`` /
+        ``linear_acceleration`` attributes hold the last sub-step for
+        backward compatibility.
+
         Args:
             state (np.ndarray): Current [x, y, theta] from the parent object.
         """
         s = np.asarray(state).ravel()
         pos = s[:2]
         theta = float(s[2])
-        dt = self.step_time
+        sim_dt = self.step_time
+        imu_dt = self._imu_dt
+        _rng = _rng_generator()  # bypass proxy on hot path
 
-        # --- Ground-truth signals ---
-        # Gyro: for a 2-D ground robot ωx_true = ωy_true = 0, ωz_true = dθ/dt
-        omega_z_true = (theta - self._prev_theta) / dt
-        omega_true = np.array([0.0, 0.0, omega_z_true])
-
-        # Accel: derive world-frame acceleration from position finite differences
-        vel_world = (pos - self._prev_pos) / dt
+        # ── Ground-truth signals (constant across sub-steps for linear interp) ──
+        omega_z_true = (theta - self._prev_theta) / sim_dt
+        vel_world = (pos - self._prev_pos) / sim_dt
         dv_world = vel_world - self._prev_vel_world
-        accel_world_2d = dv_world / dt
+        accel_world_2d = dv_world / sim_dt
 
-        # Rotate world-frame 2-D accel to body frame
         c, s_theta = np.cos(theta), np.sin(theta)
-        R_inv = np.array([[c, s_theta], [-s_theta, c]])  # R(-theta)
+        R_inv = np.array([[c, s_theta], [-s_theta, c]])
         accel_body_2d = R_inv @ accel_world_2d
 
-        # az = +g for a level robot (gravity acts on the accelerometer)
+        omega_true = np.array([0.0, 0.0, omega_z_true])
         accel_true = np.array([accel_body_2d[0], accel_body_2d[1], self.gravity])
 
-        # --- Apply noise model ---
-        if self.noise:
-            sigma_g = self._N_g / np.sqrt(dt)
-            sigma_a = self._N_a / np.sqrt(dt)
+        n = self._n_sub
+
+        if not self.noise:
+            if n == 1:
+                omega_meas = omega_true.copy()
+                accel_meas = accel_true.copy()
+                self.angular_velocity_batch = None
+                self.linear_acceleration_batch = None
+            else:
+                omega_batch = np.broadcast_to(omega_true, (n, 3)).copy()
+                accel_batch = np.broadcast_to(accel_true, (n, 3)).copy()
+                self.angular_velocity_batch = omega_batch
+                self.linear_acceleration_batch = accel_batch
+                omega_meas = omega_batch[-1]
+                accel_meas = accel_batch[-1]
+        else:
+            sigma_g = self._N_g / np.sqrt(imu_dt)
+            sigma_a = self._N_a / np.sqrt(imu_dt)
 
             if self.noise_model == "ieee517":
-                # Advance bias random walk (all 3 axes)
-                self.gyro_bias += self._K_g * np.sqrt(dt) * rng.standard_normal(3)
-                self.accel_bias += self._K_a * np.sqrt(dt) * rng.standard_normal(3)
-                # White noise + bias
-                omega_meas = (
-                    omega_true + self.gyro_bias + sigma_g * rng.standard_normal(3)
-                )
-                accel_meas = (
-                    accel_true + self.accel_bias + sigma_a * rng.standard_normal(3)
-                )
-            else:  # gaussian — simple per-axis Gaussian, no drift
-                omega_meas = omega_true + sigma_g * rng.standard_normal(3)
-                accel_meas = accel_true + sigma_a * rng.standard_normal(3)
+                # Vectorised bias random walk: n increments at the IMU rate
+                dB_g = self._K_g * np.sqrt(imu_dt) * _rng.standard_normal((n, 3))
+                dB_a = self._K_a * np.sqrt(imu_dt) * _rng.standard_normal((n, 3))
+                # Bias at each sub-step: start from current stored bias
+                bias_g = self.gyro_bias + np.cumsum(dB_g, axis=0)
+                bias_a = self.accel_bias + np.cumsum(dB_a, axis=0)
+                # Advance stored bias to final state
+                self.gyro_bias = bias_g[-1].copy()
+                self.accel_bias = bias_a[-1].copy()
 
-            # Impulsive shock (bump / collision)
-            if self._shock_prob > 0.0 and float(rng.random()) < self._shock_prob:
-                accel_meas += self._shock_accel_std * rng.standard_normal(3)
-                omega_meas += self._shock_gyro_std * rng.standard_normal(3)
-        else:
-            omega_meas = omega_true.copy()
-            accel_meas = accel_true.copy()
+                omega_batch = (
+                    omega_true + bias_g + sigma_g * _rng.standard_normal((n, 3))
+                )
+                accel_batch = (
+                    accel_true + bias_a + sigma_a * _rng.standard_normal((n, 3))
+                )
+            else:  # gaussian
+                omega_batch = omega_true + sigma_g * _rng.standard_normal((n, 3))
+                accel_batch = accel_true + sigma_a * _rng.standard_normal((n, 3))
 
-        # Store outputs
+            # Impulsive shock — applied to a random sub-step
+            if self._shock_prob > 0.0:
+                shock_mask = _rng.random(n) < self._shock_prob
+                if shock_mask.any():
+                    omega_batch[shock_mask] += (
+                        self._shock_gyro_std
+                        * _rng.standard_normal((shock_mask.sum(), 3))
+                    )
+                    accel_batch[shock_mask] += (
+                        self._shock_accel_std
+                        * _rng.standard_normal((shock_mask.sum(), 3))
+                    )
+
+            if n == 1:
+                omega_meas = omega_batch[0]
+                accel_meas = accel_batch[0]
+                self.angular_velocity_batch = None
+                self.linear_acceleration_batch = None
+            else:
+                self.angular_velocity_batch = omega_batch
+                self.linear_acceleration_batch = accel_batch
+                omega_meas = omega_batch[-1]
+                accel_meas = accel_batch[-1]
+
+        # Store outputs (scalar — backward compat)
         self.angular_velocity = omega_meas
         self.linear_acceleration = accel_meas
 

@@ -333,5 +333,161 @@ class StrapdownIntegrator(IMUPoseEstimatorBase):
         return np.array([self.pos[0], self.pos[1], self.theta])
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. C-extension accelerated integrator (sub-step aware)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_ALGORITHMS = ("euler", "midpoint", "rk4", "strapdown")
+
+
+class CExtIntegrator(IMUPoseEstimatorBase):
+    """Pose estimator backed by the C+OpenMP batch integration library.
+
+    Accepts both a single IMU measurement (shape ``(3,)``) and a full batch
+    from an ``IMU`` running at a higher rate than the simulator (shape
+    ``(n_sub, 3)``).  When the batch interface is used (``imu_rate > 0`` on
+    the ``IMU`` sensor), all sub-steps are dispatched to C in a single call,
+    making the combined Python + C overhead effectively constant regardless
+    of ``n_sub``.
+
+    Falls back to :class:`MidpointIntegrator` transparently when the C
+    extension is not available or when the incremental entry-points are
+    absent from an older compiled library.
+
+    Args:
+        initial_state: ``[x, y, theta]`` starting pose.
+        dt: IMU sub-step timestep in seconds (e.g. ``1/imu_rate``).
+        initial_velocity: World-frame ``[vx, vy]`` (optional).
+        algorithm: One of ``"euler"``, ``"midpoint"`` (default), ``"rk4"``,
+            ``"strapdown"``.
+    """
+
+    name = "CExtMidpoint"
+
+    def __init__(
+        self,
+        initial_state: np.ndarray | list,
+        dt: float,
+        initial_velocity: np.ndarray | list | None = None,
+        algorithm: str = "midpoint",
+    ) -> None:
+        if algorithm not in _ALGORITHMS:
+            raise ValueError(
+                f"algorithm must be one of {_ALGORITHMS}, got '{algorithm}'"
+            )
+        super().__init__(initial_state, dt, initial_velocity)
+        self.name = f"CExt-{algorithm}"
+        self._algorithm = algorithm
+
+        # Probe C extension availability
+        self._c_ok = False
+        try:
+            from irsim.lib.algorithm.imu_c_integrators import (
+                _has_step_fn,
+                ensure_built,
+            )
+
+            fn_name = f"imu_{algorithm if algorithm != 'strapdown' else 'strap'}_step"
+            self._c_ok = ensure_built() and _has_step_fn(fn_name)
+        except Exception:
+            pass
+
+        # Internal 5-D (or 8-D for strapdown) C state vector
+        self._c_state: np.ndarray = self._make_c_state()
+
+        # Pure-Python fallback (shares no state with self)
+        if not self._c_ok:
+            self._fallback: IMUPoseEstimatorBase = MidpointIntegrator(
+                initial_state, dt, initial_velocity
+            )
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _make_c_state(self) -> np.ndarray:
+        """Build the flat C state vector from current Python state."""
+        s5 = np.array([self.pos[0], self.pos[1], self.vel[0], self.vel[1], self.theta])
+        if self._algorithm == "strapdown":
+            return np.append(s5, [0.0, 0.0, 0.0])
+        return s5
+
+    def _sync_from_c_state(self) -> None:
+        """Copy C state vector back into Python attributes."""
+        self.pos[0] = self._c_state[0]
+        self.pos[1] = self._c_state[1]
+        self.vel[0] = self._c_state[2]
+        self.vel[1] = self._c_state[3]
+        self.theta = (float(self._c_state[4]) + np.pi) % (2 * np.pi) - np.pi
+
+    @staticmethod
+    def _to_1d(_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (omega_z, ax, ay) 1-D arrays from (N,3) or (3,) inputs."""
+        raise NotImplementedError  # handled inline below
+
+    # ── main interface ─────────────────────────────────────────────────────────
+
+    def update(self, omega, accel_body: np.ndarray) -> np.ndarray:
+        """Integrate one or more IMU measurements and return the new pose.
+
+        Args:
+            omega: Angular velocity — scalar, ``(3,)``, or ``(n_sub, 3)``.
+            accel_body: Body-frame acceleration — ``(3,)`` or ``(n_sub, 3)``.
+
+        Returns:
+            ``[x, y, theta]`` after integrating all sub-steps.
+        """
+        omega_arr = np.asarray(omega, dtype=float)
+        accel_arr = np.asarray(accel_body, dtype=float)
+
+        # Normalise to 2-D: rows = sub-steps
+        if omega_arr.ndim == 1:
+            omega_arr = omega_arr[np.newaxis, :]
+        if accel_arr.ndim == 1:
+            accel_arr = accel_arr[np.newaxis, :]
+
+        omega_z = np.ascontiguousarray(omega_arr[:, -1])
+        ax = np.ascontiguousarray(accel_arr[:, 0])
+        ay = np.ascontiguousarray(accel_arr[:, 1])
+
+        if self._c_ok:
+            from irsim.lib.algorithm.imu_c_integrators import (
+                step_euler,
+                step_midpoint,
+                step_rk4,
+                step_strapdown,
+            )
+
+            _step_fns = {
+                "euler": step_euler,
+                "midpoint": step_midpoint,
+                "rk4": step_rk4,
+                "strapdown": step_strapdown,
+            }
+            self._c_state = _step_fns[self._algorithm](
+                self._c_state, self.dt, omega_z, ax, ay
+            )
+            self._sync_from_c_state()
+        else:
+            # Python fallback — process sub-steps one at a time
+            for k in range(len(omega_z)):
+                self._fallback.update(
+                    np.array([0.0, 0.0, omega_z[k]]),
+                    np.array([ax[k], ay[k], 0.0]),
+                )
+            self.pos = self._fallback.pos.copy()
+            self.vel = self._fallback.vel.copy()
+            self.theta = self._fallback.theta
+
+        pose = np.array([self.pos[0], self.pos[1], self.theta])
+        self.history_pos.append(self.pos.copy())
+        self.history_theta.append(self.theta)
+        return pose
+
+    def reset(self, initial_state: np.ndarray | list) -> None:
+        super().reset(initial_state)
+        self._c_state = self._make_c_state()
+        if not self._c_ok:
+            self._fallback.reset(initial_state)
+
+
 # ── Backward-compatible alias ──────────────────────────────────────────────────
 IMUPoseEstimator = MidpointIntegrator
