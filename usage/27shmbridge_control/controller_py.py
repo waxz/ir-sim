@@ -27,11 +27,11 @@ if os.path.isdir(_sb_src):
 import shmbridge  # noqa: E402
 
 SHM_NAME = "/irsim_shmbridge_demo"
-RATE_HZ = 40.0       # controller runs at 40 Hz (faster than sim 20 Hz)
-V_MAX = 1.0          # m/s
-OMEGA_MAX = 1.5      # rad/s
-K_ANG = 2.0          # proportional gain for heading error
-GOAL_TOL = 0.3       # stop within 0.3 m of goal
+RATE_HZ = 40.0  # controller runs at 40 Hz (faster than sim 20 Hz)
+V_MAX = 1.0  # m/s
+OMEGA_MAX = 1.5  # rad/s
+K_ANG = 2.0  # proportional gain for heading error
+GOAL_TOL = 0.3  # stop within 0.3 m of goal
 
 
 def bearing_error(state: shmbridge.RobotState) -> float:
@@ -78,8 +78,10 @@ def main() -> None:
 
         if state.reached or state.collision:
             status = "reached" if state.reached else "collision"
-            print(f"[ctrl-py] {status}  x={state.x:.2f}  y={state.y:.2f}"
-                  f"  step={state.step}")
+            print(
+                f"[ctrl-py] {status}  x={state.x:.2f}  y={state.y:.2f}"
+                f"  step={state.step}"
+            )
             break
 
         if state.step != last_step:
@@ -90,11 +92,13 @@ def main() -> None:
             last_step = state.step
 
             if state.step % 20 == 0:
-                print(f"[ctrl-py] step={state.step:4d}"
-                      f"  x={state.x:.2f}  y={state.y:.2f}"
-                      f"  h={math.degrees(state.heading):.1f}°"
-                      f"  dist={state.goal_dist:.2f}"
-                      f"  cmd=({cmd.linear:.2f},{cmd.angular:.2f})")
+                print(
+                    f"[ctrl-py] step={state.step:4d}"
+                    f"  x={state.x:.2f}  y={state.y:.2f}"
+                    f"  h={math.degrees(state.heading):.1f}°"
+                    f"  dist={state.goal_dist:.2f}"
+                    f"  cmd=({cmd.linear:.2f},{cmd.angular:.2f})"
+                )
 
         time.sleep(dt)
 

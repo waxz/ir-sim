@@ -47,6 +47,7 @@ SHM_NAME = "/irsim_test_integration"
 
 # ── backend-compatibility helpers ─────────────────────────────────────────
 
+
 def _make_state(**kwargs) -> RobotState:
     """Create a RobotState regardless of backend (dataclass vs C++ class)."""
     s = RobotState()
@@ -61,12 +62,19 @@ def _write_state(pub, robot_idx: int, state: RobotState) -> None:
         pub.write_state(robot_idx, state)
     else:
         pub.write_state(
-            x=state.x, y=state.y, heading=state.heading,
-            vx=state.vx, vy=state.vy, omega=state.omega,
-            goal_x=state.goal_x, goal_y=state.goal_y,
+            x=state.x,
+            y=state.y,
+            heading=state.heading,
+            vx=state.vx,
+            vy=state.vy,
+            omega=state.omega,
+            goal_x=state.goal_x,
+            goal_y=state.goal_y,
             goal_dist=state.goal_dist,
-            step=state.step, sim_time=state.sim_time,
-            reached=state.reached, collision=state.collision,
+            step=state.step,
+            sim_time=state.sim_time,
+            reached=state.reached,
+            collision=state.collision,
             robot_idx=robot_idx,
         )
 
@@ -77,6 +85,7 @@ def _read_state_spin(sub, robot_idx: int = 0, max_retries: int = 1000):
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def pub_sub():
@@ -91,6 +100,7 @@ def pub_sub():
 
 # ── unit tests ────────────────────────────────────────────────────────────
 
+
 def test_backend_available():
     """shmbridge must load (C++ or Python fallback)."""
     assert shmbridge._BACKEND in ("cpp", "python")
@@ -101,11 +111,19 @@ def test_state_round_trip(pub_sub):
     pub, sub = pub_sub
 
     s = _make_state(
-        x=1.5, y=2.5, heading=math.pi / 4,
-        vx=0.3, vy=0.0, omega=0.1,
-        goal_x=9.0, goal_y=9.0, goal_dist=math.sqrt(2) * 7.5,
-        step=42, sim_time=2.1,
-        reached=False, collision=False,
+        x=1.5,
+        y=2.5,
+        heading=math.pi / 4,
+        vx=0.3,
+        vy=0.0,
+        omega=0.1,
+        goal_x=9.0,
+        goal_y=9.0,
+        goal_dist=math.sqrt(2) * 7.5,
+        step=42,
+        sim_time=2.1,
+        reached=False,
+        collision=False,
     )
     _write_state(pub, 0, s)
 
@@ -129,11 +147,23 @@ def test_cmd_round_trip(pub_sub):
     pub, sub = pub_sub
 
     # Write an initial state so the segment is live.
-    _write_state(pub, 0, _make_state(
-        x=0, y=0, heading=0, vx=0, vy=0, omega=0,
-        goal_x=5, goal_y=5, goal_dist=7.07,
-        step=0, sim_time=0.0,
-    ))
+    _write_state(
+        pub,
+        0,
+        _make_state(
+            x=0,
+            y=0,
+            heading=0,
+            vx=0,
+            vy=0,
+            omega=0,
+            goal_x=5,
+            goal_y=5,
+            goal_dist=7.07,
+            step=0,
+            sim_time=0.0,
+        ),
+    )
 
     # Controller writes a command.
     sub.write_cmd(0, 0, 0.8, -0.3)
@@ -149,12 +179,23 @@ def test_multiple_state_writes(pub_sub):
     pub, sub = pub_sub
 
     for step in range(10):
-        _write_state(pub, 0, _make_state(
-            x=float(step) * 0.1, y=0.0, heading=0.0,
-            vx=0.5, vy=0.0, omega=0.0,
-            goal_x=9.0, goal_y=0.0, goal_dist=9.0 - step * 0.1,
-            step=step, sim_time=step * 0.05,
-        ))
+        _write_state(
+            pub,
+            0,
+            _make_state(
+                x=float(step) * 0.1,
+                y=0.0,
+                heading=0.0,
+                vx=0.5,
+                vy=0.0,
+                omega=0.0,
+                goal_x=9.0,
+                goal_y=0.0,
+                goal_dist=9.0 - step * 0.1,
+                step=step,
+                sim_time=step * 0.05,
+            ),
+        )
 
     state = _read_state_spin(sub, 0)
     assert state is not None
@@ -163,6 +204,7 @@ def test_multiple_state_writes(pub_sub):
 
 
 # ── integration test with irsim ───────────────────────────────────────────
+
 
 def _robot_to_state(robot, step: int, sim_time: float) -> RobotState:
     """Extract pose/velocity/goal from an ir-sim robot into a RobotState."""
@@ -264,9 +306,9 @@ def test_irsim_shm_control_loop():
         env.end()
 
     assert initial_dist is not None
-    final_dist = float(np.linalg.norm(
-        env.robot_list[0].state[:2].flatten() - np.array([9.0, 9.0])
-    ))
+    final_dist = float(
+        np.linalg.norm(env.robot_list[0].state[:2].flatten() - np.array([9.0, 9.0]))
+    )
     reduction = (initial_dist - final_dist) / initial_dist
     assert reduction > 0.30, (
         f"Robot should reduce goal distance by ≥30%, "

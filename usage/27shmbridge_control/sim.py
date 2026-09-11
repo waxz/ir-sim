@@ -34,6 +34,7 @@ def _publish_robot_state(pub, robot, step: int, sim_time: float) -> None:
     if shmbridge._BACKEND == "cpp":
         # C++ ShmPublisher.write_state(robot_idx, RobotState)
         import math as _m
+
         s = shmbridge.RobotState()
         st, vel = robot.state, robot.velocity
         s.x = float(st.item(0))
