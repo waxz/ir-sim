@@ -427,6 +427,93 @@ class AckermannKinematics(KinematicsHandler):
         )
 
 
+@register_kinematics("forklift")
+class ForkliftKinematics(DifferentialKinematics):
+    """Counterbalance forklift chassis using differential-drive body kinematics.
+
+    The forklift body moves with ``[linear, angular]`` velocity (same as
+    ``diff``).  A :class:`~irsim.lib.handler.wheel_handler.ForkliftWheelLayout`
+    is automatically attached unless the caller provides a custom ``wheel_layout``
+    kwarg.
+
+    Args:
+        name: Registered name (``"forklift"``).
+        noise: Enable motion noise.
+        alpha: Noise parameters.
+        wheel_layout: Pre-constructed WheelLayout instance or ``None`` to
+            auto-create a default :class:`ForkliftWheelLayout`.
+        **layout_kwargs: Additional keyword arguments forwarded to
+            :class:`~irsim.lib.handler.wheel_handler.ForkliftWheelLayout`
+            when auto-creating (e.g. ``wheel_radius``, ``track``).
+    """
+
+    def __init__(
+        self, name, noise=False, alpha=None, wheel_layout=None, **layout_kwargs
+    ):
+        super().__init__(name, noise, alpha)
+        if wheel_layout is None:
+            from irsim.lib.handler.wheel_handler import ForkliftWheelLayout
+
+            wheel_layout = ForkliftWheelLayout(**layout_kwargs)
+        self.attach_wheel_layout(wheel_layout)
+
+
+@register_kinematics("dual_steer")
+class DualSteerKinematics(OmniAngularKinematics):
+    """Tandem dual-steering AGV with holonomic ``[vx, vy, omega_z]`` control.
+
+    A :class:`~irsim.lib.handler.wheel_handler.DualSteerWheelLayout` is
+    automatically attached unless the caller provides a custom ``wheel_layout``.
+
+    Args:
+        name: Registered name (``"dual_steer"``).
+        noise: Enable motion noise.
+        alpha: Noise parameters.
+        wheel_layout: Pre-constructed WheelLayout instance or ``None`` to
+            auto-create a default :class:`DualSteerWheelLayout`.
+        **layout_kwargs: Additional keyword arguments forwarded to
+            :class:`~irsim.lib.handler.wheel_handler.DualSteerWheelLayout`.
+    """
+
+    def __init__(
+        self, name, noise=False, alpha=None, wheel_layout=None, **layout_kwargs
+    ):
+        super().__init__(name, noise, alpha)
+        if wheel_layout is None:
+            from irsim.lib.handler.wheel_handler import DualSteerWheelLayout
+
+            wheel_layout = DualSteerWheelLayout(**layout_kwargs)
+        self.attach_wheel_layout(wheel_layout)
+
+
+@register_kinematics("quad_steer")
+class QuadSteerKinematics(OmniAngularKinematics):
+    """Four-wheel independent steer+drive (swerve) chassis with ``[vx, vy, omega_z]`` control.
+
+    A :class:`~irsim.lib.handler.wheel_handler.QuadSteerWheelLayout` is
+    automatically attached unless the caller provides a custom ``wheel_layout``.
+
+    Args:
+        name: Registered name (``"quad_steer"``).
+        noise: Enable motion noise.
+        alpha: Noise parameters.
+        wheel_layout: Pre-constructed WheelLayout instance or ``None`` to
+            auto-create a default :class:`QuadSteerWheelLayout`.
+        **layout_kwargs: Additional keyword arguments forwarded to
+            :class:`~irsim.lib.handler.wheel_handler.QuadSteerWheelLayout`.
+    """
+
+    def __init__(
+        self, name, noise=False, alpha=None, wheel_layout=None, **layout_kwargs
+    ):
+        super().__init__(name, noise, alpha)
+        if wheel_layout is None:
+            from irsim.lib.handler.wheel_handler import QuadSteerWheelLayout
+
+            wheel_layout = QuadSteerWheelLayout(**layout_kwargs)
+        self.attach_wheel_layout(wheel_layout)
+
+
 class KinematicsFactory:
     """
     Factory class to create kinematics handlers.
@@ -442,15 +529,17 @@ class KinematicsFactory:
         role: str = "robot",
         *,
         shape_wheelbase: float | None = None,
+        wheel_layout: dict | None = None,
         **kwargs: Any,
     ) -> KinematicsHandler:
         """Create a kinematics handler from a YAML ``kinematics`` block.
 
         Args:
             name: Registered kinematics name: ``diff``, ``omni``, ``omni_angular``,
-                ``acker``, or a custom name registered with
-                :func:`register_kinematics`. ``None`` defaults to ``diff``;
-                ``static`` is retained as the static-object sentinel.
+                ``acker``, ``forklift``, ``dual_steer``, ``quad_steer``, or a
+                custom name registered with :func:`register_kinematics`. ``None``
+                defaults to ``diff``; ``static`` is retained as the
+                static-object sentinel.
             noise: Whether to apply motion noise.
             alpha: Noise parameters passed to the handler.
             mode: Steering mode of ``acker`` handlers; forwarded when given.
@@ -460,6 +549,11 @@ class KinematicsFactory:
             shape_wheelbase: Wheelbase taken from a car-like shape; the fallback
                 for ``acker`` handlers (default ``1.0``) when ``wheelbase`` is
                 not given.
+            wheel_layout: Optional dict with a ``"name"`` key (layout type) plus
+                layout-specific parameters to construct and attach a
+                :class:`~irsim.lib.handler.wheel_handler.WheelLayout`.
+                Example: ``{name: diff, wheel_radius: 0.033, track: 0.16}``.
+                When provided it overrides any layout auto-created by the handler.
             **kwargs: Any other ``kinematics`` key, forwarded to the handler's
                 ``__init__`` (a custom handler's own parameters).
 
@@ -471,22 +565,33 @@ class KinematicsFactory:
             TypeError: If the handler does not accept a forwarded parameter.
         """
         if name is None:
-            return DifferentialKinematics("diff", noise, alpha)
+            handler = DifferentialKinematics("diff", noise, alpha)
+        else:
+            name = name.lower()
+            if name == "static":
+                handler = DifferentialKinematics("static", noise, alpha)
+            else:
+                handler_cls = _kinematics_registry.get(name)
+                if handler_cls is None:
+                    raise NotImplementedError(f"Kinematics {name!r} is not registered")
+                if mode is not None:
+                    kwargs["mode"] = mode
+                if wheelbase is not None:
+                    kwargs["wheelbase"] = wheelbase
+                if issubclass(handler_cls, AckermannKinematics):
+                    kwargs.setdefault("wheelbase", shape_wheelbase or 1.0)
+                handler = handler_cls(name, noise, alpha, **kwargs)
 
-        name = name.lower()
-        if name == "static":
-            return DifferentialKinematics("static", noise, alpha)
+        if wheel_layout is not None:
+            from irsim.lib.handler.wheel_handler import WheelLayoutFactory
 
-        handler_cls = _kinematics_registry.get(name)
-        if handler_cls is None:
-            raise NotImplementedError(f"Kinematics {name!r} is not registered")
-        if mode is not None:
-            kwargs["mode"] = mode
-        if wheelbase is not None:
-            kwargs["wheelbase"] = wheelbase
-        if issubclass(handler_cls, AckermannKinematics):
-            kwargs.setdefault("wheelbase", shape_wheelbase or 1.0)
-        return handler_cls(name, noise, alpha, **kwargs)
+            layout_cfg = dict(wheel_layout)
+            layout_name = layout_cfg.pop("name", "diff")
+            handler.attach_wheel_layout(
+                WheelLayoutFactory.create(layout_name, **layout_cfg)
+            )
+
+        return handler
 
     @staticmethod
     def get_handler_class(name: str) -> type[KinematicsHandler] | None:

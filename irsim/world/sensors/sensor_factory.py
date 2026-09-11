@@ -2,9 +2,11 @@ from typing import Any
 
 import numpy as np
 
+from irsim.world.sensors.encoder import Encoder
 from irsim.world.sensors.fmcw_lidar2d import FMCWLidar2D
 from irsim.world.sensors.imu import IMU
 from irsim.world.sensors.lidar2d import Lidar2D
+from irsim.world.sensors.lidar3d import Lidar3D
 
 
 class SensorFactory:
@@ -12,7 +14,8 @@ class SensorFactory:
 
     The factory reads the ``name`` or ``type`` key from a sensor dictionary and
     creates the matching concrete sensor class. Currently supported names are
-    ``"lidar2d"``, ``"fmcw_lidar2d"``, and ``"imu"``.
+    ``"lidar2d"``, ``"fmcw_lidar2d"``, ``"imu"``, ``"encoder"``, and
+    ``"lidar3d"``.
     """
 
     def create_sensor(self, state: np.ndarray, obj_id: int, **kwargs: Any) -> Any:
@@ -37,4 +40,8 @@ class SensorFactory:
             return FMCWLidar2D(state, obj_id, **kwargs)
         if sensor_type == "imu":
             return IMU(state, obj_id, **kwargs)
+        if sensor_type == "encoder":
+            return Encoder(state, obj_id, **kwargs)
+        if sensor_type == "lidar3d":
+            return Lidar3D(state, obj_id, **kwargs)
         raise NotImplementedError(f"Sensor type {sensor_type} not implemented")
