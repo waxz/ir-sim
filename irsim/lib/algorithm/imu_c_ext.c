@@ -195,10 +195,10 @@ void bench_strap(int n, double dt,
 void bench_mc_midpoint(int n_trials, int n_steps, double dt,
                        const double *omega, const double *ax, const double *ay,
                        double *rmse_out) {
+    int trial;
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    int trial;
     for (trial = 0; trial < n_trials; trial++) {
         State st = {0};
         double sq_sum = 0.0;

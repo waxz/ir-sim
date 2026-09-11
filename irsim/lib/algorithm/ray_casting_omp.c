@@ -33,7 +33,9 @@
 #include <math.h>
 #include <stdint.h>
 #include <float.h>
-
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 /*
  * AVX2 SIMD path — x86/x86-64 only.
  *
@@ -81,10 +83,10 @@ void cast_ray_segments_omp(
     double *out_ranges,
     int64_t *out_hit
 ) {
+    int i;
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 32)
     #endif
-    int i;
     for (i = 0; i < N; i++) {
         double dx  = directions[2*i];
         double dy  = directions[2*i + 1];
@@ -193,10 +195,10 @@ void cast_ray_segments_avx2_soa(
     /* AVX2 block: process 4 beams per iteration */
     int avx_n = N & ~3;  /* round down to multiple of 4 */
 
+    int base;
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 8)
     #endif
-    int base;
     for (base = 0; base < avx_n; base += 4) {
         __m256d dx_v  = _mm256_loadu_pd(dir_dx + base);
         __m256d dy_v  = _mm256_loadu_pd(dir_dy + base);
