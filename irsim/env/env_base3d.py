@@ -53,4 +53,28 @@ class EnvBase3D(EnvBase):
                 self._world, self.objects, **self._world.plot_parse
             )
 
+        self._init_scene3d()
+
         env_param.objects = self.objects
+
+    def _init_scene3d(self) -> None:
+        """Build the open3d raycasting scene from the ``scene3d`` YAML block.
+
+        If a ``scene3d`` key is present in the config, a
+        :class:`~irsim.world.env3d.scene3d.Scene3D` is built and stored on
+        ``self._world.scene``.  All :class:`~irsim.world.sensors.lidar3d.Lidar3D`
+        sensors on every robot and obstacle are then assigned that scene
+        automatically so they can start scanning without manual wiring.
+        """
+        scene3d_cfg = self.env_config.parse.get("scene3d") or []
+        if not scene3d_cfg:
+            return
+
+        from irsim.world.env3d.scene3d import Scene3D
+
+        self._world.scene = Scene3D.from_config(scene3d_cfg)
+
+        for obj in self._robot_collection + self._obstacle_collection:
+            for sensor in getattr(obj, "sensors", []):
+                if getattr(sensor, "sensor_type", None) == "lidar3d":
+                    sensor.scene = self._world.scene

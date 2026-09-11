@@ -61,6 +61,8 @@ class EnvConfig:
             "gui": {},
             "robot": None,
             "obstacle": None,
+            # List of 3-D shape dicts consumed by EnvBase3D to build a Scene3D.
+            "scene3d": None,
             # Read from the YAML and handed back untouched, so a scenario can
             # carry the values a user's own code needs beside the ones IR-SIM
             # interprets.

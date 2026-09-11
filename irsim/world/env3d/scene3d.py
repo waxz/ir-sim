@@ -510,6 +510,80 @@ class Scene3D:
         return np.concatenate([pts, dists[:, None]], axis=1).astype(np.float32)
 
     # ------------------------------------------------------------------
+    # Config-driven construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_config(cls, items: list[dict]) -> Scene3D:
+        """Build a :class:`Scene3D` from a list of shape configuration dicts.
+
+        Each dict must have a ``type`` key selecting which primitive to add.
+        Accepted types and their keyword arguments mirror the ``add_*`` /
+        ``load_mesh`` method signatures:
+
+        =========== ============================================================
+        Type        Keys
+        =========== ============================================================
+        ``ground``  ``xmin``, ``xmax``, ``ymin``, ``ymax``; opt: ``resolution``,
+                    ``color``
+        ``box``     ``center`` [x,y,z], ``size`` [w,d,h]; opt: ``yaw``,
+                    ``color``, ``label``
+        ``wall``    ``start_xy`` [x,y], ``end_xy`` [x,y]; opt: ``height``,
+                    ``thickness``, ``openings``, ``color``, ``label``
+        ``car``     ``center_xy`` [x,y]; opt: ``yaw``, ``model``, ``color``,
+                    ``label``
+        ``mesh``    ``path``; opt: ``scale``, ``position`` [x,y,z], ``yaw``,
+                    ``color``, ``label``
+        =========== ============================================================
+
+        Example YAML block::
+
+            scene3d:
+              - type: ground
+                xmin: -20
+                xmax: 20
+                ymin: -20
+                ymax: 20
+              - type: box
+                center: [2, 3, 0.5]
+                size: [1, 1, 1]
+              - type: wall
+                start_xy: [0, 0]
+                end_xy: [10, 0]
+                height: 3.0
+              - type: mesh
+                path: obstacles/building.ply
+
+        Args:
+            items: List of shape configuration dicts, each with a ``type`` key.
+
+        Returns:
+            A new :class:`Scene3D` with all primitives added (not yet built).
+
+        Raises:
+            ValueError: If a dict carries an unknown ``type``.
+        """
+        scene = cls()
+        _DISPATCH = {
+            "ground": scene.add_ground,
+            "box": scene.add_box,
+            "wall": scene.add_wall,
+            "car": scene.add_car,
+            "mesh": scene.load_mesh,
+        }
+        for raw in items:
+            item = dict(raw)
+            shape_type = item.pop("type", None)
+            method = _DISPATCH.get(shape_type)  # type: ignore[arg-type]
+            if method is None:
+                raise ValueError(
+                    f"Unknown scene3d shape type: {shape_type!r}. "
+                    f"Available: {list(_DISPATCH)}"
+                )
+            method(**item)
+        return scene
+
+    # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
 

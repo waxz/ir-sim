@@ -1,10 +1,21 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 from irsim.world.world import World
 
+if TYPE_CHECKING:
+    from irsim.world.env3d.scene3d import Scene3D
+
 
 class World3D(World):
-    """3D world wrapper that extends :class:`~irsim.world.world.World` with z range."""
+    """3D world wrapper that extends :class:`~irsim.world.world.World` with z range.
+
+    Attr:
+        scene (Scene3D | None): Open3D raycasting scene built from the YAML
+            ``scene3d`` block.  Set by :class:`~irsim.env.env_base3d.EnvBase3D`
+            after construction; ``None`` until then.
+    """
 
     def __init__(
         self,
@@ -25,6 +36,7 @@ class World3D(World):
         super().__init__(name=name, **kwargs)
 
         self.depth = depth
+        self.scene: Scene3D | None = None
 
         if offset is None:
             offset = [0, 0, 0]
