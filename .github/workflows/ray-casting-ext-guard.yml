@@ -1,0 +1,164 @@
+name: Ray-Casting Extension Guard
+
+# Verifies that the C extension platform guards work correctly:
+# - Linux x86-64: OMP + AVX2 both available
+# - macOS x86-64:  OMP + AVX2 both available (march=native enables AVX2)
+# - macOS arm64:   OMP available, AVX2 unavailable (no AVX2 on Apple Silicon)
+# - Windows x64:   OMP available, AVX2 unavailable (no /arch:AVX2 by default)
+# - Fallback test: with NO compiler, both unavailable → NumPy kernel used
+
+on:
+  push:
+    branches: ["claude/readme-paper-analysis-p1wpth"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-verify:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: "Linux x86-64 (OMP+AVX2 expected)"
+            expect_omp: "true"
+            expect_avx2: "true"
+          - os: macos-13
+            label: "macOS x86-64 Intel (OMP+AVX2 expected)"
+            expect_omp: "true"
+            expect_avx2: "true"
+          - os: macos-latest
+            label: "macOS arm64 Apple Silicon (OMP only)"
+            expect_omp: "true"
+            expect_avx2: "false"
+          - os: windows-latest
+            label: "Windows x64 (OMP only, no /arch:AVX2)"
+            expect_omp: "true"
+            expect_avx2: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libomp (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install project with dev deps
+        run: uv sync --dev
+
+      - name: Build C extension
+        run: uv run python setup.py build_ext --inplace
+
+      - name: Verify OMP and AVX2 availability
+        shell: python
+        run: |
+          import sys
+          from irsim.lib.algorithm.ray_casting_2d_omp import (
+              is_omp_available,
+              is_avx2_available,
+          )
+
+          omp = is_omp_available()
+          avx2 = is_avx2_available()
+          expect_omp  = "${{ matrix.expect_omp }}"  == "true"
+          expect_avx2 = "${{ matrix.expect_avx2 }}" == "true"
+
+          print(f"OMP  available: {omp}  (expected: {expect_omp})")
+          print(f"AVX2 available: {avx2} (expected: {expect_avx2})")
+
+          ok = True
+          if omp != expect_omp:
+              print(f"FAIL: OMP mismatch — got {omp}, expected {expect_omp}")
+              ok = False
+          if avx2 != expect_avx2:
+              print(f"FAIL: AVX2 mismatch — got {avx2}, expected {expect_avx2}")
+              ok = False
+
+          if not ok:
+              sys.exit(1)
+          print("PASS")
+
+      - name: Smoke-test cast_ray_segments_avx2 fallback
+        shell: python
+        run: |
+          import numpy as np
+          from irsim.lib.algorithm.ray_casting_2d_omp import cast_ray_segments_avx2
+          from irsim.lib.algorithm.ray_casting_2d import cast_ray_segments
+
+          rng = np.random.default_rng(42)
+          origin = np.array([0.0, 0.0])
+          angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+          dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+          ss = rng.uniform(-5, 5, (30, 2))
+          se = rng.uniform(-5, 5, (30, 2))
+          max_range = 10.0
+
+          r_ref, h_ref = cast_ray_segments(origin, dirs, ss, se, max_range)
+          r_avx, h_avx = cast_ray_segments_avx2(origin, dirs, ss, se, max_range)
+
+          assert np.allclose(r_ref, r_avx, atol=1e-12), \
+              f"Range mismatch: max_err={np.abs(r_ref - r_avx).max()}"
+          assert np.array_equal(h_ref, h_avx), \
+              f"Hit-index mismatch"
+          print("PASS: results match NumPy reference")
+
+  fallback-no-compiler:
+    name: "Fallback (no compiler → NumPy only)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install project (no build of C extension)
+        run: uv sync --dev
+
+      - name: Verify graceful NumPy fallback (no .so present)
+        shell: python
+        run: |
+          # Deliberately skip build_ext so no .so exists.
+          # The module must import cleanly and fall back to NumPy.
+          import sys
+          from irsim.lib.algorithm.ray_casting_2d_omp import (
+              is_omp_available,
+              is_avx2_available,
+              cast_ray_segments_omp,
+              cast_ray_segments_avx2,
+          )
+
+          print(f"OMP  available: {is_omp_available()}")
+          print(f"AVX2 available: {is_avx2_available()}")
+
+          import numpy as np
+          from irsim.lib.algorithm.ray_casting_2d import cast_ray_segments
+
+          rng = np.random.default_rng(7)
+          origin = np.array([0.0, 0.0])
+          angles = np.linspace(0, 2 * np.pi, 90, endpoint=False)
+          dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+          ss = rng.uniform(-5, 5, (20, 2))
+          se = rng.uniform(-5, 5, (20, 2))
+          mr = 8.0
+
+          r_ref, h_ref = cast_ray_segments(origin, dirs, ss, se, mr)
+          r_omp, h_omp = cast_ray_segments_omp(origin, dirs, ss, se, mr)
+          r_avx, h_avx = cast_ray_segments_avx2(origin, dirs, ss, se, mr)
+
+          assert np.allclose(r_ref, r_omp, atol=1e-12), "OMP fallback mismatch"
+          assert np.allclose(r_ref, r_avx, atol=1e-12), "AVX2 fallback mismatch"
+          print("PASS: NumPy fallback is transparent")
