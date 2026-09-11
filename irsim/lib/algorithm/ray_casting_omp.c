@@ -59,6 +59,12 @@
 
 #define ORIGIN_EPS 1e-9
 
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #define IRSIM_API __declspec(dllexport)
+#else
+  #define IRSIM_API
+#endif
+
 /*
  * cast_ray_segments_omp
  *
@@ -73,7 +79,7 @@
  *   out_ranges  - double[N]     output: hit distances
  *   out_hit     - int64_t[N]    output: hit segment indices (-1 = miss)
  */
-void cast_ray_segments_omp(
+IRSIM_API void cast_ray_segments_omp(
     const double *origin,
     const double *directions,
     const double *seg_start,
@@ -175,7 +181,7 @@ void cast_ray_segments_omp(
  *   out_ranges - double[N]   output: hit distances
  *   out_hit   - int64_t[N]   output: hit segment indices (-1 = miss)
  */
-void cast_ray_segments_avx2_soa(
+IRSIM_API void cast_ray_segments_avx2_soa(
     const double *origin,
     const double *dir_dx,
     const double *dir_dy,

@@ -14,6 +14,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #define IRSIM_API __declspec(dllexport)
+#else
+  #define IRSIM_API
+#endif
+
 /* ── 2D rotation helper ───────────────────────────────────────────────────── */
 static inline void rot2d(double th, double ax, double ay, double *wx, double *wy) {
     double c = cos(th), s = sin(th);
@@ -130,7 +136,7 @@ void strap_update(StrapState *st, double omega, double ax, double ay, double dt)
  * These are called from Python via ctypes for timing comparison.
  */
 
-void bench_euler(int n, double dt,
+IRSIM_API void bench_euler(int n, double dt,
                  const double *omega, const double *ax, const double *ay,
                  double *out_px, double *out_py, double *out_th) {
     State st = {0};
@@ -142,7 +148,7 @@ void bench_euler(int n, double dt,
     }
 }
 
-void bench_midpoint(int n, double dt,
+IRSIM_API void bench_midpoint(int n, double dt,
                     const double *omega, const double *ax, const double *ay,
                     double *out_px, double *out_py, double *out_th) {
     State st = {0};
@@ -154,7 +160,7 @@ void bench_midpoint(int n, double dt,
     }
 }
 
-void bench_rk4(int n, double dt,
+IRSIM_API void bench_rk4(int n, double dt,
                const double *omega, const double *ax, const double *ay,
                double *out_px, double *out_py, double *out_th) {
     State st = {0};
@@ -166,7 +172,7 @@ void bench_rk4(int n, double dt,
     }
 }
 
-void bench_strap(int n, double dt,
+IRSIM_API void bench_strap(int n, double dt,
                  const double *omega, const double *ax, const double *ay,
                  double *out_px, double *out_py, double *out_th) {
     StrapState st;
@@ -192,7 +198,7 @@ void bench_strap(int n, double dt,
 #include <omp.h>
 #endif
 
-void bench_mc_midpoint(int n_trials, int n_steps, double dt,
+IRSIM_API void bench_mc_midpoint(int n_trials, int n_steps, double dt,
                        const double *omega, const double *ax, const double *ay,
                        double *rmse_out) {
     int trial;
