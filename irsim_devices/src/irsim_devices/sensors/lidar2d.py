@@ -307,15 +307,23 @@ class Lidar2D:
         # .objects and .GeometryTree).  Checked first in _env_param.
         self._scene: object | None = None
 
+        # Precomputed local-frame trig for fast direction computation
+        self._local_dir_cos = np.cos(self.angle_list)
+        self._local_dir_sin = np.sin(self.angle_list)
+
         try:
             from irsim_devices.core.ray_casting_2d_omp import (
                 cast_ray_segments_avx2,
+                cast_ray_segments_avx2_f32,
                 cast_ray_segments_omp,
                 is_avx2_available,
+                is_avx2_f32_available,
                 is_omp_available,
             )
 
-            if is_avx2_available():
+            if is_avx2_f32_available():
+                self._omp_cast = cast_ray_segments_avx2_f32
+            elif is_avx2_available():
                 self._omp_cast = cast_ray_segments_avx2
             elif is_omp_available():
                 self._omp_cast = cast_ray_segments_omp
@@ -400,10 +408,18 @@ class Lidar2D:
         Static map geometry is gathered with a fast disk query and cached by
         sensor position; dynamic obstacles are re-queried every step.
 
+        When a standalone scene is attached (via :attr:`scene`), this method
+        delegates to :meth:`_step_standalone`, which bypasses all Shapely beam
+        geometry and processes directions through pure NumPy + the C kernel.
+
         Args:
             state (np.ndarray): New state of the sensor.
         """
         self._state = state
+
+        if self._scene is not None:
+            self._step_standalone(state)
+            return
 
         lidar_geometry = self._world_geometry(state)
         detected_objects = self._get_detected_objects(lidar_geometry)
@@ -422,6 +438,92 @@ class Lidar2D:
 
         if self.has_velocity:
             self._assign_velocities(hit_object_indices, detected_objects)
+
+    def _step_standalone(self, state: np.ndarray) -> None:
+        """Fast ray-casting path for standalone scene.
+
+        Bypasses Shapely beam geometry construction and scan geometry rebuild,
+        computing sensor origin and beam directions via pure NumPy.  Uses the
+        best available C kernel (AVX2 f32 > AVX2 f64 > OMP scalar).
+
+        The static segment cache (positional threshold-based) is reused from the
+        main path.  Since standalone scenes carry no dynamic objects, the dynamic
+        segment loop is omitted entirely.
+        """
+        import shapely as _sl
+
+        # ── World-frame origin ───────────────────────────────────────────────
+        s = np.asarray(state).ravel()
+        sx, sy = float(s[0]), float(s[1])
+        stheta = float(s[2]) if len(s) > 2 else 0.0
+        off = self.offset.ravel()
+        off_x, off_y, off_th = (
+            float(off[0]),
+            float(off[1]),
+            float(off[2] if len(off) > 2 else 0.0),
+        )
+        ct, st = cos(stheta), sin(stheta)
+        ox = sx + off_x * ct - off_y * st
+        oy = sy + off_x * st + off_y * ct
+        world_theta = stheta + off_th
+
+        self.lidar_origin = np.array([[ox], [oy], [world_theta]])
+
+        # ── World-frame beam directions (NumPy, no Shapely) ──────────────────
+        cw, sw = cos(world_theta), sin(world_theta)
+        dir_cos = self._local_dir_cos * cw - self._local_dir_sin * sw
+        dir_sin = self._local_dir_cos * sw + self._local_dir_sin * cw
+        directions = np.stack([dir_cos, dir_sin], axis=1)  # (N, 2) float64
+        origin = np.array([ox, oy, world_theta])
+        origin_2d = origin[:2]
+
+        # ── Segment cache (static scene only) ────────────────────────────────
+        cache_hit = (
+            self._map_seg_cache is not None
+            and np.linalg.norm(origin_2d - self._map_cache_origin)
+            <= self._map_cache_thresh
+        )
+        if not cache_hit:
+            disk = _sl.buffer(_sl.points([ox, oy]), self.range_max)
+            scene = self._scene
+            obj_hits = scene.GeometryTree.query(disk, predicate="intersects")
+            ss_list, se_list = [], []
+            for obj_idx in obj_hits:
+                obj = scene.objects[obj_idx]
+                ls_hits = obj.geometry_tree.query(disk, predicate="intersects")
+                if len(ls_hits):
+                    geoms = [obj.linestrings[h] for h in ls_hits]
+                    s, e = boundary_segments(geoms)
+                    if len(s):
+                        ss_list.append(s)
+                        se_list.append(e)
+            if ss_list:
+                seg_start = np.concatenate(ss_list)
+                seg_end = np.concatenate(se_list)
+            else:
+                seg_start, seg_end = _empty_segments()[:2]
+            dummy_owners = np.arange(len(seg_start), dtype=int)
+            self._map_seg_cache = (seg_start, seg_end, dummy_owners)
+            self._map_cache_origin = origin_2d.copy()
+        else:
+            seg_start, seg_end, _ = self._map_seg_cache  # type: ignore[misc]
+
+        # ── Cast ──────────────────────────────────────────────────────────────
+        if len(seg_start) == 0:
+            ranges = np.full(self.number, self.range_max, dtype=np.float64)
+        elif self._omp_cast is not None:
+            ranges, _ = self._omp_cast(
+                origin, directions, seg_start, seg_end, self.range_max
+            )
+        else:
+            ranges, _ = cast_ray_segments(
+                origin, directions, seg_start, seg_end, self.range_max
+            )
+
+        if self.noise:
+            self.range_data[:] = ranges + rng.normal(0, self.std, self.number)
+        else:
+            self.range_data[:] = ranges
 
     def _cast_rays_cached(
         self,

@@ -4,15 +4,13 @@ Drop-in replacement for :func:`~irsim.lib.algorithm.ray_casting_2d.cast_ray_segm
 when a C compiler with OpenMP is available.  If compilation fails the module still
 imports cleanly and :func:`cast_ray_segments_omp` falls back to the NumPy kernel.
 
-Two kernels are available:
+Three kernels are available, in descending preference:
 
-* :func:`cast_ray_segments_omp` — scalar OpenMP (AoS layout); always available
-  when the C library is loaded.
-* :func:`cast_ray_segments_avx2` — AVX2 SIMD 4-wide OpenMP (SoA layout);
-  available only when the compiled library exposes
-  ``cast_ray_segments_avx2_soa`` (requires ``-mavx2`` or ``-march=native`` on
-  an AVX2-capable CPU).  Falls back to :func:`cast_ray_segments_omp` when
-  unavailable.
+* :func:`cast_ray_segments_avx2_f32` — AVX2 SIMD **8-wide float32** OpenMP (SoA);
+  fastest; requires ``cast_ray_segments_avx2_f32_soa`` in the library.
+* :func:`cast_ray_segments_avx2` — AVX2 SIMD 4-wide float64 OpenMP (SoA);
+  available when the library exposes ``cast_ray_segments_avx2_soa``.
+* :func:`cast_ray_segments_omp` — scalar OpenMP (AoS layout); always available.
 
 Build
 -----
@@ -25,14 +23,20 @@ into ``ray_casting_omp.so`` in the same directory.
 Usage::
 
     from irsim_devices.core.ray_casting_2d_omp import (
+        cast_ray_segments_avx2_f32,
         cast_ray_segments_avx2,
         cast_ray_segments_omp,
+        is_avx2_f32_available,
         is_avx2_available,
         is_omp_available,
         ensure_built,
     )
 
-    if is_avx2_available():
+    if is_avx2_f32_available():
+        ranges, hits = cast_ray_segments_avx2_f32(
+            origin, directions, seg_start, seg_end, max_range
+        )
+    elif is_avx2_available():
         ranges, hits = cast_ray_segments_avx2(
             origin, directions, seg_start, seg_end, max_range
         )
@@ -51,13 +55,15 @@ from pathlib import Path
 import numpy as np
 
 _HERE = Path(__file__).parent
-_C_SRC = _HERE / "ray_casting_omp.c"
+# C source lives in csrc/ sibling of the package root
+_C_SRC = _HERE.parents[2] / "csrc" / "ray_casting_omp.c"
 # Legacy output path (runtime gcc compile); kept for backward compatibility.
 _SO_OUT = _HERE / "ray_casting_omp.so"
 
 _lib: ctypes.CDLL | None = None
 _OMP_AVAILABLE: bool | None = None  # None = not yet probed
 _AVX2_AVAILABLE: bool = False
+_F32_AVAILABLE: bool = False
 
 
 def _find_compiled_ext() -> Path | None:
@@ -106,7 +112,7 @@ def _try_build(force: bool = False) -> bool:
 
 def _setup_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
     """Attach argtypes/restype to *lib* and return it."""
-    global _AVX2_AVAILABLE
+    global _AVX2_AVAILABLE, _F32_AVAILABLE
     lib.cast_ray_segments_omp.restype = None
     lib.cast_ray_segments_omp.argtypes = [
         ctypes.POINTER(ctypes.c_double),  # origin
@@ -119,7 +125,7 @@ def _setup_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_double),  # out_ranges
         ctypes.POINTER(ctypes.c_int64),  # out_hit
     ]
-    # Wire up AVX2 SoA function when the compiled library exposes it
+    # Wire up AVX2 float64 SoA kernel
     try:
         fn = lib.cast_ray_segments_avx2_soa
         fn.restype = None
@@ -140,25 +146,50 @@ def _setup_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
         _AVX2_AVAILABLE = True
     except AttributeError:
         _AVX2_AVAILABLE = False
+    # Wire up AVX2 float32 8-wide SoA kernel
+    try:
+        fn32 = lib.cast_ray_segments_avx2_f32_soa
+        fn32.restype = None
+        fn32.argtypes = [
+            ctypes.POINTER(ctypes.c_float),  # origin  float[2]
+            ctypes.POINTER(ctypes.c_float),  # dir_dx  float[N]
+            ctypes.POINTER(ctypes.c_float),  # dir_dy  float[N]
+            ctypes.POINTER(ctypes.c_float),  # seg_sx  float[M]
+            ctypes.POINTER(ctypes.c_float),  # seg_sy  float[M]
+            ctypes.POINTER(ctypes.c_float),  # seg_ex  float[M]
+            ctypes.POINTER(ctypes.c_float),  # seg_ey  float[M]
+            ctypes.c_int,  # N
+            ctypes.c_int,  # M
+            ctypes.c_float,  # max_range
+            ctypes.POINTER(ctypes.c_float),  # out_ranges float[N]
+            ctypes.POINTER(ctypes.c_int32),  # out_hit    int32[N]
+        ]
+        _F32_AVAILABLE = True
+    except AttributeError:
+        _F32_AVAILABLE = False
     return lib
 
 
 def _load_lib() -> ctypes.CDLL | None:
     """Load the compiled shared library and set up argtypes.
 
-    Tries the setuptools extension first, then the legacy runtime-compiled .so.
+    Priority (highest first):
+    1. Runtime-compiled ``ray_casting_omp.so`` next to this file — carries the
+       latest kernels including AVX2 float32.
+    2. The setuptools-compiled ``_ray_casting_omp`` extension — installed by
+       pip/cibuildwheel; may not expose newer kernels.
     """
-    # 1) setuptools-compiled extension (preferred, works on all platforms)
+    # 1) Runtime .so (may expose newer kernels than the installed extension)
+    if _SO_OUT.exists():
+        try:
+            return _setup_lib(ctypes.CDLL(str(_SO_OUT)))
+        except OSError:
+            pass
+    # 2) Setuptools-compiled extension (installed package fallback)
     ext_path = _find_compiled_ext()
     if ext_path is not None:
         try:
             return _setup_lib(ctypes.CDLL(str(ext_path)))
-        except OSError:
-            pass
-    # 2) Legacy .so compiled by _try_build()
-    if _SO_OUT.exists():
-        try:
-            return _setup_lib(ctypes.CDLL(str(_SO_OUT)))
         except OSError:
             pass
     return None
@@ -192,8 +223,9 @@ def build_omp_lib(force: bool = False) -> bool:
     else:
         _OMP_AVAILABLE = False
     if not _OMP_AVAILABLE:
-        global _AVX2_AVAILABLE
+        global _AVX2_AVAILABLE, _F32_AVAILABLE
         _AVX2_AVAILABLE = False
+        _F32_AVAILABLE = False
     return bool(_OMP_AVAILABLE)
 
 
@@ -213,10 +245,17 @@ def is_omp_available() -> bool:
 
 
 def is_avx2_available() -> bool:
-    """Return ``True`` when the AVX2 SoA kernel is compiled and loaded."""
+    """Return ``True`` when the AVX2 float64 SoA kernel is compiled and loaded."""
     if _OMP_AVAILABLE is None:
         ensure_built()
     return _AVX2_AVAILABLE
+
+
+def is_avx2_f32_available() -> bool:
+    """Return ``True`` when the AVX2 float32 8-wide SoA kernel is available."""
+    if _OMP_AVAILABLE is None:
+        ensure_built()
+    return _F32_AVAILABLE
 
 
 def _np_ptr(arr: np.ndarray):
@@ -225,6 +264,14 @@ def _np_ptr(arr: np.ndarray):
 
 def _i64_ptr(arr: np.ndarray):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+
+
+def _f32_ptr(arr: np.ndarray):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+
+def _i32_ptr(arr: np.ndarray):
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
 
 
 def cast_ray_segments_omp(
@@ -355,3 +402,76 @@ def cast_ray_segments_avx2(
         _i64_ptr(out_hit),
     )
     return out_ranges, out_hit.astype(int)
+
+
+def cast_ray_segments_avx2_f32(
+    origin: np.ndarray,
+    directions: np.ndarray,
+    seg_start: np.ndarray,
+    seg_end: np.ndarray,
+    max_range: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """C+OpenMP+AVX2 float32 8-wide SoA ray-segment intersection.
+
+    Processes 8 beams simultaneously using 256-bit single-precision registers,
+    giving 2× SIMD throughput over the float64 4-wide kernel.  Absolute range
+    error is ≤5 µm at 40 m (float32 mantissa precision), well below LiDAR noise.
+
+    Falls back to :func:`cast_ray_segments_avx2` when the f32 kernel is
+    unavailable.
+
+    Args:
+        origin: Shared ray origin ``(2,)``.
+        directions: Unit ray directions ``(N, 2)``.
+        seg_start: Segment start points ``(M, 2)``.
+        seg_end: Segment end points ``(M, 2)``.
+        max_range: Maximum ray length; misses return this.
+
+    Returns:
+        ``(ranges, hit_index)`` — float64 ranges and int64 hit indices with the
+        same semantics as
+        :func:`~irsim.lib.algorithm.ray_casting_2d.cast_ray_segments`.
+    """
+    if not _F32_AVAILABLE or _lib is None:
+        return cast_ray_segments_avx2(origin, directions, seg_start, seg_end, max_range)
+
+    if len(seg_start) == 0:
+        return (
+            np.full(len(directions), max_range, dtype=np.float64),
+            np.full(len(directions), -1, dtype=np.int64),
+        )
+
+    N = len(directions)
+    M = len(seg_start)
+
+    origin_f = np.ascontiguousarray(origin, dtype=np.float32)
+    directions_f = np.ascontiguousarray(directions, dtype=np.float32)
+    seg_start_f = np.ascontiguousarray(seg_start, dtype=np.float32)
+    seg_end_f = np.ascontiguousarray(seg_end, dtype=np.float32)
+
+    # AoS → SoA (float32)
+    dir_dx = np.ascontiguousarray(directions_f[:, 0])
+    dir_dy = np.ascontiguousarray(directions_f[:, 1])
+    seg_sx = np.ascontiguousarray(seg_start_f[:, 0])
+    seg_sy = np.ascontiguousarray(seg_start_f[:, 1])
+    seg_ex = np.ascontiguousarray(seg_end_f[:, 0])
+    seg_ey = np.ascontiguousarray(seg_end_f[:, 1])
+
+    out_ranges = np.empty(N, dtype=np.float32)
+    out_hit = np.empty(N, dtype=np.int32)
+
+    _lib.cast_ray_segments_avx2_f32_soa(
+        _f32_ptr(origin_f),
+        _f32_ptr(dir_dx),
+        _f32_ptr(dir_dy),
+        _f32_ptr(seg_sx),
+        _f32_ptr(seg_sy),
+        _f32_ptr(seg_ex),
+        _f32_ptr(seg_ey),
+        ctypes.c_int(N),
+        ctypes.c_int(M),
+        ctypes.c_float(float(max_range)),
+        _f32_ptr(out_ranges),
+        _i32_ptr(out_hit),
+    )
+    return out_ranges.astype(np.float64), out_hit.astype(np.int64)
