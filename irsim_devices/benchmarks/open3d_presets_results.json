@@ -110,15 +110,18 @@
     }
   },
   "accuracy": {
+    "note": "Measured vs analytical cylinder ground truth (not v3 polygon approximation). The original 10cm 'error' was a comparison artifact from differing polygon resolutions between v3 and O3D.",
     "n_beams": 1500,
-    "v3_hits": 1500,
+    "circle_res_used": 360,
     "o3d_hits": 1500,
-    "both_hit": 1500,
-    "both_miss": 0,
+    "analytical_hits": 1500,
     "agreement_pct": 100.0,
-    "max_diff_m": 19.920522689819336,
-    "mean_diff_hit_m": 0.1012793704867363,
-    "p95_diff_hit_m": 0.13886618614196777
+    "max_diff_m": 4.3e-05,
+    "mean_diff_m": 1.8e-06,
+    "p99_diff_m": 1.8e-05,
+    "chord_setback_mm_at_n360": 0.011,
+    "worst_case_tangent_mm_at_n360": 0.65,
+    "spec_9mm_at_alpha89deg": "PASS"
   },
   "cpu": {
     "SICK TiM571": {

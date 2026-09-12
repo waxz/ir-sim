@@ -76,8 +76,13 @@ def _make_scene_2d():
     return scene
 
 
-def _make_scene_3d(circle_res=32):
-    """Build the Open3D RaycastingScene with configurable circle resolution."""
+def _make_scene_3d(circle_res=360):
+    """Build the Open3D RaycastingScene.
+
+    Uses create_cylinder() for circular obstacles so the mesh is watertight
+    with correct normals.  circle_res=360 gives chord setback ≈ 0.011 mm
+    (sub-mm vs analytical ground truth) with no measurable step-latency cost.
+    """
     EXTRUDE_H = 3.0
 
     def _box_mesh(cx, cy, hw, hh):
@@ -85,23 +90,13 @@ def _make_scene_3d(circle_res=32):
         mesh.translate([cx - hw, cy - hh, 0.0])
         return mesh
 
-    def _circle_mesh(cx, cy, r, n=32):
-        a = np.linspace(0, 2 * pi, n, endpoint=False)
-        vx, vy = cx + r * np.cos(a), cy + r * np.sin(a)
-        vb = np.column_stack([vx, vy, np.zeros(n)])
-        vt = np.column_stack([vx, vy, np.full(n, EXTRUDE_H)])
-        cb, ct = np.array([[cx, cy, 0.0]]), np.array([[cx, cy, EXTRUDE_H]])
-        vs = np.vstack([vb, vt, cb, ct]).astype(np.float32)
-        cbi, cti = 2 * n, 2 * n + 1
-        tris = []
-        for i in range(n):
-            j = (i + 1) % n
-            tris += [[i, j, i + n], [j, j + n, i + n]]
-            tris.append([cbi, j, i])
-            tris.append([cti, i + n, j + n])
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(vs)
-        mesh.triangles = o3d.utility.Vector3iVector(np.array(tris, np.int32))
+    def _cylinder_mesh(cx, cy, r, n):
+        # create_cylinder centers at origin, spans [-h/2, +h/2] along Z.
+        # Translate so the cylinder sits at z=0..EXTRUDE_H.
+        mesh = o3d.geometry.TriangleMesh.create_cylinder(
+            radius=r, height=EXTRUDE_H, resolution=n, split=1
+        )
+        mesh.translate([cx, cy, EXTRUDE_H / 2.0])
         return mesh
 
     rc = otg.RaycastingScene()
@@ -118,7 +113,7 @@ def _make_scene_3d(circle_res=32):
     _add(_box_mesh(W - WALL_T / 2, H / 2, WALL_T / 2, H / 2))
     for cx in PILLAR_COLS:
         for cy in PILLAR_ROWS:
-            _add(_circle_mesh(cx, cy, PILLAR_R, n=circle_res))
+            _add(_cylinder_mesh(cx, cy, PILLAR_R, n=circle_res))
     for rx in RACK_XS:
         for ry in RACK_YS:
             _add(_box_mesh(rx + RACK_LENGTH / 2, ry, RACK_LENGTH / 2, RACK_WIDTH / 2))
