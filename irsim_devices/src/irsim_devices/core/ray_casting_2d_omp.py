@@ -113,6 +113,12 @@ def _try_build(force: bool = False) -> bool:
 def _setup_lib(lib: ctypes.CDLL) -> ctypes.CDLL:
     """Attach argtypes/restype to *lib* and return it."""
     global _AVX2_AVAILABLE, _F32_AVAILABLE
+    # Thread-count control (always present in the compiled library)
+    try:
+        lib.set_omp_num_threads.restype = None
+        lib.set_omp_num_threads.argtypes = [ctypes.c_int]
+    except AttributeError:
+        pass
     lib.cast_ray_segments_omp.restype = None
     lib.cast_ray_segments_omp.argtypes = [
         ctypes.POINTER(ctypes.c_double),  # origin
@@ -402,6 +408,75 @@ def cast_ray_segments_avx2(
         _i64_ptr(out_hit),
     )
     return out_ranges, out_hit.astype(int)
+
+
+def set_omp_threads(n: int) -> None:
+    """Set the number of OpenMP threads used by all subsequent kernel calls.
+
+    Call with ``n=2`` (or the number of cores you can spare) before starting a
+    real-time 30 Hz loop so the raycaster leaves enough cores free for the
+    robot stack running in the same process.
+
+    Args:
+        n: Number of OpenMP threads to use (≥ 1).
+    """
+    if _OMP_AVAILABLE is None:
+        ensure_built()
+    if _lib is not None and hasattr(_lib, "set_omp_num_threads"):
+        _lib.set_omp_num_threads(ctypes.c_int(max(1, int(n))))
+
+
+def cast_ray_segments_avx2_f32_inplace(
+    origin_f: np.ndarray,
+    dir_dx_f: np.ndarray,
+    dir_dy_f: np.ndarray,
+    seg_sx_f: np.ndarray,
+    seg_sy_f: np.ndarray,
+    seg_ex_f: np.ndarray,
+    seg_ey_f: np.ndarray,
+    max_range_f: float,
+    out_ranges_f: np.ndarray,
+    out_hit_i: np.ndarray,
+) -> None:
+    """Zero-allocation AVX2 float32 kernel call; writes results in-place.
+
+    All arrays must already be contiguous float32 (``dir_*``, ``seg_*``,
+    ``out_ranges_f``, ``origin_f``) or int32 (``out_hit_i``).  No copies are
+    made, so the caller is responsible for pre-allocating and reusing them.
+
+    Args:
+        origin_f: Ray origin ``(2,)`` float32.
+        dir_dx_f: Pre-allocated beam x-directions ``(N,)`` float32 SoA.
+        dir_dy_f: Pre-allocated beam y-directions ``(N,)`` float32 SoA.
+        seg_sx_f: Segment start x ``(M,)`` float32 SoA.
+        seg_sy_f: Segment start y ``(M,)`` float32 SoA.
+        seg_ex_f: Segment end x ``(M,)`` float32 SoA.
+        seg_ey_f: Segment end y ``(M,)`` float32 SoA.
+        max_range_f: Miss distance.
+        out_ranges_f: Pre-allocated output ``(N,)`` float32 — filled in place.
+        out_hit_i: Pre-allocated output ``(N,)`` int32 — filled in place.
+
+    Raises:
+        RuntimeError: When the AVX2 float32 kernel is not compiled in.
+    """
+    if not _F32_AVAILABLE or _lib is None:
+        raise RuntimeError(
+            "AVX2 f32 kernel unavailable; call is_avx2_f32_available() to check."
+        )
+    _lib.cast_ray_segments_avx2_f32_soa(
+        _f32_ptr(origin_f),
+        _f32_ptr(dir_dx_f),
+        _f32_ptr(dir_dy_f),
+        _f32_ptr(seg_sx_f),
+        _f32_ptr(seg_sy_f),
+        _f32_ptr(seg_ex_f),
+        _f32_ptr(seg_ey_f),
+        ctypes.c_int(len(dir_dx_f)),
+        ctypes.c_int(len(seg_sx_f)),
+        ctypes.c_float(float(max_range_f)),
+        _f32_ptr(out_ranges_f),
+        _i32_ptr(out_hit_i),
+    )
 
 
 def cast_ray_segments_avx2_f32(

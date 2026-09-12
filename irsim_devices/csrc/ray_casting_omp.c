@@ -64,6 +64,19 @@
 #endif
 
 /*
+ * set_omp_num_threads
+ *
+ * Control the number of OpenMP threads used by all subsequent kernel calls.
+ * Call with n=2 before starting a real-time loop so the raycaster leaves
+ * enough cores free for the robot stack running in parallel.
+ */
+IRSIM_API void set_omp_num_threads(int n) {
+#ifdef _OPENMP
+    omp_set_num_threads(n);
+#endif
+}
+
+/*
  * cast_ray_segments_omp
  *
  * Scalar OpenMP kernel (AoS layout).  Works on every platform.

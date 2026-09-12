@@ -307,20 +307,48 @@ class Lidar2D:
         # .objects and .GeometryTree).  Checked first in _env_param.
         self._scene: object | None = None
 
-        # Precomputed local-frame trig for fast direction computation
+        # Precomputed local-frame trig for fast direction computation (f64 + f32)
         self._local_dir_cos = np.cos(self.angle_list)
         self._local_dir_sin = np.sin(self.angle_list)
+        self._local_dir_cos_f32 = self._local_dir_cos.astype(np.float32)
+        self._local_dir_sin_f32 = self._local_dir_sin.astype(np.float32)
+
+        # Pre-allocated f32 SoA direction/output buffers (zero-alloc fast path)
+        self._dir_dx_f32 = np.empty(number, dtype=np.float32)
+        self._dir_dy_f32 = np.empty(number, dtype=np.float32)
+        self._tmp_f32 = np.empty(number, dtype=np.float32)
+        self._out_ranges_f32 = np.empty(number, dtype=np.float32)
+        self._out_hit_i32 = np.empty(number, dtype=np.int32)
+        self._origin_f32 = np.zeros(2, dtype=np.float32)
+
+        # Precomputed static scene segments (set by _attach_scene / set_scene)
+        self._all_seg_sx: np.ndarray | None = None
+        self._all_seg_sy: np.ndarray | None = None
+        self._all_seg_ex: np.ndarray | None = None
+        self._all_seg_ey: np.ndarray | None = None
+        self._seg_dvx: np.ndarray | None = None  # ex - sx for each segment
+        self._seg_dvy: np.ndarray | None = None  # ey - sy for each segment
+        self._seg_len2_safe: np.ndarray | None = None  # |dv|^2, 0→1 for safety
+        # Pre-allocated working buffers for compressed-segment output
+        self._work_seg_sx: np.ndarray | None = None
+        self._work_seg_sy: np.ndarray | None = None
+        self._work_seg_ex: np.ndarray | None = None
+        self._work_seg_ey: np.ndarray | None = None
 
         try:
             from irsim_devices.core.ray_casting_2d_omp import (
                 cast_ray_segments_avx2,
                 cast_ray_segments_avx2_f32,
+                cast_ray_segments_avx2_f32_inplace,
                 cast_ray_segments_omp,
                 is_avx2_available,
                 is_avx2_f32_available,
                 is_omp_available,
             )
 
+            self._cast_inplace = (
+                cast_ray_segments_avx2_f32_inplace if is_avx2_f32_available() else None
+            )
             if is_avx2_f32_available():
                 self._omp_cast = cast_ray_segments_avx2_f32
             elif is_avx2_available():
@@ -330,6 +358,7 @@ class Lidar2D:
             else:
                 self._omp_cast = None
         except ImportError:
+            self._cast_inplace = None
             self._omp_cast = None
 
     @property
@@ -351,7 +380,105 @@ class Lidar2D:
 
     @scene.setter
     def scene(self, value: object | None) -> None:
-        self._scene = value
+        self._attach_scene(value)
+
+    def set_scene(self, scene: object | None, n_omp_threads: int = 2) -> None:
+        """Attach a standalone scene and configure the sensor for low-CPU operation.
+
+        Precomputes all static segment geometry from *scene* at call time so that
+        each :meth:`step` call requires no Shapely operations — only a NumPy
+        range prefilter and one in-place AVX2 kernel call.
+
+        Also sets the number of OpenMP threads used by the raycasting kernel so
+        the sensor does not starve a robot stack running in the same process.
+
+        Args:
+            scene: An :class:`~irsim_devices.core.open3d_scene_2d.Open3DScene2D`
+                (or any object with ``.objects`` iterable, each with
+                ``.linestrings``).  Pass ``None`` to detach.
+            n_omp_threads: OMP thread count for the raycasting kernel.  Default
+                ``2`` — enough to achieve >200 Hz at 1500 beams / 30 m while
+                leaving the remaining cores free for the robot stack.
+        """
+        try:
+            from irsim_devices.core.ray_casting_2d_omp import set_omp_threads
+
+            set_omp_threads(n_omp_threads)
+        except ImportError:
+            pass
+        self._attach_scene(scene)
+
+    def _attach_scene(self, scene: object | None) -> None:
+        """Precompute static segment geometry from *scene*.
+
+        Extracts every linestring from every object in *scene* and stores them
+        as contiguous float32 SoA arrays.  Also pre-allocates per-step working
+        buffers sized to the total segment count.  All of this runs **once** at
+        scene-attachment time; :meth:`_step_standalone` then runs allocation-free.
+        """
+        self._scene = scene
+        if scene is None:
+            self._all_seg_sx = None
+            self._all_seg_sy = None
+            self._all_seg_ex = None
+            self._all_seg_ey = None
+            self._seg_dvx = None
+            self._seg_dvy = None
+            self._seg_len2_safe = None
+            self._work_seg_sx = None
+            self._work_seg_sy = None
+            self._work_seg_ex = None
+            self._work_seg_ey = None
+            self._map_seg_cache = None
+            self._map_cache_origin = np.full(2, np.inf)
+            return
+
+        sx_list: list[np.ndarray] = []
+        sy_list: list[np.ndarray] = []
+        ex_list: list[np.ndarray] = []
+        ey_list: list[np.ndarray] = []
+        for obj in scene.objects:
+            if not obj.linestrings:
+                continue
+            s, e = boundary_segments(obj.linestrings)
+            if len(s) == 0:
+                continue
+            sx_list.append(s[:, 0])
+            sy_list.append(s[:, 1])
+            ex_list.append(e[:, 0])
+            ey_list.append(e[:, 1])
+
+        if sx_list:
+            sx = np.concatenate(sx_list).astype(np.float32)
+            sy = np.concatenate(sy_list).astype(np.float32)
+            ex = np.concatenate(ex_list).astype(np.float32)
+            ey = np.concatenate(ey_list).astype(np.float32)
+        else:
+            sx = sy = ex = ey = np.zeros(0, dtype=np.float32)
+
+        self._all_seg_sx = sx
+        self._all_seg_sy = sy
+        self._all_seg_ex = ex
+        self._all_seg_ey = ey
+
+        # Precompute segment delta vectors for the per-step range prefilter
+        dvx = (ex - sx).astype(np.float32)
+        dvy = (ey - sy).astype(np.float32)
+        len2 = dvx * dvx + dvy * dvy
+        self._seg_dvx = dvx
+        self._seg_dvy = dvy
+        # Replace zero-length entries with 1.0 to avoid division by zero
+        self._seg_len2_safe = np.where(len2 > 0, len2, np.float32(1.0))
+
+        # Pre-allocate working buffers for filtered segments
+        M = len(sx)
+        self._work_seg_sx = np.empty(M, dtype=np.float32)
+        self._work_seg_sy = np.empty(M, dtype=np.float32)
+        self._work_seg_ex = np.empty(M, dtype=np.float32)
+        self._work_seg_ey = np.empty(M, dtype=np.float32)
+
+        self._map_seg_cache = None
+        self._map_cache_origin = np.full(2, np.inf)
 
     @property
     def _env_param(self):
@@ -442,34 +569,43 @@ class Lidar2D:
     def _step_standalone(self, state: np.ndarray) -> None:
         """Fast ray-casting path for standalone scene.
 
-        Bypasses Shapely beam geometry construction and scan geometry rebuild,
-        computing sensor origin and beam directions via pure NumPy.  Uses the
-        best available C kernel (AVX2 f32 > AVX2 f64 > OMP scalar).
+        When static segment geometry has been precomputed via :meth:`set_scene`
+        or :meth:`_attach_scene`, this path is fully allocation-free per step:
 
-        The static segment cache (positional threshold-based) is reused from the
-        main path.  Since standalone scenes carry no dynamic objects, the dynamic
-        segment loop is omitted entirely.
+        * Sensor origin and heading are computed with scalar math.
+        * World-frame beam directions are written directly into pre-allocated
+          float32 SoA buffers via NumPy in-place operations.
+        * A vectorised NumPy range prefilter eliminates segments outside
+          ``range_max`` (no Shapely disk query).
+        * The AVX2 float32 kernel writes hits into pre-allocated output buffers.
+        * ``range_data`` is updated with a single NumPy assignment.
+
+        Falls back to the Shapely-based positional-cache path when precomputed
+        geometry is unavailable (e.g. scene attached via the ``scene`` property
+        before the first call to :meth:`set_scene`).
         """
-        import shapely as _sl
-
         # ── World-frame origin ───────────────────────────────────────────────
         s = np.asarray(state).ravel()
         sx, sy = float(s[0]), float(s[1])
         stheta = float(s[2]) if len(s) > 2 else 0.0
         off = self.offset.ravel()
-        off_x, off_y, off_th = (
-            float(off[0]),
-            float(off[1]),
-            float(off[2] if len(off) > 2 else 0.0),
-        )
+        off_x = float(off[0])
+        off_y = float(off[1])
+        off_th = float(off[2] if len(off) > 2 else 0.0)
         ct, st = cos(stheta), sin(stheta)
         ox = sx + off_x * ct - off_y * st
         oy = sy + off_x * st + off_y * ct
         world_theta = stheta + off_th
-
         self.lidar_origin = np.array([[ox], [oy], [world_theta]])
 
-        # ── World-frame beam directions (NumPy, no Shapely) ──────────────────
+        # ── Fast path: precomputed f32 SoA segments + in-place AVX2 kernel ──
+        if self._all_seg_sx is not None and self._cast_inplace is not None:
+            self._step_fast(ox, oy, world_theta)
+            return
+
+        # ── Fallback: Shapely disk query + positional cache ──────────────────
+        import shapely as _sl
+
         cw, sw = cos(world_theta), sin(world_theta)
         dir_cos = self._local_dir_cos * cw - self._local_dir_sin * sw
         dir_sin = self._local_dir_cos * sw + self._local_dir_sin * cw
@@ -477,7 +613,6 @@ class Lidar2D:
         origin = np.array([ox, oy, world_theta])
         origin_2d = origin[:2]
 
-        # ── Segment cache (static scene only) ────────────────────────────────
         cache_hit = (
             self._map_seg_cache is not None
             and np.linalg.norm(origin_2d - self._map_cache_origin)
@@ -493,10 +628,10 @@ class Lidar2D:
                 ls_hits = obj.geometry_tree.query(disk, predicate="intersects")
                 if len(ls_hits):
                     geoms = [obj.linestrings[h] for h in ls_hits]
-                    s, e = boundary_segments(geoms)
-                    if len(s):
-                        ss_list.append(s)
-                        se_list.append(e)
+                    s_segs, e_segs = boundary_segments(geoms)
+                    if len(s_segs):
+                        ss_list.append(s_segs)
+                        se_list.append(e_segs)
             if ss_list:
                 seg_start = np.concatenate(ss_list)
                 seg_end = np.concatenate(se_list)
@@ -508,7 +643,6 @@ class Lidar2D:
         else:
             seg_start, seg_end, _ = self._map_seg_cache  # type: ignore[misc]
 
-        # ── Cast ──────────────────────────────────────────────────────────────
         if len(seg_start) == 0:
             ranges = np.full(self.number, self.range_max, dtype=np.float64)
         elif self._omp_cast is not None:
@@ -524,6 +658,87 @@ class Lidar2D:
             self.range_data[:] = ranges + rng.normal(0, self.std, self.number)
         else:
             self.range_data[:] = ranges
+
+    def _step_fast(self, ox: float, oy: float, world_theta: float) -> None:
+        """Zero-allocation inner step using precomputed f32 SoA geometry.
+
+        Called only when ``_attach_scene`` has run (precomputed segment SoA
+        arrays present) and the AVX2 float32 in-place kernel is available.
+
+        All intermediate arrays are pre-allocated class members; this method
+        makes no heap allocations beyond a small integer index array for the
+        filtered segment indices (typically a few KB).
+        """
+        rmax_f = np.float32(self.range_max)
+        ox_f = np.float32(ox)
+        oy_f = np.float32(oy)
+
+        # ── Directions: in-place rotation of precomputed local-frame trig ───
+        cw_f = np.float32(cos(world_theta))
+        sw_f = np.float32(sin(world_theta))
+        # dir_dx = local_cos * cw - local_sin * sw
+        np.multiply(self._local_dir_cos_f32, cw_f, out=self._dir_dx_f32)
+        np.multiply(self._local_dir_sin_f32, sw_f, out=self._tmp_f32)
+        np.subtract(self._dir_dx_f32, self._tmp_f32, out=self._dir_dx_f32)
+        # dir_dy = local_cos * sw + local_sin * cw
+        np.multiply(self._local_dir_cos_f32, sw_f, out=self._dir_dy_f32)
+        np.multiply(self._local_dir_sin_f32, cw_f, out=self._tmp_f32)
+        np.add(self._dir_dy_f32, self._tmp_f32, out=self._dir_dy_f32)
+
+        self._origin_f32[0] = ox_f
+        self._origin_f32[1] = oy_f
+
+        M_all = len(self._all_seg_sx)  # type: ignore[arg-type]
+        if M_all == 0:
+            self._out_ranges_f32[:] = rmax_f
+        else:
+            # ── Vectorised range prefilter: closest-point-on-segment test ────
+            # For each segment AB, find the point P closest to origin O and
+            # keep the segment when |OP| ≤ range_max.
+            # t* = clip(-dot(O-A, B-A) / |B-A|^2, 0, 1)
+            # P  = A + t*(B-A);  keep when |O-P|^2 ≤ rmax^2
+            ax = self._all_seg_sx - ox_f  # type: ignore[operator]
+            ay = self._all_seg_sy - oy_f  # type: ignore[operator]
+            t = np.clip(
+                -(ax * self._seg_dvx + ay * self._seg_dvy)  # type: ignore[operator]
+                / self._seg_len2_safe,
+                np.float32(0.0),
+                np.float32(1.0),
+            )
+            px = ax + t * self._seg_dvx  # type: ignore[operator]
+            py = ay + t * self._seg_dvy  # type: ignore[operator]
+            mask = px * px + py * py <= rmax_f * rmax_f
+
+            idx = np.nonzero(mask)[0]
+            M_filt = len(idx)
+
+            if M_filt == 0:
+                self._out_ranges_f32[:] = rmax_f
+            else:
+                # Compress filtered segments into pre-allocated working buffers
+                np.take(self._all_seg_sx, idx, out=self._work_seg_sx[:M_filt])  # type: ignore[index]
+                np.take(self._all_seg_sy, idx, out=self._work_seg_sy[:M_filt])  # type: ignore[index]
+                np.take(self._all_seg_ex, idx, out=self._work_seg_ex[:M_filt])  # type: ignore[index]
+                np.take(self._all_seg_ey, idx, out=self._work_seg_ey[:M_filt])  # type: ignore[index]
+                self._cast_inplace(  # type: ignore[misc]
+                    self._origin_f32,
+                    self._dir_dx_f32,
+                    self._dir_dy_f32,
+                    self._work_seg_sx[:M_filt],
+                    self._work_seg_sy[:M_filt],
+                    self._work_seg_ex[:M_filt],
+                    self._work_seg_ey[:M_filt],
+                    float(rmax_f),
+                    self._out_ranges_f32,
+                    self._out_hit_i32,
+                )
+
+        if self.noise:
+            self.range_data[:] = self._out_ranges_f32 + rng.normal(
+                0, self.std, self.number
+            )
+        else:
+            self.range_data[:] = self._out_ranges_f32
 
     def _cast_rays_cached(
         self,
