@@ -11,9 +11,15 @@ from irsim_devices.core.world_model import GeometryObject2D, Scene3DProtocol
 __all__ = [
     "ClipTo2Pi",
     "GeometryObject2D",
+    "Open3DScene2D",
     "Scene3DProtocol",
     "geometry_transform",
     "rng",
     "set_seed",
     "transform_point_with_state",
 ]
+
+try:
+    from irsim_devices.core.open3d_scene_2d import Open3DScene2D
+except ImportError:
+    pass

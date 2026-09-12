@@ -14,6 +14,7 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 lidar2d = ["shapely>=2.1.2", "matplotlib"]
 lidar3d = ["open3d"]
+open3d_scene = ["open3d", "shapely>=2.1.2"]
 all = ["shapely>=2.1.2", "matplotlib", "open3d"]
 dev = ["pytest", "numpy", "shapely>=2.1.2"]
 

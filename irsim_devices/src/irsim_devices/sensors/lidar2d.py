@@ -303,6 +303,10 @@ class Lidar2D:
         self._map_cache_origin: np.ndarray = np.full(2, np.inf)
         self._map_cache_thresh: float = range_max * 0.05
 
+        # Optional standalone scene (Open3DScene2D or any object with
+        # .objects and .GeometryTree).  Checked first in _env_param.
+        self._scene: object | None = None
+
         try:
             from irsim_devices.core.ray_casting_2d_omp import (
                 cast_ray_segments_avx2,
@@ -321,8 +325,31 @@ class Lidar2D:
             self._omp_cast = None
 
     @property
+    def scene(self) -> object | None:
+        """Standalone scene providing ``.objects`` and ``.GeometryTree``.
+
+        Assign an :class:`~irsim_devices.core.open3d_scene_2d.Open3DScene2D`
+        (or any compatible object) before calling :meth:`step` to run the
+        sensor without the ir-sim environment.
+
+        Example::
+
+            from irsim_devices.core.open3d_scene_2d import Open3DScene2D
+            lidar = Lidar2D(state=[0, 0, 0], obj_id=0)
+            lidar.scene = Open3DScene2D.from_files(["map.obj"], slice_z=0.5)
+            lidar.step([0, 0, 0])
+        """
+        return self._scene
+
+    @scene.setter
+    def scene(self, value: object | None) -> None:
+        self._scene = value
+
+    @property
     def _env_param(self):
-        """Access env_param via parent's env instance if available."""
+        """Access env_param: standalone scene > parent env > irsim global."""
+        if self._scene is not None:
+            return self._scene
         if self.parent is not None and self.parent._env is not None:
             return self.parent._env._env_param
         try:
