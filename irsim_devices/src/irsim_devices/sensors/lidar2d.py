@@ -334,6 +334,24 @@ class Lidar2D:
         self._work_seg_sy: np.ndarray | None = None
         self._work_seg_ex: np.ndarray | None = None
         self._work_seg_ey: np.ndarray | None = None
+        # Pre-allocated prefilter temporaries — these 6 arrays would otherwise
+        # be heap-allocated on every step (one per intermediate expression in
+        # the closest-point-on-segment test).  Sized to total segment count at
+        # _attach_scene time and reused every step.
+        self._pf_ax: np.ndarray | None = None
+        self._pf_ay: np.ndarray | None = None
+        self._pf_t: np.ndarray | None = None
+        self._pf_px: np.ndarray | None = None
+        self._pf_py: np.ndarray | None = None
+        self._pf_mask: np.ndarray | None = None
+        # Pose-change cache: skip the prefilter entirely when the robot has not
+        # moved more than filter_margin metres from the last filter position.
+        # The filter runs at range_max + margin so the cached segment set is
+        # always a superset of the true in-range set (triangle inequality).
+        self._filter_cache_x: float = np.inf
+        self._filter_cache_y: float = np.inf
+        self._filter_cache_M: int = 0
+        self._filter_margin: float = 1.0  # metres; configurable via set_scene()
 
         try:
             from irsim_devices.core.ray_casting_2d_omp import (
@@ -382,12 +400,20 @@ class Lidar2D:
     def scene(self, value: object | None) -> None:
         self._attach_scene(value)
 
-    def set_scene(self, scene: object | None, n_omp_threads: int = 2) -> None:
+    def set_scene(
+        self,
+        scene: object | None,
+        n_omp_threads: int = 2,
+        filter_margin: float = 1.0,
+    ) -> None:
         """Attach a standalone scene and configure the sensor for low-CPU operation.
 
         Precomputes all static segment geometry from *scene* at call time so that
-        each :meth:`step` call requires no Shapely operations — only a NumPy
-        range prefilter and one in-place AVX2 kernel call.
+        each :meth:`step` call requires no Shapely operations.  Also installs a
+        pose-change cache so the per-step range prefilter is skipped whenever the
+        sensor has not moved more than *filter_margin* metres from its position at
+        the last filter run — which is the common case for robots navigating at
+        typical indoor speeds (0.5–1.5 m/s at 30 Hz).
 
         Also sets the number of OpenMP threads used by the raycasting kernel so
         the sensor does not starve a robot stack running in the same process.
@@ -399,7 +425,14 @@ class Lidar2D:
             n_omp_threads: OMP thread count for the raycasting kernel.  Default
                 ``2`` — enough to achieve >200 Hz at 1500 beams / 30 m while
                 leaving the remaining cores free for the robot stack.
+            filter_margin: Safety margin in metres added to *range_max* when
+                computing the cached segment set.  The cache is valid as long as
+                the robot moves less than this distance between refilter calls,
+                guaranteeing the cached set is always a superset of the true
+                in-range segments.  Default ``1.0`` m; increase for faster
+                robots or decrease to reduce the extra kernel work on cache hits.
         """
+        self._filter_margin = float(filter_margin)
         try:
             from irsim_devices.core.ray_casting_2d_omp import set_omp_threads
 
@@ -429,6 +462,15 @@ class Lidar2D:
             self._work_seg_sy = None
             self._work_seg_ex = None
             self._work_seg_ey = None
+            self._pf_ax = None
+            self._pf_ay = None
+            self._pf_t = None
+            self._pf_px = None
+            self._pf_py = None
+            self._pf_mask = None
+            self._filter_cache_x = np.inf
+            self._filter_cache_y = np.inf
+            self._filter_cache_M = 0
             self._map_seg_cache = None
             self._map_cache_origin = np.full(2, np.inf)
             return
@@ -476,6 +518,19 @@ class Lidar2D:
         self._work_seg_sy = np.empty(M, dtype=np.float32)
         self._work_seg_ex = np.empty(M, dtype=np.float32)
         self._work_seg_ey = np.empty(M, dtype=np.float32)
+
+        # Pre-allocate prefilter temporaries (avoids 6 heap allocs per step)
+        self._pf_ax = np.empty(M, dtype=np.float32)
+        self._pf_ay = np.empty(M, dtype=np.float32)
+        self._pf_t = np.empty(M, dtype=np.float32)
+        self._pf_px = np.empty(M, dtype=np.float32)
+        self._pf_py = np.empty(M, dtype=np.float32)
+        self._pf_mask = np.empty(M, dtype=bool)
+
+        # Reset pose-change cache (force refilter on first step)
+        self._filter_cache_x = np.inf
+        self._filter_cache_y = np.inf
+        self._filter_cache_M = 0
 
         self._map_seg_cache = None
         self._map_cache_origin = np.full(2, np.inf)
@@ -662,12 +717,18 @@ class Lidar2D:
     def _step_fast(self, ox: float, oy: float, world_theta: float) -> None:
         """Zero-allocation inner step using precomputed f32 SoA geometry.
 
-        Called only when ``_attach_scene`` has run (precomputed segment SoA
-        arrays present) and the AVX2 float32 in-place kernel is available.
+        Runs fully allocation-free on cache-hit steps:
 
-        All intermediate arrays are pre-allocated class members; this method
-        makes no heap allocations beyond a small integer index array for the
-        filtered segment indices (typically a few KB).
+        * Direction rotation uses 6 in-place NumPy ops on pre-allocated buffers.
+        * The range prefilter is skipped when the sensor position is within
+          ``_filter_margin`` metres of the last filter run (pose-change cache).
+          Filtered segments already live in ``_work_seg_*``; the kernel reuses them.
+        * On a cache miss, the prefilter executes entirely in-place using
+          pre-allocated ``_pf_*`` temporaries (no heap allocations).
+        * The AVX2 float32 kernel writes results into pre-allocated output buffers.
+
+        The only remaining allocation on a cache-miss step is ``np.nonzero(mask)[0]``
+        (the filtered index array, typically a few KB).
         """
         rmax_f = np.float32(self.range_max)
         ox_f = np.float32(ox)
@@ -692,34 +753,65 @@ class Lidar2D:
         if M_all == 0:
             self._out_ranges_f32[:] = rmax_f
         else:
-            # ── Vectorised range prefilter: closest-point-on-segment test ────
-            # For each segment AB, find the point P closest to origin O and
-            # keep the segment when |OP| ≤ range_max.
-            # t* = clip(-dot(O-A, B-A) / |B-A|^2, 0, 1)
-            # P  = A + t*(B-A);  keep when |O-P|^2 ≤ rmax^2
-            ax = self._all_seg_sx - ox_f  # type: ignore[operator]
-            ay = self._all_seg_sy - oy_f  # type: ignore[operator]
-            t = np.clip(
-                -(ax * self._seg_dvx + ay * self._seg_dvy)  # type: ignore[operator]
-                / self._seg_len2_safe,
-                np.float32(0.0),
-                np.float32(1.0),
-            )
-            px = ax + t * self._seg_dvx  # type: ignore[operator]
-            py = ay + t * self._seg_dvy  # type: ignore[operator]
-            mask = px * px + py * py <= rmax_f * rmax_f
+            # ── Pose-change cache ─────────────────────────────────────────────
+            # The filtered segment set (which segments lie within range_max)
+            # changes only when the robot moves.  Cache the last filtered set
+            # and skip refiltering when position delta < filter_margin.
+            # The filter uses range_max + margin so the cached set is always a
+            # superset of the true in-range segments (triangle inequality), and
+            # the kernel correctly treats out-of-range segment hits as misses.
+            dx_c = ox_f - np.float32(self._filter_cache_x)
+            dy_c = oy_f - np.float32(self._filter_cache_y)
+            margin_f = np.float32(self._filter_margin)
 
-            idx = np.nonzero(mask)[0]
-            M_filt = len(idx)
+            if dx_c * dx_c + dy_c * dy_c > margin_f * margin_f:
+                # ── Cache miss: recompute prefilter in-place (no heap alloc) ─
+                # Closest-point-on-segment test, fully vectorised.
+                # t* = clip(-dot(O-A, B-A) / |B-A|^2, 0, 1)
+                # P  = A + t*(B-A);  keep when |O-P|^2 <= (rmax+margin)^2
+                rmax_m = rmax_f + margin_f
+                rmax_m_sq = rmax_m * rmax_m
+
+                # ax = sx - ox;  ay = sy - oy
+                np.subtract(self._all_seg_sx, ox_f, out=self._pf_ax)  # type: ignore[arg-type]
+                np.subtract(self._all_seg_sy, oy_f, out=self._pf_ay)  # type: ignore[arg-type]
+                # t_num = ax*dvx + ay*dvy  (reuse _pf_px as scratch)
+                np.multiply(self._pf_ax, self._seg_dvx, out=self._pf_t)  # type: ignore[arg-type]
+                np.multiply(self._pf_ay, self._seg_dvy, out=self._pf_px)  # type: ignore[arg-type]
+                np.add(self._pf_t, self._pf_px, out=self._pf_t)
+                np.negative(self._pf_t, out=self._pf_t)
+                np.divide(self._pf_t, self._seg_len2_safe, out=self._pf_t)  # type: ignore[arg-type]
+                np.clip(self._pf_t, np.float32(0.0), np.float32(1.0), out=self._pf_t)
+                # px = ax + t*dvx
+                np.multiply(self._pf_t, self._seg_dvx, out=self._pf_px)  # type: ignore[arg-type]
+                np.add(self._pf_ax, self._pf_px, out=self._pf_px)
+                # py = ay + t*dvy
+                np.multiply(self._pf_t, self._seg_dvy, out=self._pf_py)  # type: ignore[arg-type]
+                np.add(self._pf_ay, self._pf_py, out=self._pf_py)
+                # dist2 = px^2 + py^2  (reuse _pf_t and _pf_ay as scratch)
+                np.multiply(self._pf_px, self._pf_px, out=self._pf_t)
+                np.multiply(self._pf_py, self._pf_py, out=self._pf_ay)
+                np.add(self._pf_t, self._pf_ay, out=self._pf_t)
+                np.less_equal(self._pf_t, rmax_m_sq, out=self._pf_mask)  # type: ignore[arg-type]
+
+                idx = np.nonzero(self._pf_mask)[0]
+                M_filt = len(idx)
+                if M_filt > 0:
+                    np.take(self._all_seg_sx, idx, out=self._work_seg_sx[:M_filt])  # type: ignore[index]
+                    np.take(self._all_seg_sy, idx, out=self._work_seg_sy[:M_filt])  # type: ignore[index]
+                    np.take(self._all_seg_ex, idx, out=self._work_seg_ex[:M_filt])  # type: ignore[index]
+                    np.take(self._all_seg_ey, idx, out=self._work_seg_ey[:M_filt])  # type: ignore[index]
+
+                self._filter_cache_x = float(ox_f)
+                self._filter_cache_y = float(oy_f)
+                self._filter_cache_M = M_filt
+            else:
+                # ── Cache hit: reuse last filtered segment set ────────────────
+                M_filt = self._filter_cache_M
 
             if M_filt == 0:
                 self._out_ranges_f32[:] = rmax_f
             else:
-                # Compress filtered segments into pre-allocated working buffers
-                np.take(self._all_seg_sx, idx, out=self._work_seg_sx[:M_filt])  # type: ignore[index]
-                np.take(self._all_seg_sy, idx, out=self._work_seg_sy[:M_filt])  # type: ignore[index]
-                np.take(self._all_seg_ex, idx, out=self._work_seg_ex[:M_filt])  # type: ignore[index]
-                np.take(self._all_seg_ey, idx, out=self._work_seg_ey[:M_filt])  # type: ignore[index]
                 self._cast_inplace(  # type: ignore[misc]
                     self._origin_f32,
                     self._dir_dx_f32,
