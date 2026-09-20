@@ -82,9 +82,9 @@ def bench(name, fn, n=REPEATS, w=WARMUP):
     t0 = time.perf_counter()
     for _ in range(n):
         fn()
-    us = (time.perf_counter() - t0) / n * 1e6
-    print(f"  {name:35s}: {us:8.1f} µs/step")
-    return us
+    ms = (time.perf_counter() - t0) / n * 1e3
+    print(f"  {name:35s}: {ms:8.3f} ms/step")
+    return ms
 
 
 # ── Build scenes ───────────────────────────────────────────────────────────────
@@ -347,15 +347,15 @@ def main():
     def fn_3d():
         return s3d.cast_3d_lidar(origin3d, *VLP16, float(RMAX_3D))
 
-    us_scalar = bench("Embree2D scalar (1548 segs)", fn_scalar)
-    us_packet = bench("Embree2D packet-8 (1548 segs)", fn_packet)
-    us_3d = bench("Embree3D VLP-16 OMP (4692 tris)", fn_3d)
+    ms_scalar = bench("Embree2D scalar (1548 segs)", fn_scalar)
+    ms_packet = bench("Embree2D packet-8 (1548 segs)", fn_packet)
+    ms_3d = bench("Embree3D VLP-16 OMP (4692 tris)", fn_3d)
 
-    speedup = us_scalar / us_packet
+    speedup = ms_scalar / ms_packet
     print(f"\n  Packet-8 speedup over scalar: {speedup:.2f}×")
 
     # ── Try O3D 3D for fair comparison ────────────────────────────────────
-    us_o3d_3d = None
+    ms_o3d_3d = None
     try:
         import open3d as o3d
         import open3d.t.geometry as otg
@@ -391,7 +391,7 @@ def main():
         def fn_o3d():
             return rc.cast_rays(rays3)["t_hit"].numpy()
 
-        us_o3d_3d = bench("Open3D 3D VLP-16 (reference)", fn_o3d)
+        ms_o3d_3d = bench("Open3D 3D VLP-16 (reference)", fn_o3d)
     except Exception as e:
         print(f"  O3D 3D skipped: {e}")
 
@@ -409,20 +409,20 @@ def main():
             "hits_3d": int(len(scan3d)),
             "sensor_pos": [OX, OY, SENSOR_Z],
         },
-        "timing_us": {
-            k: round(v2, 1)
+        "timing_ms": {
+            k: round(v2, 3)
             for k, v2 in [
-                ("embree2d_scalar", us_scalar),
-                ("embree2d_packet8", us_packet),
-                ("embree3d_vlp16_omp", us_3d),
-                ("o3d_3d_vlp16", us_o3d_3d),
+                ("embree2d_scalar", ms_scalar),
+                ("embree2d_packet8", ms_packet),
+                ("embree3d_vlp16_omp", ms_3d),
+                ("o3d_3d_vlp16", ms_o3d_3d),
             ]
             if v2 is not None
         },
         "speedup_packet8_vs_scalar": round(speedup, 2),
     }
-    if us_o3d_3d:
-        results["speedup_3d_vs_o3d"] = round(us_o3d_3d / us_3d, 2)
+    if ms_o3d_3d:
+        results["speedup_3d_vs_o3d"] = round(ms_o3d_3d / ms_3d, 2)
 
     out_json = os.path.join(BENCH_DIR, "model_bench_results.json")
     with open(out_json, "w") as f:

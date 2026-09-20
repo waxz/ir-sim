@@ -15,11 +15,11 @@
       1.5
     ]
   },
-  "timing_us": {
-    "embree2d_scalar": 177.3,
-    "embree2d_packet8": 135.4,
-    "embree3d_vlp16_omp": 1816.8,
-    "o3d_3d_vlp16": 2495.1
+  "timing_ms": {
+    "embree2d_scalar": 0.177,
+    "embree2d_packet8": 0.135,
+    "embree3d_vlp16_omp": 1.817,
+    "o3d_3d_vlp16": 2.495
   },
   "speedup_packet8_vs_scalar": 1.31,
   "speedup_3d_vs_o3d": 1.37

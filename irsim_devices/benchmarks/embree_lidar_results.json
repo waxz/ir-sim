@@ -5,13 +5,13 @@
   "n_rays_vlp16": 28800,
   "n_tris": 1704,
   "hits_embree2d_scalar": 1500,
-  "timing_us": {
-    "o3d_2d_python": 192.7,
-    "embree2d_scalar_32": 130.5,
-    "embree2d_packet8_32": 94.0,
-    "embree2d_scalar_360": 135.6,
-    "o3d_3d_vlp16": 709.5,
-    "embree3d_vlp16_omp": 640.9
+  "timing_ms": {
+    "o3d_2d_python": 0.193,
+    "embree2d_scalar_32": 0.131,
+    "embree2d_packet8_32": 0.094,
+    "embree2d_scalar_360": 0.136,
+    "o3d_3d_vlp16": 0.710,
+    "embree3d_vlp16_omp": 0.641
   },
   "speedup_vs_o3d_2d": {
     "embree2d_scalar_32": 1.5,

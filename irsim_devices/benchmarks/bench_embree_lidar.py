@@ -167,9 +167,9 @@ def _bench(name, fn, n=REPEATS, w=WARMUP):
     t0 = time.perf_counter()
     for _ in range(n):
         fn()
-    us = (time.perf_counter() - t0) / n * 1e6
-    print(f"  {name:30s}: {us:8.1f} µs/step")
-    return us
+    ms = (time.perf_counter() - t0) / n * 1e3
+    print(f"  {name:30s}: {ms:8.3f} ms/step")
+    return ms
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -209,7 +209,7 @@ def main():
     print(f"\nHit counts (Embree2D scalar, res=32): {hits_e2d}/{N_BEAMS}")
 
     # ── O3D Python baseline ───────────────────────────────────────────────────
-    us_o3d = None
+    ms_o3d = None
     try:
         import open3d as o3d
         import open3d.t.geometry as otg
@@ -262,12 +262,12 @@ def main():
             return np.minimum(rc.cast_rays(rays)["t_hit"].numpy(), RMAX)
 
         print("\nBenchmark (1500 beams, warehouse scene, 2000 reps):")
-        us_o3d = _bench("Open3D Python", fn_o3d)
+        ms_o3d = _bench("Open3D Python", fn_o3d)
     except ImportError:
         print("  Open3D not available — skipping O3D baseline")
 
     # ── AVX2 scalar kernel ────────────────────────────────────────────────────
-    us_avx2_32 = None
+    ms_avx2_32 = None
     try:
         sys.path.insert(0, os.path.join(SRC_DIR, "irsim_devices", "core"))
         from irsim_devices.core.ray_casting_2d import cast_ray_segments  # noqa: E402
@@ -289,23 +289,23 @@ def main():
                 RMAX,
             )
 
-        if us_o3d is None:
+        if ms_o3d is None:
             print("\nBenchmark (1500 beams, warehouse scene, 2000 reps):")
-        us_avx2_32 = _bench("AVX2 scalar (Python)", fn_avx2)
+        ms_avx2_32 = _bench("AVX2 scalar (Python)", fn_avx2)
     except Exception as e:
         print(f"  AVX2 kernel unavailable: {e}")
 
     # ── Embree 2D ─────────────────────────────────────────────────────────────
-    if us_o3d is None and us_avx2_32 is None:
+    if ms_o3d is None and ms_avx2_32 is None:
         print("\nBenchmark (1500 beams, warehouse scene, 2000 reps):")
-    us_e2d_s32 = _bench("Embree2D scalar  (res=32)", fn_e2d_s32)
-    us_e2d_8_32 = _bench("Embree2D packet8 (res=32)", fn_e2d_8_32)
-    us_e2d_s360 = _bench("Embree2D scalar  (res=360)", fn_e2d_s360)
+    ms_e2d_s32 = _bench("Embree2D scalar  (res=32)", fn_e2d_s32)
+    ms_e2d_8_32 = _bench("Embree2D packet8 (res=32)", fn_e2d_8_32)
+    ms_e2d_s360 = _bench("Embree2D scalar  (res=360)", fn_e2d_s360)
 
     # ── Embree 3D vs O3D 3D (fair: same VLP-16 ray count) ────────────────────
     soup = build_3d_mesh(32)
-    us_e3d = None
-    us_o3d_3d = None
+    ms_e3d = None
+    ms_o3d_3d = None
     n_tris = 0
     vlp16_rays = 16 * 1800  # 28800
 
@@ -323,7 +323,7 @@ def main():
         print(
             f"  Embree3D VLP-16 ({vlp16_rays} rays, {n_tris} tris): {len(warmup_scan)} hits"
         )
-        us_e3d = _bench("Embree3D VLP-16 (OMP)", fn_e3d)
+        ms_e3d = _bench("Embree3D VLP-16 (OMP)", fn_e3d)
 
         # O3D with same VLP-16 rays for a fair comparison
         try:
@@ -362,7 +362,7 @@ def main():
             def fn_o3d_3d():
                 return rc.cast_rays(rays3)["t_hit"].numpy()
 
-            us_o3d_3d = _bench("O3D  VLP-16 (threaded)", fn_o3d_3d)
+            ms_o3d_3d = _bench("O3D  VLP-16 (threaded)", fn_o3d_3d)
         except Exception as e:
             print(f"  O3D 3D benchmark skipped: {e}")
 
@@ -371,25 +371,25 @@ def main():
     print(
         f"Summary — LiDAR 2D ({N_BEAMS} beams, 440 segs) + 3D ({vlp16_rays} rays, {n_tris} tris)"
     )
-    if us_o3d:
-        print(f"  O3D  2D Python         : {us_o3d:8.1f} µs")
-    if us_avx2_32:
-        print(f"  AVX2 scalar kernel     : {us_avx2_32:8.1f} µs")
-    if us_o3d:
+    if ms_o3d:
+        print(f"  O3D  2D Python         : {ms_o3d:8.3f} ms")
+    if ms_avx2_32:
+        print(f"  AVX2 scalar kernel     : {ms_avx2_32:8.3f} ms")
+    if ms_o3d:
         print(
-            f"  Embree2D scalar  N=32  : {us_e2d_s32:8.1f} µs  ({us_o3d / us_e2d_s32:.1f}× vs O3D)"
+            f"  Embree2D scalar  N=32  : {ms_e2d_s32:8.3f} ms  ({ms_o3d / ms_e2d_s32:.1f}× vs O3D)"
         )
         print(
-            f"  Embree2D packet8 N=32  : {us_e2d_8_32:8.1f} µs  ({us_o3d / us_e2d_8_32:.1f}× vs O3D)"
+            f"  Embree2D packet8 N=32  : {ms_e2d_8_32:8.3f} ms  ({ms_o3d / ms_e2d_8_32:.1f}× vs O3D)"
         )
     else:
-        print(f"  Embree2D scalar  N=32  : {us_e2d_s32:8.1f} µs")
-        print(f"  Embree2D packet8 N=32  : {us_e2d_8_32:8.1f} µs")
-    if us_o3d_3d:
-        print(f"  O3D  3D VLP-16         : {us_o3d_3d:8.1f} µs")
-    if us_e3d:
-        sp3 = f"  ({us_o3d_3d / us_e3d:.1f}× vs O3D)" if us_o3d_3d else ""
-        print(f"  Embree3D VLP-16        : {us_e3d:8.1f} µs{sp3}")
+        print(f"  Embree2D scalar  N=32  : {ms_e2d_s32:8.3f} ms")
+        print(f"  Embree2D packet8 N=32  : {ms_e2d_8_32:8.3f} ms")
+    if ms_o3d_3d:
+        print(f"  O3D  3D VLP-16         : {ms_o3d_3d:8.3f} ms")
+    if ms_e3d:
+        sp3 = f"  ({ms_o3d_3d / ms_e3d:.1f}× vs O3D)" if ms_o3d_3d else ""
+        print(f"  Embree3D VLP-16        : {ms_e3d:8.3f} ms{sp3}")
 
     results = {
         "n_beams_2d": N_BEAMS,
@@ -398,34 +398,34 @@ def main():
         "n_rays_vlp16": vlp16_rays,
         "n_tris": n_tris,
         "hits_embree2d_scalar": hits_e2d,
-        "timing_us": {
-            k: round(v, 1)
+        "timing_ms": {
+            k: round(v, 3)
             for k, v in [
-                ("o3d_2d_python", us_o3d),
-                ("avx2_scalar_2d", us_avx2_32),
-                ("embree2d_scalar_32", us_e2d_s32),
-                ("embree2d_packet8_32", us_e2d_8_32),
-                ("embree2d_scalar_360", us_e2d_s360),
-                ("o3d_3d_vlp16", us_o3d_3d),
-                ("embree3d_vlp16_omp", us_e3d),
+                ("o3d_2d_python", ms_o3d),
+                ("avx2_scalar_2d", ms_avx2_32),
+                ("embree2d_scalar_32", ms_e2d_s32),
+                ("embree2d_packet8_32", ms_e2d_8_32),
+                ("embree2d_scalar_360", ms_e2d_s360),
+                ("o3d_3d_vlp16", ms_o3d_3d),
+                ("embree3d_vlp16_omp", ms_e3d),
             ]
             if v is not None
         },
         "speedup_vs_o3d_2d": (
             {
-                k: round(us_o3d / v, 1)
+                k: round(ms_o3d / v, 1)
                 for k, v in [
-                    ("embree2d_scalar_32", us_e2d_s32),
-                    ("embree2d_packet8_32", us_e2d_8_32),
+                    ("embree2d_scalar_32", ms_e2d_s32),
+                    ("embree2d_packet8_32", ms_e2d_8_32),
                 ]
                 if v is not None
             }
-            if us_o3d
+            if ms_o3d
             else {}
         ),
         "speedup_vs_o3d_3d": (
-            {"embree3d_vlp16": round(us_o3d_3d / us_e3d, 1)}
-            if us_o3d_3d and us_e3d
+            {"embree3d_vlp16": round(ms_o3d_3d / ms_e3d, 1)}
+            if ms_o3d_3d and ms_e3d
             else {}
         ),
     }
