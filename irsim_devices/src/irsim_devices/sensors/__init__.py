@@ -21,3 +21,17 @@ try:
     __all__ += ["Lidar3D"]
 except ImportError:
     pass
+
+try:
+    from irsim_devices.sensors.lidar2d_embree import EmbreeLidar2D
+
+    __all__ += ["EmbreeLidar2D"]
+except ImportError:
+    pass
+
+try:
+    from irsim_devices.sensors.lidar3d_embree import EmbreeLidar3D
+
+    __all__ += ["EmbreeLidar3D"]
+except ImportError:
+    pass
