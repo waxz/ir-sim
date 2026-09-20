@@ -284,6 +284,124 @@ struct EmbreeScene2D {
         }
     }
 
+    // ── cast16 ────────────────────────────────────────────────────────────────
+    /**
+     * 16-ray AVX-512 packet cast.  Processes 16 rays per rtcIntersect16 call,
+     * falls back to packet8 then scalar for remainders.
+     */
+    void cast16_inplace(
+        py::array_t<float, py::array::c_style> origin_f,
+        py::array_t<float, py::array::c_style> dir_dx_f,
+        py::array_t<float, py::array::c_style> dir_dy_f,
+        float max_range_f,
+        py::array_t<float, py::array::c_style> out_ranges_f,
+        py::array_t<int,   py::array::c_style> out_hit_i
+    ) {
+        if (!scene_) throw std::runtime_error("EmbreeScene2D: scene not built");
+
+        auto ox = origin_f.unchecked<1>();
+        auto dx = dir_dx_f.unchecked<1>();
+        auto dy = dir_dy_f.unchecked<1>();
+        auto  r = out_ranges_f.mutable_unchecked<1>();
+        auto  h = out_hit_i.mutable_unchecked<1>();
+
+        const int N = (int)dx.shape(0);
+        const float ox_val = ox(0), oy_val = ox(1);
+
+        int i = 0;
+        // ── packet16 (AVX-512) blocks ────────────────────────────────────────
+        for (; i + 16 <= N; i += 16) {
+            struct RTCRayHit16 rh16;
+            int valid[16];
+            for (int k = 0; k < 16; ++k) {
+                valid[k] = -1;
+                rh16.ray.org_x[k]  = ox_val;
+                rh16.ray.org_y[k]  = oy_val;
+                rh16.ray.org_z[k]  = RAY_Z;
+                rh16.ray.dir_x[k]  = dx(i+k);
+                rh16.ray.dir_y[k]  = dy(i+k);
+                rh16.ray.dir_z[k]  = 0.f;
+                rh16.ray.tnear[k]  = TNEAR;
+                rh16.ray.tfar[k]   = max_range_f;
+                rh16.ray.mask[k]   = 0xFFFFFFFF;
+                rh16.ray.flags[k]  = 0;
+                rh16.ray.time[k]   = 0.f;
+                rh16.hit.geomID[k] = RTC_INVALID_GEOMETRY_ID;
+                rh16.hit.primID[k] = RTC_INVALID_GEOMETRY_ID;
+                rh16.hit.instID[0][k] = RTC_INVALID_GEOMETRY_ID;
+            }
+            struct RTCIntersectArguments iargs;
+            rtcInitIntersectArguments(&iargs);
+            rtcIntersect16(valid, scene_, &rh16, &iargs);
+            for (int k = 0; k < 16; ++k) {
+                if (rh16.hit.geomID[k] != RTC_INVALID_GEOMETRY_ID) {
+                    r(i+k) = rh16.ray.tfar[k];
+                    h(i+k) = (int)(rh16.hit.primID[k] / 2);
+                } else {
+                    r(i+k) = max_range_f;
+                    h(i+k) = -1;
+                }
+            }
+        }
+        // ── packet8 remainder ────────────────────────────────────────────────
+        for (; i + 8 <= N; i += 8) {
+            struct RTCRayHit8 rh8;
+            int valid[8];
+            for (int k = 0; k < 8; ++k) {
+                valid[k] = -1;
+                rh8.ray.org_x[k]  = ox_val;
+                rh8.ray.org_y[k]  = oy_val;
+                rh8.ray.org_z[k]  = RAY_Z;
+                rh8.ray.dir_x[k]  = dx(i+k);
+                rh8.ray.dir_y[k]  = dy(i+k);
+                rh8.ray.dir_z[k]  = 0.f;
+                rh8.ray.tnear[k]  = TNEAR;
+                rh8.ray.tfar[k]   = max_range_f;
+                rh8.ray.mask[k]   = 0xFFFFFFFF;
+                rh8.ray.flags[k]  = 0;
+                rh8.ray.time[k]   = 0.f;
+                rh8.hit.geomID[k] = RTC_INVALID_GEOMETRY_ID;
+                rh8.hit.primID[k] = RTC_INVALID_GEOMETRY_ID;
+                rh8.hit.instID[0][k] = RTC_INVALID_GEOMETRY_ID;
+            }
+            struct RTCIntersectArguments iargs;
+            rtcInitIntersectArguments(&iargs);
+            rtcIntersect8(valid, scene_, &rh8, &iargs);
+            for (int k = 0; k < 8; ++k) {
+                if (rh8.hit.geomID[k] != RTC_INVALID_GEOMETRY_ID) {
+                    r(i+k) = rh8.ray.tfar[k];
+                    h(i+k) = (int)(rh8.hit.primID[k] / 2);
+                } else {
+                    r(i+k) = max_range_f;
+                    h(i+k) = -1;
+                }
+            }
+        }
+        // ── scalar tail ──────────────────────────────────────────────────────
+        for (; i < N; ++i) {
+            struct RTCRayHit rh;
+            rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+            rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+            rh.ray.org_x  = ox_val; rh.ray.org_y = oy_val; rh.ray.org_z = RAY_Z;
+            rh.ray.dir_x  = dx(i); rh.ray.dir_y = dy(i); rh.ray.dir_z = 0.f;
+            rh.ray.tnear  = TNEAR; rh.ray.tfar   = max_range_f;
+            rh.ray.mask   = 0xFFFFFFFF; rh.ray.flags = 0;
+            rh.hit.Ng_x = rh.hit.Ng_y = rh.hit.Ng_z = 0.f;
+            rh.hit.u = rh.hit.v = 0.f;
+            rh.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+            struct RTCIntersectArguments iargs;
+            rtcInitIntersectArguments(&iargs);
+            rtcIntersect1(scene_, &rh, &iargs);
+            if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
+                r(i) = rh.ray.tfar;
+                h(i) = (int)(rh.hit.primID / 2);
+            } else {
+                r(i) = max_range_f;
+                h(i) = -1;
+            }
+        }
+    }
+
     int n_segments() const { return n_segs_; }
 
 private:
@@ -491,6 +609,162 @@ struct EmbreeScene3D {
         return result;
     }
 
+    // ── cast_3d_lidar_packet16 ────────────────────────────────────────────────
+    /**
+     * AVX-512 packet16 + OpenMP spinning LiDAR.
+     *
+     * Outer loop iterates over n_horizontal azimuth steps (OMP-parallel).
+     * Inner loop packs n_vertical elevation rays into packet16 blocks (ideally
+     * one call for VLP-16 with n_vertical==16) then falls back to packet8 and
+     * scalar for remainders.  Coherent elevation bundles share BVH subtrees,
+     * giving substantially better SIMD utilisation than the scalar path.
+     *
+     * Same signature and return format as cast_3d_lidar().
+     */
+    py::array_t<float> cast_3d_lidar_packet16(
+        py::array_t<float> origin,
+        int   n_vertical,
+        int   n_horizontal,
+        float elev_min_deg,
+        float elev_max_deg,
+        float range_max
+    ) {
+        if (!scene_) throw std::runtime_error("EmbreeScene3D: scene not built");
+
+        auto ob = origin.unchecked<1>();
+        if (ob.shape(0) < 3) throw std::invalid_argument("origin must have 3 elements");
+
+        const float ox = ob(0), oy = ob(1), oz = ob(2);
+        const float az_step = 2.f * (float)M_PI / (float)n_horizontal;
+        const float el_step = (n_vertical > 1)
+            ? deg2rad(elev_max_deg - elev_min_deg) / (float)(n_vertical - 1)
+            : 0.f;
+        const float el_min = deg2rad(elev_min_deg);
+        const int N = n_vertical * n_horizontal;
+
+        // Pre-compute all ray directions (row-major: [h][v])
+        std::vector<float> dir_x(N), dir_y(N), dir_z(N);
+        for (int h = 0; h < n_horizontal; ++h) {
+            float az = (float)h * az_step;
+            float cos_az = std::cos(az), sin_az = std::sin(az);
+            for (int v = 0; v < n_vertical; ++v) {
+                float el = el_min + (float)v * el_step;
+                float cos_el = std::cos(el), sin_el = std::sin(el);
+                int idx = h * n_vertical + v;
+                dir_x[idx] = cos_el * cos_az;
+                dir_y[idx] = cos_el * sin_az;
+                dir_z[idx] = sin_el;
+            }
+        }
+
+        std::vector<float> t_out(N, -1.f);
+
+        // OMP over azimuth steps; each step uses packet16/8/scalar for elevation
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 32)
+#endif
+        for (int h = 0; h < n_horizontal; ++h) {
+            int v = 0;
+            const int base = h * n_vertical;
+
+            // ── packet16 blocks (AVX-512) ─────────────────────────────────
+            for (; v + 16 <= n_vertical; v += 16) {
+                struct RTCRayHit16 rh16;
+                int valid[16];
+                for (int k = 0; k < 16; ++k) {
+                    int idx = base + v + k;
+                    valid[k] = -1;
+                    rh16.ray.org_x[k]  = ox;
+                    rh16.ray.org_y[k]  = oy;
+                    rh16.ray.org_z[k]  = oz;
+                    rh16.ray.dir_x[k]  = dir_x[idx];
+                    rh16.ray.dir_y[k]  = dir_y[idx];
+                    rh16.ray.dir_z[k]  = dir_z[idx];
+                    rh16.ray.tnear[k]  = TNEAR;
+                    rh16.ray.tfar[k]   = range_max;
+                    rh16.ray.mask[k]   = 0xFFFFFFFF;
+                    rh16.ray.flags[k]  = 0;
+                    rh16.ray.time[k]   = 0.f;
+                    rh16.hit.geomID[k] = RTC_INVALID_GEOMETRY_ID;
+                    rh16.hit.primID[k] = RTC_INVALID_GEOMETRY_ID;
+                    rh16.hit.instID[0][k] = RTC_INVALID_GEOMETRY_ID;
+                }
+                struct RTCIntersectArguments iargs;
+                rtcInitIntersectArguments(&iargs);
+                rtcIntersect16(valid, scene_, &rh16, &iargs);
+                for (int k = 0; k < 16; ++k) {
+                    if (rh16.hit.geomID[k] != RTC_INVALID_GEOMETRY_ID)
+                        t_out[base + v + k] = rh16.ray.tfar[k];
+                }
+            }
+            // ── packet8 remainder ─────────────────────────────────────────
+            for (; v + 8 <= n_vertical; v += 8) {
+                struct RTCRayHit8 rh8;
+                int valid[8];
+                for (int k = 0; k < 8; ++k) {
+                    int idx = base + v + k;
+                    valid[k] = -1;
+                    rh8.ray.org_x[k]  = ox;
+                    rh8.ray.org_y[k]  = oy;
+                    rh8.ray.org_z[k]  = oz;
+                    rh8.ray.dir_x[k]  = dir_x[idx];
+                    rh8.ray.dir_y[k]  = dir_y[idx];
+                    rh8.ray.dir_z[k]  = dir_z[idx];
+                    rh8.ray.tnear[k]  = TNEAR;
+                    rh8.ray.tfar[k]   = range_max;
+                    rh8.ray.mask[k]   = 0xFFFFFFFF;
+                    rh8.ray.flags[k]  = 0;
+                    rh8.ray.time[k]   = 0.f;
+                    rh8.hit.geomID[k] = RTC_INVALID_GEOMETRY_ID;
+                    rh8.hit.primID[k] = RTC_INVALID_GEOMETRY_ID;
+                    rh8.hit.instID[0][k] = RTC_INVALID_GEOMETRY_ID;
+                }
+                struct RTCIntersectArguments iargs;
+                rtcInitIntersectArguments(&iargs);
+                rtcIntersect8(valid, scene_, &rh8, &iargs);
+                for (int k = 0; k < 8; ++k) {
+                    if (rh8.hit.geomID[k] != RTC_INVALID_GEOMETRY_ID)
+                        t_out[base + v + k] = rh8.ray.tfar[k];
+                }
+            }
+            // ── scalar tail ───────────────────────────────────────────────
+            for (; v < n_vertical; ++v) {
+                int idx = base + v;
+                struct RTCRayHit rh;
+                struct RTCIntersectArguments iargs;
+                rtcInitIntersectArguments(&iargs);
+                rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+                rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+                rh.ray.org_x = ox; rh.ray.org_y = oy; rh.ray.org_z = oz;
+                rh.ray.dir_x = dir_x[idx]; rh.ray.dir_y = dir_y[idx]; rh.ray.dir_z = dir_z[idx];
+                rh.ray.tnear = TNEAR; rh.ray.tfar = range_max;
+                rh.ray.mask = 0xFFFFFFFF; rh.ray.flags = 0;
+                rh.hit.Ng_x = rh.hit.Ng_y = rh.hit.Ng_z = 0.f;
+                rh.hit.u = rh.hit.v = 0.f;
+                rh.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+                rtcIntersect1(scene_, &rh, &iargs);
+                if (rh.hit.geomID != RTC_INVALID_GEOMETRY_ID)
+                    t_out[idx] = rh.ray.tfar;
+            }
+        }
+
+        // Pack hits
+        std::vector<float> hits;
+        hits.reserve(N * 4 / 2);
+        for (int i = 0; i < N; ++i) {
+            if (t_out[i] < 0.f) continue;
+            float t = t_out[i];
+            hits.push_back(ox + t * dir_x[i]);
+            hits.push_back(oy + t * dir_y[i]);
+            hits.push_back(oz + t * dir_z[i]);
+            hits.push_back(t);
+        }
+        int n_hits = (int)(hits.size() / 4);
+        auto result = py::array_t<float>({n_hits, 4});
+        std::memcpy(result.mutable_data(), hits.data(), hits.size() * sizeof(float));
+        return result;
+    }
+
     // ── cast_rays ─────────────────────────────────────────────────────────────
     /**
      * General multi-ray cast.
@@ -577,7 +851,12 @@ PYBIND11_MODULE(lidar_embree, m) {
              py::arg("origin_f"), py::arg("dir_dx_f"), py::arg("dir_dy_f"),
              py::arg("max_range_f"),
              py::arg("out_ranges_f"), py::arg("out_hit_i"),
-             "8-ray SIMD packet cast (AVX2 path, ~1.5× faster on long scans).")
+             "8-ray SIMD packet cast (AVX2 path).")
+        .def("cast16_inplace", &EmbreeScene2D::cast16_inplace,
+             py::arg("origin_f"), py::arg("dir_dx_f"), py::arg("dir_dy_f"),
+             py::arg("max_range_f"),
+             py::arg("out_ranges_f"), py::arg("out_hit_i"),
+             "16-ray AVX-512 packet cast; falls back to packet8+scalar for remainders.")
         .def("n_segments", &EmbreeScene2D::n_segments,
              "Number of 2D segments in the scene.");
 
@@ -607,6 +886,14 @@ PYBIND11_MODULE(lidar_embree, m) {
              py::arg("elev_min_deg"), py::arg("elev_max_deg"),
              py::arg("range_max"),
              "Cast a full spinning LiDAR scan. Returns float32 [N_hits, 4] (x,y,z,dist).")
+        .def("cast_3d_lidar_packet16", &EmbreeScene3D::cast_3d_lidar_packet16,
+             py::arg("origin"),
+             py::arg("n_vertical"), py::arg("n_horizontal"),
+             py::arg("elev_min_deg"), py::arg("elev_max_deg"),
+             py::arg("range_max"),
+             "AVX-512 packet16 + OMP spinning LiDAR scan. "
+             "Optimal for VLP-16 (n_vertical=16): one rtcIntersect16 per azimuth step. "
+             "Returns float32 [N_hits, 4] (x,y,z,dist).")
         .def("cast_rays", &EmbreeScene3D::cast_rays,
              py::arg("origins"), py::arg("directions"), py::arg("range_max"),
              "Cast N rays, returns float32 [N] ranges.");

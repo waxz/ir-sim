@@ -332,8 +332,18 @@ def main():
             out_h2,
         )
 
-    def fn_packet():
+    def fn_packet8():
         return s2d.cast8_inplace(
+            origin_f,
+            dx.astype(np.float32),
+            dy.astype(np.float32),
+            float(RMAX_2D),
+            out_r2,
+            out_h2,
+        )
+
+    def fn_packet16():
+        return s2d.cast16_inplace(
             origin_f,
             dx.astype(np.float32),
             dy.astype(np.float32),
@@ -347,12 +357,18 @@ def main():
     def fn_3d():
         return s3d.cast_3d_lidar(origin3d, *VLP16, float(RMAX_3D))
 
-    ms_scalar = bench("Embree2D scalar (1548 segs)", fn_scalar)
-    ms_packet = bench("Embree2D packet-8 (1548 segs)", fn_packet)
-    ms_3d = bench("Embree3D VLP-16 OMP (4692 tris)", fn_3d)
+    def fn_3d_p16():
+        return s3d.cast_3d_lidar_packet16(origin3d, *VLP16, float(RMAX_3D))
 
-    speedup = ms_scalar / ms_packet
-    print(f"\n  Packet-8 speedup over scalar: {speedup:.2f}×")
+    ms_scalar = bench("Embree2D scalar      (1548 segs)", fn_scalar)
+    ms_packet8 = bench("Embree2D packet-8    (1548 segs)", fn_packet8)
+    ms_packet16 = bench("Embree2D packet-16   (1548 segs)", fn_packet16)
+    ms_3d = bench("Embree3D VLP-16 scalar+OMP (4692 tris)", fn_3d)
+    ms_3d_p16 = bench("Embree3D VLP-16 pkt16+OMP (4692 tris)", fn_3d_p16)
+
+    print(f"\n  2D  packet8  vs scalar  : {ms_scalar / ms_packet8:.2f}×")
+    print(f"  2D  packet16 vs scalar  : {ms_scalar / ms_packet16:.2f}×")
+    print(f"  3D  pkt16+OMP vs scalar : {ms_3d / ms_3d_p16:.2f}×")
 
     # ── Try O3D 3D for fair comparison ────────────────────────────────────
     ms_o3d_3d = None
@@ -413,16 +429,26 @@ def main():
             k: round(v2, 3)
             for k, v2 in [
                 ("embree2d_scalar", ms_scalar),
-                ("embree2d_packet8", ms_packet),
+                ("embree2d_packet8", ms_packet8),
+                ("embree2d_packet16", ms_packet16),
                 ("embree3d_vlp16_omp", ms_3d),
+                ("embree3d_vlp16_pkt16_omp", ms_3d_p16),
                 ("o3d_3d_vlp16", ms_o3d_3d),
             ]
             if v2 is not None
         },
-        "speedup_packet8_vs_scalar": round(speedup, 2),
+        "speedup_2d": {
+            "packet8_vs_scalar": round(ms_scalar / ms_packet8, 2),
+            "packet16_vs_scalar": round(ms_scalar / ms_packet16, 2),
+            "packet16_vs_packet8": round(ms_packet8 / ms_packet16, 2),
+        },
+        "speedup_3d_pkt16_vs_scalar_omp": round(ms_3d / ms_3d_p16, 2),
     }
     if ms_o3d_3d:
-        results["speedup_3d_vs_o3d"] = round(ms_o3d_3d / ms_3d, 2)
+        results["speedup_3d_vs_o3d"] = {
+            "scalar_omp": round(ms_o3d_3d / ms_3d, 2),
+            "pkt16_omp": round(ms_o3d_3d / ms_3d_p16, 2),
+        }
 
     out_json = os.path.join(BENCH_DIR, "model_bench_results.json")
     with open(out_json, "w") as f:
