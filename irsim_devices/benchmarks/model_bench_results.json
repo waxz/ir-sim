@@ -1,0 +1,26 @@
+{
+  "model": {
+    "vertices": 3104,
+    "triangles": 4692,
+    "segments_2d": 1548
+  },
+  "raycast": {
+    "n_beams_2d": 1500,
+    "hits_2d": 1500,
+    "n_rays_3d": 28800,
+    "hits_3d": 28766,
+    "sensor_pos": [
+      12.0,
+      15.0,
+      1.5
+    ]
+  },
+  "timing_us": {
+    "embree2d_scalar": 177.3,
+    "embree2d_packet8": 135.4,
+    "embree3d_vlp16_omp": 1816.8,
+    "o3d_3d_vlp16": 2495.1
+  },
+  "speedup_packet8_vs_scalar": 1.31,
+  "speedup_3d_vs_o3d": 1.37
+}
