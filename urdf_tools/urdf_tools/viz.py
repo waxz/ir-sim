@@ -18,33 +18,41 @@ from .parser import Geometry, Robot
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
+_ALPHA_CUTOFF = 0.1  # skip near-transparent visuals (e.g. scene_bounds phantoms)
+
+
 def _link_world_blocks(
-    robot: Robot, use_collision: bool = True
-) -> list[tuple[np.ndarray, Geometry]]:
-    """Return (world_T 4×4, Geometry) for every geometry block in the robot."""
+    robot: Robot, use_collision: bool = False
+) -> list[tuple[np.ndarray, Geometry, list[float]]]:
+    """Return (world_T 4×4, Geometry, rgba) for every visible geometry block."""
     parent_map = robot.parent_map()
     joint_T = {j.child: pose_to_matrix(j.pose.xyz, j.pose.rpy) for j in robot.joints}
 
-    results: list[tuple[np.ndarray, Geometry]] = []
+    results: list[tuple[np.ndarray, Geometry, list[float]]] = []
     for link in robot.links:
         T_world = world_transform(link.name, parent_map, joint_T)
-        blocks = link.collisions if use_collision else link.visuals
+        # Prefer visuals (they carry color); fall back to collisions for display
+        blocks = link.visuals if not use_collision else link.collisions
         if not blocks:
-            blocks = link.visuals if use_collision else link.collisions
+            blocks = link.collisions if not use_collision else link.visuals
         for block in blocks:
             if block.geometry is None or block.geometry.type == "mesh":
                 continue
+            if block.color[3] < _ALPHA_CUTOFF:
+                continue  # skip phantom / near-transparent geometry
             T_local = pose_to_matrix(block.pose.xyz, block.pose.rpy)
-            results.append((T_world @ T_local, block.geometry))
+            results.append((T_world @ T_local, block.geometry, block.color))
     return results
 
 
 # ── 2D floor plan ─────────────────────────────────────────────────────────────
 
 
-def _xy_footprint(T: np.ndarray, geom: Geometry) -> list[tuple[str, object]]:
+def _xy_footprint(
+    T: np.ndarray, geom: Geometry, color: list[float]
+) -> list[tuple[str, object, list[float]]]:
     """Top-down XY footprint of a geometry in world frame."""
-    patches: list[tuple[str, object]] = []
+    patches: list[tuple[str, object, list[float]]] = []
     if geom.type == "box":
         sx, sy = geom.size[0] / 2, geom.size[1] / 2
         local = np.array(
@@ -56,10 +64,10 @@ def _xy_footprint(T: np.ndarray, geom: Geometry) -> list[tuple[str, object]]:
             ]
         ).T
         world_xy = (T @ local)[:2, :].T  # (4, 2)
-        patches.append(("polygon", world_xy))
+        patches.append(("polygon", world_xy, color))
     elif geom.type in ("cylinder", "sphere"):
         cx, cy = T[0, 3], T[1, 3]
-        patches.append(("circle", (cx, cy, geom.radius)))
+        patches.append(("circle", (cx, cy, geom.radius), color))
     return patches
 
 
@@ -78,30 +86,82 @@ def plot_floor_plan(
     ax.set_facecolor("#f0f2f5")
     ax.set_aspect("equal")
 
-    for T, geom in _link_world_blocks(robot):
-        for kind, params in _xy_footprint(T, geom):
-            if kind == "polygon":
-                ax.add_patch(
-                    plt.Polygon(
-                        params,
-                        fc="#94a3b8",
-                        ec="#475569",
-                        lw=0.8,
-                        alpha=0.65,
+    # Draw phantom bounding-box links (near-transparent in URDF) as dashed outlines
+    parent_map = robot.parent_map()
+    joint_T = {j.child: pose_to_matrix(j.pose.xyz, j.pose.rpy) for j in robot.joints}
+    for link in robot.links:
+        T_world = world_transform(link.name, parent_map, joint_T)
+        for block in link.visuals:
+            if block.geometry is None or block.geometry.type == "mesh":
+                continue
+            if block.color[3] >= _ALPHA_CUTOFF:
+                continue  # handled below in the solid pass
+            T_local = pose_to_matrix(block.pose.xyz, block.pose.rpy)
+            T = T_world @ T_local
+            for kind, params, _ in _xy_footprint(T, block.geometry, block.color):
+                if kind == "polygon":
+                    ax.add_patch(
+                        plt.Polygon(
+                            params,
+                            fc="none",
+                            ec="#94a3b8",
+                            lw=1.0,
+                            ls="--",
+                            alpha=0.5,
+                            zorder=0,
+                        )
                     )
-                )
+                elif kind == "circle":
+                    cx, cy, r = params
+                    ax.add_patch(
+                        plt.Circle(
+                            (cx, cy),
+                            r,
+                            fc="none",
+                            ec="#94a3b8",
+                            lw=1.0,
+                            ls="--",
+                            alpha=0.5,
+                            zorder=0,
+                        )
+                    )
+
+    # Compute scene scale for minimum-size clamping (tiny objects stay visible)
+    all_blocks = _link_world_blocks(robot)
+    if all_blocks:
+        all_x = [T[0, 3] for T, _, _ in all_blocks]
+        all_y = [T[1, 3] for T, _, _ in all_blocks]
+        scene_scale = max(max(all_x) - min(all_x), max(all_y) - min(all_y), 1.0)
+    else:
+        scene_scale = 1.0
+    min_vis = scene_scale * 0.012  # minimum visible half-extent
+
+    for T, geom, rgba in all_blocks:
+        fc = rgba[:3]
+        alpha = rgba[3] * 0.80
+        ec = [max(0, c - 0.25) for c in fc]
+        for kind, params, _ in _xy_footprint(T, geom, rgba):
+            if kind == "polygon":
+                pts = np.asarray(params)
+                # Pad very thin boxes so they stay visible
+                ext = pts.max(axis=0) - pts.min(axis=0)
+                if ext[0] < min_vis * 2 or ext[1] < min_vis * 2:
+                    cx, cy = pts.mean(axis=0)
+                    hw = max(ext[0] / 2, min_vis)
+                    hh = max(ext[1] / 2, min_vis)
+                    pts = np.array(
+                        [
+                            [cx - hw, cy - hh],
+                            [cx + hw, cy - hh],
+                            [cx + hw, cy + hh],
+                            [cx - hw, cy + hh],
+                        ]
+                    )
+                ax.add_patch(plt.Polygon(pts, fc=fc, ec=ec, lw=0.8, alpha=alpha))
             elif kind == "circle":
                 cx, cy, r = params
-                ax.add_patch(
-                    plt.Circle(
-                        (cx, cy),
-                        r,
-                        fc="#94a3b8",
-                        ec="#475569",
-                        lw=0.8,
-                        alpha=0.65,
-                    )
-                )
+                r = max(r, min_vis)
+                ax.add_patch(plt.Circle((cx, cy), r, fc=fc, ec=ec, lw=0.8, alpha=alpha))
 
     if scan_ranges is not None and scan_angles is not None:
         sx, sy, sth = sensor_pose
@@ -148,7 +208,8 @@ def plot_3d(
     ax3 = fig.add_subplot(111, projection="3d") if ax is None else ax
     ax3.set_facecolor("#f0f2f5")
 
-    for T, geom in _link_world_blocks(robot):
+    all_pts: list[np.ndarray] = []
+    for T, geom, rgba in _link_world_blocks(robot):
         if geom.type == "box":
             corners, edges = box_wireframe(geom.size)
         elif geom.type == "cylinder":
@@ -159,16 +220,29 @@ def plot_3d(
             continue
         h = np.column_stack([corners, np.ones(len(corners))])
         w = (T @ h.T).T[:, :3]
+        all_pts.append(w)
+        edge_color = [max(0, c - 0.15) for c in rgba[:3]]
         for i, j in edges:
             p0, p1 = w[i], w[j]
             ax3.plot(
                 [p0[0], p1[0]],
                 [p0[1], p1[1]],
                 [p0[2], p1[2]],
-                color="#334155",
-                lw=0.6,
-                alpha=0.8,
+                color=edge_color,
+                lw=0.8,
+                alpha=0.85,
             )
+
+    # Equal-aspect 3D scaling
+    if all_pts:
+        pts = np.vstack(all_pts)
+        mins, maxs = pts.min(axis=0), pts.max(axis=0)
+        ranges = maxs - mins
+        max_range = ranges.max() * 0.5 or 1.0
+        mids = (mins + maxs) * 0.5
+        ax3.set_xlim(mids[0] - max_range, mids[0] + max_range)
+        ax3.set_ylim(mids[1] - max_range, mids[1] + max_range)
+        ax3.set_zlim(mids[2] - max_range, mids[2] + max_range)
 
     if cloud is not None and len(cloud):
         ax3.scatter(

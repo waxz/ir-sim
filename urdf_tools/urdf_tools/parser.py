@@ -31,6 +31,7 @@ class Pose:
 class VisualCollision:
     pose: Pose
     geometry: Geometry | None
+    color: list[float] = field(default_factory=lambda: [0.58, 0.64, 0.74, 1.0])
 
 
 @dataclass
@@ -119,10 +120,21 @@ def _parse_geometry(elem) -> Geometry | None:
     return g
 
 
+def _parse_color(elem) -> list[float]:
+    """Return [r, g, b, a] from <material><color rgba="..."/> or default."""
+    mat = elem.find("material")
+    if mat is not None:
+        col = mat.find("color")
+        if col is not None:
+            return _floats(col.get("rgba", "0.58 0.64 0.74 1.0"))
+    return [0.58, 0.64, 0.74, 1.0]
+
+
 def _parse_vc(elem) -> VisualCollision:
     return VisualCollision(
         pose=_parse_pose(elem.find("origin")),
         geometry=_parse_geometry(elem.find("geometry")),
+        color=_parse_color(elem),
     )
 
 
