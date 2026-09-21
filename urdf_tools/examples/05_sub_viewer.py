@@ -1,14 +1,24 @@
-"""Example 05 — Subscribe to sensor topics and display a live LiDAR scan.
+"""Example 05 — Subscribe to sensor topics: real-time 2D and 3D LiDAR viewers.
 
-Requires shmbridge installed and 04_pub_sensors.py (or urdf-tools publish) running.
+Requires shmbridge installed and 06_irsim_bridge.py (or 04_pub_sensors.py) running.
 
 Usage:
-    python 05_sub_viewer.py            # text print mode
-    python 05_sub_viewer.py --live     # 2D matplotlib live scan viewer
-    python 05_sub_viewer.py --live3d   # 3D live viewer (world + robot + lidar)
-    python 05_sub_viewer.py --live3d --world models/warehouse_world.urdf \\
+    python 05_sub_viewer.py                     # text print mode
+    python 05_sub_viewer.py --live2d            # 2D real-time LiDAR (no world)
+    python 05_sub_viewer.py --live3d            # 3D real-time LiDAR (no world)
+
+    # With world and robot URDF overlays
+    python 05_sub_viewer.py --live2d \\
+        --world models/warehouse_world.urdf \\
         --robot models/robot_diff.urdf
-    python 05_sub_viewer.py --count 20 # stop after 20 polls (text mode)
+
+    python 05_sub_viewer.py --live3d \\
+        --world models/warehouse_world.urdf \\
+        --robot models/robot_diff.urdf
+
+    # Legacy alias
+    python 05_sub_viewer.py --live              # same as --live2d
+    python 05_sub_viewer.py --count 20          # stop after 20 polls (text mode)
 """
 
 from __future__ import annotations
@@ -26,26 +36,341 @@ from urdf_tools.pubsub import SensorSubscriber
 
 SHM_NAME = "/urdf_tools_sensors"
 
+# ── shared style ──────────────────────────────────────────────────────────────
 
-def live_viewer(sub: SensorSubscriber) -> None:
+_BG = "#0f172a"  # page / figure background  (slate-900)
+_PANE = "#0d1526"  # 3-D pane  (slightly darker)
+_GRID = "#1e293b"  # grid lines                 (slate-800)
+_TEXT = "#94a3b8"  # axis labels / tick text    (slate-400)
+_WORLD_FC = "#1e3a5f"  # world geometry fill
+_WORLD_EC = "#2d5fa0"  # world geometry edge
+_ROBOT_C = "#3b82f6"  # robot marker / wireframe  (blue-500)
+_HDG_C = "#60a5fa"  # heading arrow             (blue-400)
+_SCAN_CMAP = "plasma"
+_RAY_C = "#ef4444"  # scan ray colour           (red-500)
+_SCAN_HIT_EC = "#f97316"  # scan hit edge          (orange-500)
+
+
+def _style_fig(fig) -> None:
+    fig.patch.set_facecolor(_BG)
+
+
+def _style_ax2d(ax, title: str = "") -> None:
+    ax.set_facecolor(_BG)
+    ax.set_aspect("equal")
+    ax.tick_params(colors=_TEXT, labelsize=8)
+    ax.set_xlabel("X (m)", color=_TEXT, fontsize=9)
+    ax.set_ylabel("Y (m)", color=_TEXT, fontsize=9)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(_GRID)
+    ax.grid(True, color=_GRID, lw=0.4, alpha=0.7, zorder=0)
+    if title:
+        ax.set_title(title, color="white", fontweight="bold", fontsize=10)
+
+
+def _style_ax3d(ax3, title: str = "") -> None:
+    ax3.set_facecolor(_PANE)
+    ax3.xaxis.pane.fill = False
+    ax3.yaxis.pane.fill = False
+    ax3.zaxis.pane.fill = False
+    for a in (ax3.xaxis, ax3.yaxis, ax3.zaxis):
+        a.pane.set_edgecolor(_GRID)
+        a.line.set_color(_GRID)
+    ax3.tick_params(colors=_TEXT, labelsize=7)
+    ax3.set_xlabel("X (m)", color=_TEXT, fontsize=9)
+    ax3.set_ylabel("Y (m)", color=_TEXT, fontsize=9)
+    ax3.set_zlabel("Z (m)", color=_TEXT, fontsize=9)
+    if title:
+        ax3.set_title(title, color="white", fontweight="bold", fontsize=10)
+
+
+# ── URDF overlay helpers ───────────────────────────────────────────────────────
+
+
+def _draw_urdf_2d(ax, robot, *, alpha: float = 0.55, root_T=None) -> None:
+    """Draw URDF geometry as 2-D patches onto *ax* (static, called once)."""
+    import matplotlib.pyplot as plt
+
+    from urdf_tools.viz import _link_world_blocks, _xy_footprint
+
+    for T, geom, _rgba in _link_world_blocks(robot, root_T=root_T):
+        for kind, params, _ in _xy_footprint(T, geom, _rgba):
+            if kind == "polygon":
+                ax.add_patch(
+                    plt.Polygon(
+                        params,
+                        fc=_WORLD_FC,
+                        ec=_WORLD_EC,
+                        lw=0.8,
+                        alpha=alpha,
+                        zorder=2,
+                    )
+                )
+            elif kind == "circle":
+                cx, cy, r = params
+                ax.add_patch(
+                    plt.Circle(
+                        (cx, cy),
+                        r,
+                        fc=_WORLD_FC,
+                        ec=_WORLD_EC,
+                        lw=0.8,
+                        alpha=alpha,
+                        zorder=2,
+                    )
+                )
+
+
+def _world_bounds_2d(robot) -> tuple[float, float, float, float]:
+    """Return (xmin, xmax, ymin, ymax) of the world URDF geometry."""
+    from urdf_tools.viz import _link_world_blocks, _xy_footprint
+
+    xs, ys = [], []
+    for T, geom, rgba in _link_world_blocks(robot):
+        for kind, params, _ in _xy_footprint(T, geom, rgba):
+            if kind == "polygon":
+                pts = np.asarray(params)
+                xs.extend(pts[:, 0])
+                ys.extend(pts[:, 1])
+            elif kind == "circle":
+                cx, cy, r = params
+                xs += [cx - r, cx + r]
+                ys += [cy - r, cy + r]
+    if not xs:
+        return -15, 15, -15, 15
+    pad = max((max(xs) - min(xs)) * 0.05, 1.0)
+    return min(xs) - pad, max(xs) + pad, min(ys) - pad, max(ys) + pad
+
+
+def _draw_urdf_3d_static(ax3, robot) -> list[np.ndarray]:
+    """Draw world URDF wireframe (muted) onto ax3 once; return world-space corners."""
+    from urdf_tools.geometry import box_wireframe, cylinder_wireframe, sphere_wireframe
+    from urdf_tools.viz import _link_world_blocks
+
+    all_pts: list[np.ndarray] = []
+    for T, geom, _rgba in _link_world_blocks(robot):
+        if geom.type == "box":
+            corners, edges = box_wireframe(geom.size)
+        elif geom.type == "cylinder":
+            corners, edges = cylinder_wireframe(geom.radius, geom.length)
+        elif geom.type == "sphere":
+            corners, edges = sphere_wireframe(geom.radius)
+        else:
+            continue
+        h = np.column_stack([corners, np.ones(len(corners))])
+        w = (T @ h.T).T[:, :3]
+        all_pts.append(w)
+        for i, j in edges:
+            p0, p1 = w[i], w[j]
+            ax3.plot(
+                [p0[0], p1[0]],
+                [p0[1], p1[1]],
+                [p0[2], p1[2]],
+                color=_WORLD_EC,
+                lw=0.6,
+                alpha=0.45,
+            )
+    return all_pts
+
+
+def _robot_wireframe_segments(robot):
+    """Pre-compute per-link homogeneous corner matrices + edge indices."""
+    from urdf_tools.geometry import box_wireframe, cylinder_wireframe, sphere_wireframe
+    from urdf_tools.viz import _link_world_blocks
+
+    segs = []
+    for _T, geom, rgba in _link_world_blocks(robot):
+        if geom.type == "box":
+            corners, edges = box_wireframe(geom.size)
+        elif geom.type == "cylinder":
+            corners, edges = cylinder_wireframe(geom.radius, geom.length)
+        elif geom.type == "sphere":
+            corners, edges = sphere_wireframe(geom.radius)
+        else:
+            continue
+        h = np.column_stack([corners, np.ones(len(corners))])
+        ec = tuple(max(0.0, c - 0.05) for c in rgba[:3])
+        segs.append((h, edges, ec))
+    return segs
+
+
+# ── 2D real-time viewer ────────────────────────────────────────────────────────
+
+
+def live2d(
+    sub: SensorSubscriber,
+    world_robot=None,
+    overlay_robot=None,
+) -> None:
+    """Real-time 2D LiDAR viewer: world overlay + robot pose + scan."""
     import matplotlib.animation as animation
     import matplotlib.pyplot as plt
 
-    RMAX = 25.0
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.set_aspect("equal")
-    ax.set_xlim(-RMAX, RMAX)
-    ax.set_ylim(-RMAX, RMAX)
-    ax.set_facecolor("#0f172a")
-    fig.patch.set_facecolor("#0f172a")
-    ax.set_title("Live LiDAR — shmbridge", fontweight="bold", color="white")
-    ax.tick_params(colors="#475569")
-    for sp in ax.spines.values():
-        sp.set_edgecolor("#1e293b")
+    RMAX = 12.0
+    RAY_STEP = 6  # draw every N-th beam as a ray line
 
-    scat = ax.scatter([], [], s=1.5, c=[], cmap="plasma", vmin=0, vmax=RMAX, zorder=3)
-    robot_dot = ax.scatter([0], [0], s=100, c="#3b82f6", zorder=5, marker="D")
-    (hdg,) = ax.plot([], [], color="#60a5fa", lw=1.5, zorder=4)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    _style_fig(fig)
+    _style_ax2d(ax, "2D LiDAR — shmbridge")
+    fig.tight_layout(pad=1.2)
+
+    # Static world geometry
+    if world_robot is not None:
+        _draw_urdf_2d(ax, world_robot, alpha=0.55)
+        xmin, xmax, ymin, ymax = _world_bounds_2d(world_robot)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        RMAX = min(max(xmax - xmin, ymax - ymin) * 0.4, 30.0)
+    else:
+        ax.set_xlim(-RMAX, RMAX)
+        ax.set_ylim(-RMAX, RMAX)
+
+    # Range rings (muted dashed circles)
+    ring_step = max(1, int(RMAX / 4))
+    for r in range(ring_step, int(RMAX) + 1, ring_step):
+        ax.add_patch(
+            plt.Circle((0, 0), r, fc="none", ec=_GRID, lw=0.5, ls="--", alpha=0.5)
+        )
+
+    # Animated artists
+    scan_scat = ax.scatter(
+        [],
+        [],
+        s=4,
+        c=[],
+        cmap=_SCAN_CMAP,
+        vmin=0,
+        vmax=RMAX,
+        zorder=5,
+        edgecolors="none",
+    )
+    ray_lines = [
+        ax.plot([], [], color=_RAY_C, lw=0.3, alpha=0.18, zorder=3)[0]
+        for _ in range(360 // RAY_STEP + 10)
+    ]
+    robot_circle = plt.Circle((0, 0), 0.2, fc=_ROBOT_C, ec="white", lw=0.8, zorder=7)
+    ax.add_patch(robot_circle)
+    (hdg_line,) = ax.plot([], [], color=_HDG_C, lw=2.0, zorder=8)
+
+    state = {"pose": (0.0, 0.0, 0.0), "dynamic_xlim": world_robot is None}
+
+    def update(_frame):
+        scan = sub.read_scan()
+        odom = sub.read_odom()
+        if odom:
+            state["pose"] = (odom.x, odom.y, odom.theta)
+        x0, y0, th = state["pose"]
+
+        # Robot circle + heading
+        robot_circle.center = (x0, y0)
+        hdg_line.set_data(
+            [x0, x0 + 0.6 * math.cos(th)],
+            [y0, y0 + 0.6 * math.sin(th)],
+        )
+
+        # Dynamic axis follow (when no world urdf)
+        if state["dynamic_xlim"]:
+            ax.set_xlim(x0 - RMAX, x0 + RMAX)
+            ax.set_ylim(y0 - RMAX, y0 + RMAX)
+
+        # Scan
+        if scan and scan.ranges:
+            rng = np.asarray(scan.ranges, dtype=np.float32)
+            a = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
+            hit = rng < scan.range_max * 0.999
+            hx = x0 + rng[hit] * np.cos(th + a[hit])
+            hy = y0 + rng[hit] * np.sin(th + a[hit])
+            pts = np.column_stack([hx, hy]) if len(hx) else np.empty((0, 2))
+            scan_scat.set_offsets(pts)
+            scan_scat.set_array(rng[hit])
+
+            # Ray lines
+            ray_idx = np.arange(0, len(rng), RAY_STEP)
+            for k, li in enumerate(ray_lines):
+                if k < len(ray_idx):
+                    i = ray_idx[k]
+                    ex = x0 + rng[i] * math.cos(th + float(a[i]))
+                    ey = y0 + rng[i] * math.sin(th + float(a[i]))
+                    li.set_data([x0, ex], [y0, ey])
+                else:
+                    li.set_data([], [])
+        else:
+            scan_scat.set_offsets(np.empty((0, 2)))
+            for li in ray_lines:
+                li.set_data([], [])
+
+        return (scan_scat, robot_circle, hdg_line, *ray_lines)
+
+    ani = animation.FuncAnimation(fig, update, interval=50, blit=False)
+    _ = ani
+    plt.show()
+
+
+# ── 3D real-time viewer ────────────────────────────────────────────────────────
+
+
+def live3d(
+    sub: SensorSubscriber,
+    world_robot=None,
+    overlay_robot=None,
+) -> None:
+    """Real-time 3D viewer: world wireframe + animated robot + LiDAR scan cloud."""
+    import matplotlib.animation as animation
+    import matplotlib.pyplot as plt
+
+    from urdf_tools.geometry import pose_to_matrix as _p2m
+
+    fig = plt.figure(figsize=(11, 9))
+    _style_fig(fig)
+    ax3 = fig.add_subplot(111, projection="3d")
+    _style_ax3d(ax3, "3D LiDAR — shmbridge")
+    fig.tight_layout(pad=1.0)
+
+    # Static world wireframe
+    world_pts: list[np.ndarray] = []
+    if world_robot is not None:
+        world_pts = _draw_urdf_3d_static(ax3, world_robot)
+
+    # Pre-build robot wireframe line objects (updated per-frame)
+    robot_segs = _robot_wireframe_segments(overlay_robot) if overlay_robot else []
+    robot_lines: list[tuple] = []
+    for h, edges, ec in robot_segs:
+        seg_lines = []
+        for i, j in edges:
+            (ln,) = ax3.plot([], [], [], color=ec, lw=1.1, alpha=0.95)
+            seg_lines.append((ln, h, i, j))
+        robot_lines.append(seg_lines)
+
+    # Scan scatter + robot dot
+    scan_scat = ax3.scatter(
+        [],
+        [],
+        [],
+        s=1.5,
+        c=[],
+        cmap=_SCAN_CMAP,
+        vmin=0,
+        vmax=12.0,
+        alpha=0.75,
+    )
+    robot_dot = ax3.scatter([], [], [], s=90, c=[_ROBOT_C], zorder=6, marker="^")
+
+    # Axis limits from world geometry (or default)
+    if world_pts:
+        pts = np.vstack(world_pts)
+        mins, maxs = pts.min(0), pts.max(0)
+        ranges = maxs - mins
+        mr = max(ranges.max() * 0.5, 3.0)
+        mids = (mins + maxs) * 0.5
+        ax3.set_xlim(mids[0] - mr, mids[0] + mr)
+        ax3.set_ylim(mids[1] - mr, mids[1] + mr)
+        ax3.set_zlim(max(mids[2] - mr, -1.0), mids[2] + mr)
+    else:
+        ax3.set_xlim(-12, 12)
+        ax3.set_ylim(-12, 12)
+        ax3.set_zlim(-1, 8)
+
+    scan_rmax = [12.0]  # mutable container for current range_max
     state = {"pose": (0.0, 0.0, 0.0)}
 
     def update(_frame):
@@ -54,22 +379,39 @@ def live_viewer(sub: SensorSubscriber) -> None:
         if odom:
             state["pose"] = (odom.x, odom.y, odom.theta)
         x0, y0, th = state["pose"]
-        robot_dot.set_offsets([[x0, y0]])
-        hdg.set_data([x0, x0 + 1.2 * math.cos(th)], [y0, y0 + 1.2 * math.sin(th)])
-        if scan and scan.ranges:
-            rng = np.array(scan.ranges, dtype=np.float32)
-            a = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
-            hit = rng < scan.range_max
-            xs = x0 + rng[hit] * np.cos(th + a[hit])
-            ys = y0 + rng[hit] * np.sin(th + a[hit])
-            scat.set_offsets(np.column_stack([xs, ys]) if len(xs) else np.empty((0, 2)))
-            scat.set_array(rng[hit])
-        return scat, robot_dot, hdg
 
-    ani = animation.FuncAnimation(fig, update, interval=60, blit=True)
+        # Move robot wireframe
+        root_T = _p2m([x0, y0, 0.0], [0.0, 0.0, th])
+        for seg_lines in robot_lines:
+            for ln, h, i, j in seg_lines:
+                w = (root_T @ h.T).T[:, :3]
+                ln.set_data_3d(
+                    [w[i, 0], w[j, 0]], [w[i, 1], w[j, 1]], [w[i, 2], w[j, 2]]
+                )
+
+        robot_dot._offsets3d = ([x0], [y0], [0.12])
+
+        # Scan cloud in world frame
+        if scan and scan.ranges:
+            scan_rmax[0] = scan.range_max
+            rng = np.asarray(scan.ranges, dtype=np.float32)
+            a = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
+            hit = rng < scan.range_max * 0.999
+            lx = x0 + rng[hit] * np.cos(th + a[hit])
+            ly = y0 + rng[hit] * np.sin(th + a[hit])
+            lz = np.zeros(hit.sum())
+            scan_scat._offsets3d = (lx, ly, lz)
+            scan_scat.set_array(rng[hit])
+            scan_scat.set_clim(0, scan_rmax[0])
+
+        return (scan_scat, robot_dot)
+
+    ani = animation.FuncAnimation(fig, update, interval=50, blit=False)
     _ = ani
-    plt.tight_layout()
     plt.show()
+
+
+# ── text mode ─────────────────────────────────────────────────────────────────
 
 
 def text_mode(sub: SensorSubscriber, count: int) -> None:
@@ -82,15 +424,18 @@ def text_mode(sub: SensorSubscriber, count: int) -> None:
             if scan:
                 hits = sum(1 for r in scan.ranges if r < scan.range_max)
                 print(
-                    f"  [scan] t={scan.stamp:.3f}  beams={len(scan.ranges)}  hits={hits}"
+                    f"  [scan] t={scan.stamp:.3f}"
+                    f"  beams={len(scan.ranges)}  hits={hits}"
                 )
             if imu:
                 print(
-                    f"  [imu]  t={imu.stamp:.3f}  acc={[f'{v:.2f}' for v in imu.linear_acceleration]}"
+                    f"  [imu]  t={imu.stamp:.3f}"
+                    f"  acc={[f'{v:.2f}' for v in imu.linear_acceleration]}"
                 )
             if odom:
                 print(
-                    f"  [odom] t={odom.stamp:.3f}  x={odom.x:.2f}  y={odom.y:.2f}  θ={odom.theta:.2f}"
+                    f"  [odom] t={odom.stamp:.3f}"
+                    f"  x={odom.x:.2f}  y={odom.y:.2f}  θ={odom.theta:.2f}"
                 )
             n += 1
             if count and n >= count:
@@ -100,181 +445,61 @@ def text_mode(sub: SensorSubscriber, count: int) -> None:
         print("\nStopped.")
 
 
-def live_viewer_3d(
-    sub: SensorSubscriber,
-    world_robot=None,
-    overlay_robot=None,
-) -> None:
-    """3D live viewer: world wireframe + robot pose + LiDAR scan cloud."""
-    import matplotlib.animation as animation
-    import matplotlib.pyplot as plt
-
-    from urdf_tools.geometry import (
-        box_wireframe,
-        cylinder_wireframe,
-        sphere_wireframe,
-    )
-    from urdf_tools.geometry import (
-        pose_to_matrix as _p2m,
-    )
-
-    fig = plt.figure(figsize=(11, 9))
-    ax3 = fig.add_subplot(111, projection="3d")
-    ax3.set_facecolor("#0f172a")
-    fig.patch.set_facecolor("#0f172a")
-    ax3.xaxis.pane.fill = False
-    ax3.yaxis.pane.fill = False
-    ax3.zaxis.pane.fill = False
-    for ax in (ax3.xaxis, ax3.yaxis, ax3.zaxis):
-        ax.pane.set_edgecolor("#1e293b")
-    ax3.tick_params(colors="#475569")
-    ax3.set_xlabel("X (m)", color="#94a3b8")
-    ax3.set_ylabel("Y (m)", color="#94a3b8")
-    ax3.set_zlabel("Z (m)", color="#94a3b8")
-    ax3.set_title("3D Live View — shmbridge", fontweight="bold", color="white")
-
-    # Draw static world wireframe once
-    from urdf_tools.viz import _link_world_blocks as _lwb
-
-    world_pts: list[np.ndarray] = []
-    if world_robot is not None:
-        for T, geom, rgba in _lwb(world_robot):
-            if geom.type == "box":
-                corners, edges = box_wireframe(geom.size)
-            elif geom.type == "cylinder":
-                corners, edges = cylinder_wireframe(geom.radius, geom.length)
-            elif geom.type == "sphere":
-                corners, edges = sphere_wireframe(geom.radius)
-            else:
-                continue
-            h = np.column_stack([corners, np.ones(len(corners))])
-            w = (T @ h.T).T[:, :3]
-            world_pts.append(w)
-            ec = [max(0, c - 0.15) for c in rgba[:3]]
-            for i, j in edges:
-                p0, p1 = w[i], w[j]
-                ax3.plot(
-                    [p0[0], p1[0]],
-                    [p0[1], p1[1]],
-                    [p0[2], p1[2]],
-                    color=ec,
-                    lw=0.6,
-                    alpha=0.5,
-                )
-
-    # Pre-compute robot link blocks (positions relative to robot origin)
-    robot_blocks = list(_lwb(overlay_robot)) if overlay_robot is not None else []
-    robot_lines = []
-    for _T, geom, rgba in robot_blocks:
-        if geom.type == "box":
-            corners, edges = box_wireframe(geom.size)
-        elif geom.type == "cylinder":
-            corners, edges = cylinder_wireframe(geom.radius, geom.length)
-        elif geom.type == "sphere":
-            corners, edges = sphere_wireframe(geom.radius)
-        else:
-            robot_lines.append(None)
-            continue
-        h = np.column_stack([corners, np.ones(len(corners))])
-        ec = [max(0, c - 0.15) for c in rgba[:3]]
-        segs = []
-        for i, j in edges:
-            (ln,) = ax3.plot([], [], [], color=ec, lw=1.0, alpha=0.9)
-            segs.append((ln, h, i, j))
-        robot_lines.append(segs)
-
-    scan_scat = ax3.scatter([], [], [], s=1.0, c=[], cmap="plasma", vmin=-1.0, vmax=2.0)
-    robot_dot = ax3.scatter([], [], [], s=80, c="#3b82f6", zorder=6, marker="^")
-
-    # Axis limits
-    all_pts = world_pts.copy()
-    if all_pts:
-        pts = np.vstack(all_pts)
-        mins, maxs = pts.min(0), pts.max(0)
-        rng = maxs - mins
-        mr = max(rng.max() * 0.5, 5.0)
-        mids = (mins + maxs) * 0.5
-        ax3.set_xlim(mids[0] - mr, mids[0] + mr)
-        ax3.set_ylim(mids[1] - mr, mids[1] + mr)
-        ax3.set_zlim(mids[2] - mr, mids[2] + mr)
-    else:
-        ax3.set_xlim(-15, 15)
-        ax3.set_ylim(-15, 15)
-        ax3.set_zlim(-1, 10)
-
-    state = {"pose": (0.0, 0.0, 0.0)}
-
-    def update(_frame):
-        scan = sub.read_scan()
-        odom = sub.read_odom()
-        if odom:
-            state["pose"] = (odom.x, odom.y, odom.theta)
-        x0, y0, th = state["pose"]
-
-        # Move robot wireframe
-        root_T = _p2m([x0, y0, 0.0], [0.0, 0.0, th])
-        for segs_or_none in robot_lines:
-            if segs_or_none is None:
-                continue
-            for ln, h, i, j in segs_or_none:
-                w = (root_T @ h.T).T[:, :3]
-                p0, p1 = w[i], w[j]
-                ln.set_data_3d([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]])
-
-        robot_dot._offsets3d = ([x0], [y0], [0.1])
-
-        # Lidar scan → world frame
-        if scan and scan.ranges:
-            rng = np.array(scan.ranges, dtype=np.float32)
-            a = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
-            hit = rng < scan.range_max
-            lx = x0 + rng[hit] * np.cos(th + a[hit])
-            ly = y0 + rng[hit] * np.sin(th + a[hit])
-            lz = np.zeros(hit.sum())
-            pts_w = np.column_stack([lx, ly, lz]) if len(lx) else np.empty((0, 3))
-            scan_scat._offsets3d = (pts_w[:, 0], pts_w[:, 1], pts_w[:, 2])
-            scan_scat.set_array(lz)
-
-        return scan_scat, robot_dot
-
-    ani = animation.FuncAnimation(fig, update, interval=80, blit=False)
-    _ = ani
-    plt.tight_layout()
-    plt.show()
+# ── entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     import argparse
 
-    ap = argparse.ArgumentParser(description="Subscribe to sensor topics")
-    ap.add_argument("--shm", default=SHM_NAME)
+    ap = argparse.ArgumentParser(
+        description="Subscribe to sensor topics and visualise in 2D or 3D"
+    )
+    ap.add_argument("--shm", default=SHM_NAME, help="Shared memory segment name")
     ap.add_argument(
-        "--count", type=int, default=0, help="Stop after N polls (0=forever)"
+        "--count", type=int, default=0, help="Stop after N polls (text mode only)"
     )
     ap.add_argument(
-        "--live", action="store_true", help="Open 2D matplotlib live scan viewer"
+        "--live2d",
+        "--live",
+        dest="live2d",
+        action="store_true",
+        help="Open real-time 2D LiDAR viewer",
     )
     ap.add_argument(
-        "--live3d", action="store_true", help="Open 3D live viewer (world+robot+lidar)"
+        "--live3d",
+        action="store_true",
+        help="Open real-time 3D LiDAR viewer",
     )
     ap.add_argument(
         "--world",
         default=None,
         metavar="URDF",
-        help="World URDF for 3D viewer background",
+        help="World URDF drawn as static background overlay",
     )
     ap.add_argument(
         "--robot",
         default=None,
         metavar="URDF",
-        help="Robot URDF to animate in 3D viewer",
+        help="Robot URDF model to animate at odometry pose",
     )
     ap.add_argument(
         "--timeout", type=float, default=10000.0, help="Attach timeout in ms"
     )
     args = ap.parse_args()
 
-    print(f"Attaching to shm={args.shm!r}  (timeout={args.timeout:.0f}ms) …")
+    world_robot = None
+    overlay_robot = None
+    if args.world or args.robot:
+        from urdf_tools.parser import parse_urdf
+
+        if args.world:
+            world_robot = parse_urdf(args.world)
+            print(f"World : {world_robot.name!r}  links={len(world_robot.links)}")
+        if args.robot:
+            overlay_robot = parse_urdf(args.robot)
+            print(f"Robot : {overlay_robot.name!r}  links={len(overlay_robot.links)}")
+
+    print(f"Attaching to shm={args.shm!r}  (timeout={args.timeout:.0f} ms) …")
     sub = SensorSubscriber(args.shm, timeout_ms=args.timeout)
     try:
         sub.attach()
@@ -285,23 +510,9 @@ def main() -> None:
 
     try:
         if args.live3d:
-            world_robot = None
-            overlay_robot = None
-            if args.world:
-                from urdf_tools.parser import parse_urdf
-
-                world_robot = parse_urdf(args.world)
-                print(f"World: {world_robot.name!r}  links={len(world_robot.links)}")
-            if args.robot:
-                from urdf_tools.parser import parse_urdf
-
-                overlay_robot = parse_urdf(args.robot)
-                print(
-                    f"Robot: {overlay_robot.name!r}  links={len(overlay_robot.links)}"
-                )
-            live_viewer_3d(sub, world_robot=world_robot, overlay_robot=overlay_robot)
-        elif args.live:
-            live_viewer(sub)
+            live3d(sub, world_robot=world_robot, overlay_robot=overlay_robot)
+        elif args.live2d:
+            live2d(sub, world_robot=world_robot, overlay_robot=overlay_robot)
         else:
             text_mode(sub, args.count)
     finally:
