@@ -22,15 +22,19 @@ _ALPHA_CUTOFF = 0.1  # skip near-transparent visuals (e.g. scene_bounds phantoms
 
 
 def _link_world_blocks(
-    robot: Robot, use_collision: bool = False
+    robot: Robot,
+    use_collision: bool = False,
+    root_T: np.ndarray | None = None,
 ) -> list[tuple[np.ndarray, Geometry, list[float]]]:
     """Return (world_T 4×4, Geometry, rgba) for every visible geometry block."""
     parent_map = robot.parent_map()
     joint_T = {j.child: pose_to_matrix(j.pose.xyz, j.pose.rpy) for j in robot.joints}
+    if root_T is None:
+        root_T = np.eye(4)
 
     results: list[tuple[np.ndarray, Geometry, list[float]]] = []
     for link in robot.links:
-        T_world = world_transform(link.name, parent_map, joint_T)
+        T_world = root_T @ world_transform(link.name, parent_map, joint_T)
         # Prefer visuals (they carry color); fall back to collisions for display
         blocks = link.visuals if not use_collision else link.collisions
         if not blocks:
@@ -195,21 +199,14 @@ def plot_floor_plan(
 # ── 3D wireframe ──────────────────────────────────────────────────────────────
 
 
-def plot_3d(
+def _draw_robot_wireframe(
+    ax3,
     robot: Robot,
-    *,
-    cloud: np.ndarray | None = None,
-    ax=None,
-    save: str | None = None,
-    show: bool = True,
-) -> plt.Figure:
-    """Draw 3D wireframe for all link geometries."""
-    fig = plt.figure(figsize=(10, 8)) if ax is None else ax.get_figure()
-    ax3 = fig.add_subplot(111, projection="3d") if ax is None else ax
-    ax3.set_facecolor("#f0f2f5")
-
-    all_pts: list[np.ndarray] = []
-    for T, geom, rgba in _link_world_blocks(robot):
+    root_T: np.ndarray | None = None,
+    all_pts: list | None = None,
+) -> None:
+    """Draw wireframe edges for one robot into ax3; append world-space corners to all_pts."""
+    for T, geom, rgba in _link_world_blocks(robot, root_T=root_T):
         if geom.type == "box":
             corners, edges = box_wireframe(geom.size)
         elif geom.type == "cylinder":
@@ -220,7 +217,8 @@ def plot_3d(
             continue
         h = np.column_stack([corners, np.ones(len(corners))])
         w = (T @ h.T).T[:, :3]
-        all_pts.append(w)
+        if all_pts is not None:
+            all_pts.append(w)
         edge_color = [max(0, c - 0.15) for c in rgba[:3]]
         for i, j in edges:
             p0, p1 = w[i], w[j]
@@ -233,32 +231,74 @@ def plot_3d(
                 alpha=0.85,
             )
 
-    # Equal-aspect 3D scaling
+
+def plot_3d(
+    robot: Robot,
+    *,
+    cloud: np.ndarray | None = None,
+    overlay: list[tuple[Robot, list[float]]] | None = None,
+    ax=None,
+    save: str | None = None,
+    show: bool = True,
+) -> plt.Figure:
+    """Draw 3D wireframe for all link geometries.
+
+    Parameters
+    ----------
+    robot:
+        Primary robot/world URDF (rendered at origin).
+    cloud:
+        Optional (N, 3) or (N, 4) point cloud to scatter-plot.
+    overlay:
+        List of ``(Robot, [x, y, z, roll, pitch, yaw])`` tuples to render at
+        arbitrary world poses — use this to place a robot model inside a world scene.
+    """
+    fig = plt.figure(figsize=(10, 8)) if ax is None else ax.get_figure()
+    ax3 = fig.add_subplot(111, projection="3d") if ax is None else ax
+    ax3.set_facecolor("#f0f2f5")
+
+    all_pts: list[np.ndarray] = []
+    _draw_robot_wireframe(ax3, robot, all_pts=all_pts)
+
+    for ov_robot, pose_xyzrpy in overlay or []:
+        xyz = pose_xyzrpy[:3]
+        rpy = pose_xyzrpy[3:6] if len(pose_xyzrpy) >= 6 else [0.0, 0.0, 0.0]
+        root_T = pose_to_matrix(xyz, rpy)
+        _draw_robot_wireframe(ax3, ov_robot, root_T=root_T, all_pts=all_pts)
+
+    # Equal-aspect 3D scaling (include cloud)
+    if cloud is not None and len(cloud):
+        all_pts.append(cloud[:, :3])
     if all_pts:
         pts = np.vstack(all_pts)
         mins, maxs = pts.min(axis=0), pts.max(axis=0)
         ranges = maxs - mins
-        max_range = ranges.max() * 0.5 or 1.0
+        max_range = max(ranges.max() * 0.5, 1.0)
         mids = (mins + maxs) * 0.5
         ax3.set_xlim(mids[0] - max_range, mids[0] + max_range)
         ax3.set_ylim(mids[1] - max_range, mids[1] + max_range)
         ax3.set_zlim(mids[2] - max_range, mids[2] + max_range)
 
     if cloud is not None and len(cloud):
+        z_col = cloud[:, 2] if cloud.shape[1] > 2 else np.zeros(len(cloud))
         ax3.scatter(
             cloud[:, 0],
             cloud[:, 1],
-            cloud[:, 2],
-            s=0.5,
-            c=cloud[:, 2],
+            z_col,
+            s=1.0,
+            c=z_col,
             cmap="plasma",
-            alpha=0.5,
+            alpha=0.6,
+            zorder=5,
         )
 
     ax3.set_xlabel("X (m)")
     ax3.set_ylabel("Y (m)")
     ax3.set_zlabel("Z (m)")
-    ax3.set_title(f"3D View — {robot.name}", fontweight="bold")
+    names = robot.name
+    if overlay:
+        names += " + " + " + ".join(r.name for r, _ in overlay)
+    ax3.set_title(f"3D View — {names}", fontweight="bold")
     fig.tight_layout()
     if save:
         fig.savefig(save, dpi=130, bbox_inches="tight")
