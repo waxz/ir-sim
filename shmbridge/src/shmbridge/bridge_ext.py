@@ -18,7 +18,7 @@ try:
 except ImportError:
     _HAS_NUMPY = False
 
-from ._libc import _libc, _monotonic_ns
+from ._libc import _libc, _libshm, _monotonic_ns
 from ._platform import O_CREAT, O_EXCL, O_RDWR
 from ._types import (
     EXT_SHM_NAME_DEFAULT,
@@ -73,21 +73,29 @@ class ExtShmBridge:
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
+    def _win_tag(self) -> str:
+        """Windows tagname: strip leading '/' from the POSIX shm name."""
+        return self._name.lstrip(b"/").decode()
+
     def open(self) -> None:
         """Create and initialise the extended shm segment."""
-        _libc.shm_unlink(self._name)
-        fd = _libc.shm_open(self._name, O_CREAT | O_RDWR | O_EXCL, 0o666)
-        if fd < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err), self._name.decode())
-        if _libc.ftruncate(fd, self._size) != 0:
-            err = ctypes.get_errno()
+        if _libc is None:
+            # Windows: named mmap backed by the pagefile (CreateFileMapping)
+            self._mm = mmap.mmap(-1, self._size, tagname=self._win_tag())
+        else:
+            _libshm.shm_unlink(self._name)
+            fd = _libshm.shm_open(self._name, O_CREAT | O_RDWR | O_EXCL, 0o666)
+            if fd < 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err), self._name.decode())
+            if _libc.ftruncate(fd, self._size) != 0:
+                err = ctypes.get_errno()
+                os.close(fd)
+                raise OSError(err, os.strerror(err))
+            self._mm = mmap.mmap(
+                fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+            )
             os.close(fd)
-            raise OSError(err, os.strerror(err))
-        self._mm = mmap.mmap(
-            fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
-        )
-        os.close(fd)
         self._mm.write(b"\x00" * self._size)
         self._mm.seek(0)
         self._blk = _IrsimExtBlock.from_buffer(self._mm)
@@ -100,14 +108,19 @@ class ExtShmBridge:
 
     def attach(self) -> None:
         """Attach to an existing extended segment as a secondary client."""
-        fd = _libc.shm_open(self._name, O_RDWR, 0o666)
-        if fd < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err), self._name.decode())
-        self._mm = mmap.mmap(
-            fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
-        )
-        os.close(fd)
+        if _libc is None:
+            # Windows: opens or creates the named mapping; magic check verifies
+            # the publisher has initialised it.
+            self._mm = mmap.mmap(-1, self._size, tagname=self._win_tag())
+        else:
+            fd = _libshm.shm_open(self._name, O_RDWR, 0o666)
+            if fd < 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err), self._name.decode())
+            self._mm = mmap.mmap(
+                fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+            )
+            os.close(fd)
         self._blk = _IrsimExtBlock.from_buffer(self._mm)
         hdr = self._blk.header
         if hdr.magic and hdr.magic != MAGIC:
@@ -140,7 +153,20 @@ class ExtShmBridge:
         if self._mm is not None:
             self._mm.close()
             self._mm = None
-        _libc.shm_unlink(self._name)
+        if _libc is not None:  # POSIX only; Windows releases the mapping via close()
+            _libshm.shm_unlink(self._name)
+
+    def detach(self) -> None:
+        """Unmap without unlinking — safe for secondary clients (subscribers)."""
+        self._state_slot = self._cmd_slot = self._imu_slot = None
+        self._enc_slot = self._pc_slot_ref = None
+        if self._pc_data_mv is not None:
+            self._pc_data_mv.release()
+            self._pc_data_mv = None
+        self._blk = None
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
 
     def __enter__(self) -> ExtShmBridge:
         self.open()

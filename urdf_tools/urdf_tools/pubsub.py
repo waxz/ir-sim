@@ -172,11 +172,27 @@ class SensorSubscriber:
         self._timeout_ms = timeout_ms
 
     def attach(self) -> None:
-        """Attach to the publisher's shm segment, retrying until ready."""
+        """Attach to the publisher's shm segment, retrying until ready.
+
+        On POSIX the publisher creates the segment before subscribers can open
+        it, so OSError signals "not yet".  On Windows mmap opens-or-creates,
+        so we also poll the header magic to confirm the publisher has written
+        its initialisation data.
+        """
+        import sys
+
         deadline = time.monotonic() + self._timeout_ms / 1000.0
         while True:
             try:
                 self._ext.attach()
+                # On Windows the attach above may have succeeded against an
+                # uninitialised mapping the subscriber itself just created.
+                # Poll the header magic until the publisher initialises it.
+                if sys.platform == "win32":
+                    blk = self._ext._blk
+                    if blk is not None and blk.header.magic == 0:
+                        self._ext.detach()
+                        raise OSError("publisher not ready")
                 return
             except OSError:
                 if time.monotonic() > deadline:
@@ -186,12 +202,8 @@ class SensorSubscriber:
                 time.sleep(0.05)
 
     def detach(self) -> None:
-        # ExtShmBridge.close() unmaps without unlinking when called by subscriber
-        # We call close but the publisher owns the segment lifetime.
         try:
-            if self._ext._mm is not None:
-                self._ext._mm.close()
-                self._ext._mm = None
+            self._ext.detach()
         except Exception:
             pass
 
