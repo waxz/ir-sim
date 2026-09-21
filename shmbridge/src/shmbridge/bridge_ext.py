@@ -8,8 +8,11 @@ as the base bridge, so liveness checks work uniformly across all data streams.
 from __future__ import annotations
 
 import ctypes
+import errno
 import mmap
 import os
+import sys
+import time
 
 try:
     import numpy as np
@@ -73,15 +76,14 @@ class ExtShmBridge:
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
-    def _win_tag(self) -> str:
-        """Windows tagname: strip leading '/' from the POSIX shm name."""
-        return self._name.lstrip(b"/").decode()
-
     def open(self) -> None:
         """Create and initialise the extended shm segment."""
-        if _libc is None:
-            # Windows: named mmap backed by the pagefile (CreateFileMapping)
-            self._mm = mmap.mmap(-1, self._size, tagname=self._win_tag())
+        if sys.platform == "win32":
+            tag = self._name.decode().lstrip("/")
+            self._mm = mmap.mmap(-1, self._size, tagname=tag, access=mmap.ACCESS_WRITE)
+            self._mm.seek(0)
+            self._mm.write(b"\x00" * self._size)
+            self._mm.seek(0)
         else:
             _libshm.shm_unlink(self._name)
             fd = _libshm.shm_open(self._name, O_CREAT | O_RDWR | O_EXCL, 0o666)
@@ -96,8 +98,8 @@ class ExtShmBridge:
                 fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
             )
             os.close(fd)
-        self._mm.write(b"\x00" * self._size)
-        self._mm.seek(0)
+            self._mm.write(b"\x00" * self._size)
+            self._mm.seek(0)
         self._blk = _IrsimExtBlock.from_buffer(self._mm)
         hdr = self._blk.header
         hdr.magic = MAGIC
@@ -106,25 +108,67 @@ class ExtShmBridge:
         hdr.ready = 1
         self._cache_slots()
 
-    def attach(self) -> None:
-        """Attach to an existing extended segment as a secondary client."""
-        if _libc is None:
-            # Windows: opens or creates the named mapping; magic check verifies
-            # the publisher has initialised it.
-            self._mm = mmap.mmap(-1, self._size, tagname=self._win_tag())
+    def attach(self, timeout_ms: float = 30_000.0) -> None:
+        """Attach to an existing extended segment; blocks until ready or timeout.
+
+        Safe to call before the publisher has started: retries until the segment
+        appears (up to *timeout_ms* ms), then waits for the ready flag.
+        Pass timeout_ms=0 for a single non-blocking attempt.
+        """
+        self.detach()  # release old mapping before (re-)attaching
+
+        if sys.platform == "win32":
+            tag = self._name.decode().lstrip("/")
+            deadline = time.monotonic() + timeout_ms * 1e-3
+            # ACCESS_READ uses OpenFileMappingA which fails cleanly when the
+            # mapping doesn't exist yet — use it to poll until publisher starts.
+            while True:
+                try:
+                    test = mmap.mmap(-1, 128, tagname=tag, access=mmap.ACCESS_READ)
+                    test.close()
+                    break
+                except OSError as exc:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"attach timeout: segment '{tag}' not found "
+                            "— is the publisher running?"
+                        ) from exc
+                    time.sleep(0.05)
+            # ACCESS_WRITE uses CreateFileMappingA which opens an existing mapping
+            self._mm = mmap.mmap(-1, self._size, tagname=tag, access=mmap.ACCESS_WRITE)
         else:
-            fd = _libshm.shm_open(self._name, O_RDWR, 0o666)
-            if fd < 0:
+            deadline = time.monotonic() + timeout_ms * 1e-3
+            while True:
+                fd = _libshm.shm_open(self._name, O_RDWR, 0o666)
+                if fd >= 0:
+                    break
                 err = ctypes.get_errno()
-                raise OSError(err, os.strerror(err), self._name.decode())
+                if err not in (errno.ENOENT, errno.EACCES):
+                    raise OSError(err, os.strerror(err), self._name.decode())
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"attach timeout: segment '{self._name.decode()}' not found "
+                        "— is the publisher running?"
+                    )
+                time.sleep(0.05)
             self._mm = mmap.mmap(
                 fd, self._size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
             )
             os.close(fd)
+
         self._blk = _IrsimExtBlock.from_buffer(self._mm)
         hdr = self._blk.header
+
+        # Wait for ready flag
+        deadline = time.monotonic() + timeout_ms * 1e-3
+        while not hdr.ready:
+            if time.monotonic() > deadline:
+                self.detach()
+                raise TimeoutError("attach timeout: publisher not ready")
+            time.sleep(0.0005)
+
         if hdr.magic and hdr.magic != MAGIC:
-            self.close()
+            self.detach()
             raise ValueError(
                 f"Schema mismatch: magic=0x{hdr.magic:08X} (expected 0x{MAGIC:08X})"
             )
@@ -153,7 +197,7 @@ class ExtShmBridge:
         if self._mm is not None:
             self._mm.close()
             self._mm = None
-        if _libc is not None:  # POSIX only; Windows releases the mapping via close()
+        if sys.platform != "win32":
             _libshm.shm_unlink(self._name)
 
     def detach(self) -> None:
