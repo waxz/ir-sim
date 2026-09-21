@@ -94,11 +94,13 @@ def _parse_pose(elem) -> Pose:
 def _parse_geometry(elem) -> Geometry | None:
     if elem is None:
         return None
-    child = (
-        elem.find("box")
-        or elem.find("cylinder")
-        or elem.find("sphere")
-        or elem.find("mesh")
+    child = next(
+        (
+            elem.find(t)
+            for t in ("box", "cylinder", "sphere", "mesh")
+            if elem.find(t) is not None
+        ),
+        None,
     )
     if child is None:
         return None
