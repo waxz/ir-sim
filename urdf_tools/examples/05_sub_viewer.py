@@ -353,23 +353,12 @@ def live3d(
             seg_lines.append((ln, h, i, j))
         robot_lines.append(seg_lines)
 
-    # Scan scatter — seed with one off-screen point so the colormap is properly
-    # initialised; empty c=[] leaves the internal state incomplete in some
-    # matplotlib versions and later set_array() calls are silently ignored.
-    _SEED = -9999.0
-    scan_scat = ax3.scatter(
-        [_SEED],
-        [_SEED],
-        [_SEED],
-        s=4.0,
-        c=[0.0],
-        cmap=_SCAN_CMAP,
-        vmin=0,
-        vmax=12.0,
-        alpha=0.90,
-        edgecolors="none",
-        depthshade=False,
-    )
+    # Scan scatter — use a mutable holder so the scatter is removed and recreated
+    # each frame.  Mutating _offsets3d + set_facecolors on the same object fails
+    # in animation: matplotlib re-computes face colours from the stale _A array
+    # (set at init via c=[scalar]) and overrides whatever set_facecolors wrote.
+    # A fresh scatter every frame carries only the colours we provide.
+    scan_holder: list = [None]  # scan_holder[0] is the current scatter or None
     robot_dot = ax3.scatter([], [], [], s=90, c=[_ROBOT_C], zorder=6, marker="^")
 
     # Axis limits — use per-axis tight bounds so the z-range tracks the actual
@@ -411,7 +400,16 @@ def live3d(
 
         robot_dot._offsets3d = ([x0], [y0], [0.12])
 
-        # Scan cloud in world frame
+        # Remove previous scan scatter before replacing it
+        if scan_holder[0] is not None:
+            try:
+                scan_holder[0].remove()
+            except Exception:
+                pass
+            scan_holder[0] = None
+
+        # Scan cloud in world frame — fresh scatter each frame avoids the
+        # matplotlib colormap-override bug on animated Axes3D scatter objects.
         if scan and scan.ranges:
             scan_rmax[0] = scan.range_max
             rng = np.asarray(scan.ranges, dtype=np.float32)
@@ -421,17 +419,25 @@ def live3d(
                 lx = x0 + rng[hit] * np.cos(th + a[hit])
                 ly = y0 + rng[hit] * np.sin(th + a[hit])
                 lz = np.full(hit.sum(), 0.05, dtype=np.float32)
-                scan_scat._offsets3d = (lx, ly, lz)
-                # Compute explicit RGBA colours — avoids the set_array/colormap
-                # state issue that occurs when the scatter was init'd with c=[0].
                 norm_c = np.clip(rng[hit] / max(scan_rmax[0], 1e-6), 0.0, 1.0)
-                colors = plt.cm.plasma(norm_c)
-                scan_scat.set_facecolors(colors)
-                scan_scat.set_edgecolors("none")
-            else:
-                scan_scat._offsets3d = ([_SEED], [_SEED], [_SEED])
+                scan_holder[0] = ax3.scatter(
+                    lx,
+                    ly,
+                    lz,
+                    s=4.0,
+                    c=plt.cm.plasma(norm_c),
+                    alpha=0.90,
+                    edgecolors="none",
+                    depthshade=False,
+                    zorder=4,
+                )
 
-        return (scan_scat, robot_dot)
+        artists = [robot_dot] + [
+            ln for seg_lines in robot_lines for ln, *_ in seg_lines
+        ]
+        if scan_holder[0] is not None:
+            artists.append(scan_holder[0])
+        return artists
 
     ani = animation.FuncAnimation(fig, update, interval=50, blit=False)
     _ = ani
