@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "urdf-tools"
+version = "0.1.0"
+description = "CLI tools for URDF visualization and sensor pub/sub"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "pyzmq>=25.0",
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+mesh = ["trimesh>=4.0"]
+
+[project.scripts]
+urdf-tools = "urdf_tools.cli:main"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B"]
+ignore = ["E501"]
