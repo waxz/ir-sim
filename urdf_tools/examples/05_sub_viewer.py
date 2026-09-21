@@ -143,12 +143,16 @@ def _world_bounds_2d(robot) -> tuple[float, float, float, float]:
 
 
 def _draw_urdf_3d_static(ax3, robot) -> list[np.ndarray]:
-    """Draw world URDF wireframe (muted) onto ax3 once; return world-space corners."""
+    """Draw world URDF wireframe onto ax3 once; return world-space corners.
+
+    Edge colour is derived from each geometry's URDF material rgba so that
+    different element types (walls, columns, racks, beams) are visually distinct.
+    """
     from urdf_tools.geometry import box_wireframe, cylinder_wireframe, sphere_wireframe
     from urdf_tools.viz import _link_world_blocks
 
     all_pts: list[np.ndarray] = []
-    for T, geom, _rgba in _link_world_blocks(robot):
+    for T, geom, rgba in _link_world_blocks(robot):
         if geom.type == "box":
             corners, edges = box_wireframe(geom.size)
         elif geom.type == "cylinder":
@@ -160,15 +164,23 @@ def _draw_urdf_3d_static(ax3, robot) -> list[np.ndarray]:
         h = np.column_stack([corners, np.ones(len(corners))])
         w = (T @ h.T).T[:, :3]
         all_pts.append(w)
+        # Blend material RGB toward the dark theme so each element type has a
+        # distinct but coherent tint: e.g. amber racks stay warm, steel columns
+        # stay cool-grey, walls stay neutral blue-grey.
+        r, g, b = float(rgba[0]), float(rgba[1]), float(rgba[2])
+        mat_a = float(rgba[3]) if len(rgba) > 3 else 1.0
+        ec = (r * 0.55 + 0.08, g * 0.55 + 0.10, b * 0.55 + 0.15)
+        wire_a = min(mat_a * 0.65, 0.75)
+        lw = 0.55 if geom.type == "box" else 0.65
         for i, j in edges:
             p0, p1 = w[i], w[j]
             ax3.plot(
                 [p0[0], p1[0]],
                 [p0[1], p1[1]],
                 [p0[2], p1[2]],
-                color=_WORLD_EC,
-                lw=0.6,
-                alpha=0.45,
+                color=ec,
+                lw=lw,
+                alpha=wire_a,
             )
     return all_pts
 
@@ -341,34 +353,42 @@ def live3d(
             seg_lines.append((ln, h, i, j))
         robot_lines.append(seg_lines)
 
-    # Scan scatter + robot dot
+    # Scan scatter — seed with one off-screen point so the colormap is properly
+    # initialised; empty c=[] leaves the internal state incomplete in some
+    # matplotlib versions and later set_array() calls are silently ignored.
+    _SEED = -9999.0
     scan_scat = ax3.scatter(
-        [],
-        [],
-        [],
-        s=1.5,
-        c=[],
+        [_SEED],
+        [_SEED],
+        [_SEED],
+        s=4.0,
+        c=[0.0],
         cmap=_SCAN_CMAP,
         vmin=0,
         vmax=12.0,
-        alpha=0.75,
+        alpha=0.90,
+        edgecolors="none",
+        depthshade=False,
     )
     robot_dot = ax3.scatter([], [], [], s=90, c=[_ROBOT_C], zorder=6, marker="^")
 
-    # Axis limits from world geometry (or default)
+    # Axis limits — use per-axis tight bounds so the z-range tracks the actual
+    # warehouse height (~6 m) rather than being inflated to match XY extent.
     if world_pts:
         pts = np.vstack(world_pts)
-        mins, maxs = pts.min(0), pts.max(0)
-        ranges = maxs - mins
-        mr = max(ranges.max() * 0.5, 3.0)
-        mids = (mins + maxs) * 0.5
-        ax3.set_xlim(mids[0] - mr, mids[0] + mr)
-        ax3.set_ylim(mids[1] - mr, mids[1] + mr)
-        ax3.set_zlim(max(mids[2] - mr, -1.0), mids[2] + mr)
+        xmin, ymin, zmin = pts.min(0)
+        xmax, ymax, zmax = pts.max(0)
+        xpad = (xmax - xmin) * 0.03 + 1.0
+        ypad = (ymax - ymin) * 0.03 + 1.0
+        ax3.set_xlim(xmin - xpad, xmax + xpad)
+        ax3.set_ylim(ymin - ypad, ymax + ypad)
+        ax3.set_zlim(-0.5, zmax + 0.5)
+        ax3.view_init(elev=32, azim=-52)
     else:
         ax3.set_xlim(-12, 12)
         ax3.set_ylim(-12, 12)
         ax3.set_zlim(-1, 8)
+        ax3.view_init(elev=32, azim=-52)
 
     scan_rmax = [12.0]  # mutable container for current range_max
     state = {"pose": (0.0, 0.0, 0.0)}
@@ -397,12 +417,19 @@ def live3d(
             rng = np.asarray(scan.ranges, dtype=np.float32)
             a = scan.angle_min + np.arange(len(rng)) * scan.angle_increment
             hit = rng < scan.range_max * 0.999
-            lx = x0 + rng[hit] * np.cos(th + a[hit])
-            ly = y0 + rng[hit] * np.sin(th + a[hit])
-            lz = np.zeros(hit.sum())
-            scan_scat._offsets3d = (lx, ly, lz)
-            scan_scat.set_array(rng[hit])
-            scan_scat.set_clim(0, scan_rmax[0])
+            if hit.any():
+                lx = x0 + rng[hit] * np.cos(th + a[hit])
+                ly = y0 + rng[hit] * np.sin(th + a[hit])
+                lz = np.full(hit.sum(), 0.05, dtype=np.float32)
+                scan_scat._offsets3d = (lx, ly, lz)
+                # Compute explicit RGBA colours — avoids the set_array/colormap
+                # state issue that occurs when the scatter was init'd with c=[0].
+                norm_c = np.clip(rng[hit] / max(scan_rmax[0], 1e-6), 0.0, 1.0)
+                colors = plt.cm.plasma(norm_c)
+                scan_scat.set_facecolors(colors)
+                scan_scat.set_edgecolors("none")
+            else:
+                scan_scat._offsets3d = ([_SEED], [_SEED], [_SEED])
 
         return (scan_scat, robot_dot)
 
