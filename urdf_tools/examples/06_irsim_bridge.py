@@ -5,14 +5,15 @@ sensor data (scan, odometry, IMU) via shmbridge shared memory so that
 05_sub_viewer.py can visualise it in real-time.
 
 Requires:
-    pip install ir-sim      (or: cd ir-sim && pip install -e .)
-    pip install shmbridge   (or: cd ir-sim/shmbridge && pip install -e .)
+    pip install ir-sim        (or: cd ir-sim && pip install -e .)
+    pip install shmbridge     (or: cd ir-sim/shmbridge && pip install -e .)
+    pip install irsim-devices (or: cd ir-sim/irsim_devices && pip install -e .)
 
 Usage:
-    # Basic — 10×10 m world with 4 yaml obstacles
+    # Basic — 10×10 m world with 4 yaml obstacles (irsim built-in lidar)
     python 06_irsim_bridge.py
 
-    # Warehouse — lidar raycasts against warehouse URDF geometry
+    # Warehouse — irsim_devices raycaster against warehouse URDF geometry
     python 06_irsim_bridge.py \\
         --yaml irsim_warehouse.yaml \\
         --world models/warehouse_world.urdf
@@ -81,22 +82,36 @@ def main() -> None:
 
     env = irsim.make(args.yaml, headless=args.no_render)
 
+    # irsim_devices lidar (standalone, raycasts against URDF scene)
+    dev_lidar = None
     if args.world:
-        from urdf_tools.irsim_compat import urdf_to_irsim_obstacles
+        from urdf_tools.irsim_compat import urdf_to_scene_2d
         from urdf_tools.parser import parse_urdf
 
         world_robot = parse_urdf(args.world)
-        urdf_obs = urdf_to_irsim_obstacles(
-            world_robot, name_prefix="urdf", lidar_height=args.lidar_height
+        scene = urdf_to_scene_2d(world_robot, lidar_height=args.lidar_height)
+
+        from irsim_devices.sensors import Lidar2D as DevLidar2D
+
+        robot_tmp = env.robot_list[0]
+        irsim_lidar = getattr(robot_tmp, "lidar", None)
+        dev_lidar = DevLidar2D(
+            state=None,
+            range_min=irsim_lidar.range_min if irsim_lidar else 0.1,
+            range_max=irsim_lidar.range_max if irsim_lidar else 20.0,
+            angle_range=irsim_lidar.angle_range if irsim_lidar else 6.2832,
+            number=irsim_lidar.number if irsim_lidar else 360,
         )
-        env.add_objects(urdf_obs)
+        dev_lidar.set_scene(scene)
         print(
-            f"[bridge] loaded {len(urdf_obs)} URDF obstacles"
+            f"[bridge] irsim_devices lidar — {len(scene)} scene objects"
             f" from {args.world!r}  (lidar_height={args.lidar_height} m)"
         )
 
     robot = env.robot_list[0]
-    has_lidar = hasattr(robot, "lidar") and robot.lidar is not None
+    has_lidar = dev_lidar is not None or (
+        hasattr(robot, "lidar") and robot.lidar is not None
+    )
 
     if not has_lidar:
         print(
@@ -136,7 +151,12 @@ def main() -> None:
 
                 # --- LiDAR scan ---
                 if has_lidar:
-                    scan_dict = robot.get_lidar_scan()
+                    if dev_lidar is not None:
+                        # irsim_devices raycaster against URDF scene
+                        dev_lidar.step(np.array([x, y, theta], dtype=np.float64))
+                        scan_dict = dev_lidar.get_scan()
+                    else:
+                        scan_dict = robot.get_lidar_scan()
                     ranges = scan_dict.get("ranges")
                     if ranges is not None and len(ranges):
                         rng = np.asarray(ranges, dtype=np.float32).ravel()
