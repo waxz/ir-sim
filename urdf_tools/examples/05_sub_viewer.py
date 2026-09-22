@@ -353,12 +353,13 @@ def live3d(
             seg_lines.append((ln, h, i, j))
         robot_lines.append(seg_lines)
 
-    # Scan scatter — use a mutable holder so the scatter is removed and recreated
-    # each frame.  Mutating _offsets3d + set_facecolors on the same object fails
-    # in animation: matplotlib re-computes face colours from the stale _A array
+    # Scan scatter + rays — mutable holders so both are removed and recreated each
+    # frame.  Mutating _offsets3d + set_facecolors on the same Axes3D scatter fails
+    # in FuncAnimation: matplotlib re-computes face colours from the stale _A array
     # (set at init via c=[scalar]) and overrides whatever set_facecolors wrote.
-    # A fresh scatter every frame carries only the colours we provide.
-    scan_holder: list = [None]  # scan_holder[0] is the current scatter or None
+    # Fresh artists every frame carry only the colours we provide.
+    scan_holder: list = [None]  # current scatter artist or None
+    scan_rays: list = []  # current ray Line3D objects
     robot_dot = ax3.scatter([], [], [], s=90, c=[_ROBOT_C], zorder=6, marker="^")
 
     # Axis limits — use per-axis tight bounds so the z-range tracks the actual
@@ -400,16 +401,24 @@ def live3d(
 
         robot_dot._offsets3d = ([x0], [y0], [0.12])
 
-        # Remove previous scan scatter before replacing it
+        # Remove previous scan scatter + rays before replacing them
         if scan_holder[0] is not None:
             try:
                 scan_holder[0].remove()
             except Exception:
                 pass
             scan_holder[0] = None
+        for _ln in scan_rays:
+            try:
+                _ln.remove()
+            except Exception:
+                pass
+        scan_rays.clear()
 
         # Scan cloud in world frame — fresh scatter each frame avoids the
         # matplotlib colormap-override bug on animated Axes3D scatter objects.
+        # Render at realistic lidar height (0.30 m) with larger dots and sparse
+        # rays so the cloud is clearly visible from any 3D viewing angle.
         if scan and scan.ranges:
             scan_rmax[0] = scan.range_max
             rng = np.asarray(scan.ranges, dtype=np.float32)
@@ -418,25 +427,41 @@ def live3d(
             if hit.any():
                 lx = x0 + rng[hit] * np.cos(th + a[hit])
                 ly = y0 + rng[hit] * np.sin(th + a[hit])
-                lz = np.full(hit.sum(), 0.05, dtype=np.float32)
+                _LZ = 0.30  # lidar height above floor (m)
+                lz = np.full(hit.sum(), _LZ, dtype=np.float32)
                 norm_c = np.clip(rng[hit] / max(scan_rmax[0], 1e-6), 0.0, 1.0)
+                colors_rgba = plt.cm.plasma(norm_c)
                 scan_holder[0] = ax3.scatter(
                     lx,
                     ly,
                     lz,
-                    s=4.0,
-                    c=plt.cm.plasma(norm_c),
-                    alpha=0.90,
+                    s=18,
+                    c=colors_rgba,
+                    alpha=0.95,
                     edgecolors="none",
                     depthshade=False,
-                    zorder=4,
+                    zorder=5,
                 )
+                # Sparse rays every 8th hit — thin coloured lines from robot to
+                # each hit point make the cloud obvious at any elevation angle.
+                for _k in range(0, hit.sum(), 8):
+                    _c = tuple(colors_rgba[_k, :3])
+                    (_ray,) = ax3.plot(
+                        [x0, float(lx[_k])],
+                        [y0, float(ly[_k])],
+                        [_LZ, _LZ],
+                        color=_c,
+                        lw=0.7,
+                        alpha=0.35,
+                    )
+                    scan_rays.append(_ray)
 
         artists = [robot_dot] + [
             ln for seg_lines in robot_lines for ln, *_ in seg_lines
         ]
         if scan_holder[0] is not None:
             artists.append(scan_holder[0])
+        artists.extend(scan_rays)
         return artists
 
     ani = animation.FuncAnimation(fig, update, interval=50, blit=False)
