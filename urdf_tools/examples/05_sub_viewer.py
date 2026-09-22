@@ -5,7 +5,7 @@ Requires shmbridge installed and 06_irsim_bridge.py (or 04_pub_sensors.py) runni
 Usage:
     python 05_sub_viewer.py                     # text print mode
     python 05_sub_viewer.py --live2d            # 2D real-time LiDAR (no world)
-    python 05_sub_viewer.py --live3d            # 3D real-time LiDAR (no world)
+    python 05_sub_viewer.py --live3d            # 3D real-time LiDAR (three.js web viewer)
 
     # With world and robot URDF overlays
     python 05_sub_viewer.py --live2d \\
@@ -16,6 +16,11 @@ Usage:
         --world models/warehouse_world.urdf \\
         --robot models/robot_diff.urdf
 
+    # Fallback matplotlib 3D viewer
+    python 05_sub_viewer.py --live3d-mpl \\
+        --world models/warehouse_world.urdf \\
+        --robot models/robot_diff.urdf
+
     # Legacy alias
     python 05_sub_viewer.py --live              # same as --live2d
     python 05_sub_viewer.py --count 20          # stop after 20 polls (text mode)
@@ -23,8 +28,12 @@ Usage:
 
 from __future__ import annotations
 
+import json as _json
 import math
+import queue as _queue
+import socket as _socket
 import sys
+import threading as _threading
 import time
 from pathlib import Path
 
@@ -49,6 +58,440 @@ _HDG_C = "#60a5fa"  # heading arrow             (blue-400)
 _SCAN_CMAP = "plasma"
 _RAY_C = "#ef4444"  # scan ray colour           (red-500)
 _SCAN_HIT_EC = "#f97316"  # scan hit edge          (orange-500)
+
+# ── three.js web viewer HTML ──────────────────────────────────────────────────
+
+_HTML_VIEWER = """\
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>3D LiDAR — shmbridge</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;background:#0f172a;overflow:hidden}
+canvas{display:block}
+#hud{
+  position:fixed;top:14px;left:14px;
+  background:rgba(13,21,38,.82);border:1px solid #1e293b;
+  border-radius:7px;padding:9px 14px;
+  color:#94a3b8;font:11px/1.65 'JetBrains Mono','Fira Code',ui-monospace,monospace;
+  pointer-events:none;white-space:pre;backdrop-filter:blur(6px);
+}
+.hi{color:#60a5fa}.val{color:#e2e8f0}.dim{color:#475569}
+</style>
+</head>
+<body>
+<div id="hud"><span class="dim">Connecting…</span></div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── renderer ──────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ── scene ─────────────────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f172a);
+scene.fog = new THREE.FogExp2(0x0f172a, 0.007);
+
+// ── camera (Z-up) ─────────────────────────────────────────────────────────────
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 600);
+camera.up.set(0, 0, 1);
+camera.position.set(-8, -22, 32);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(25, 15, 3);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.update();
+
+// R = reset camera
+window.addEventListener('keydown', e => {
+  if (e.key === 'r' || e.key === 'R') {
+    camera.position.set(-8, -22, 32);
+    controls.target.set(25, 15, 3);
+    controls.update();
+  }
+});
+
+// ── floor grid ────────────────────────────────────────────────────────────────
+const grid = new THREE.GridHelper(300, 300, 0x1e293b, 0x1e293b);
+grid.rotation.x = Math.PI / 2;
+scene.add(grid);
+
+// ── plasma colour LUT ─────────────────────────────────────────────────────────
+const PLASMA = [
+  [0.050,0.030,0.528],[0.283,0.030,0.632],[0.492,0.012,0.657],
+  [0.675,0.079,0.596],[0.829,0.193,0.439],[0.940,0.378,0.220],
+  [0.976,0.607,0.100],[0.940,0.975,0.131],
+];
+function plasma(t) {
+  t = Math.max(0, Math.min(1, t));
+  const n = PLASMA.length - 1;
+  const i = Math.min(Math.floor(t * n), n - 1);
+  const f = t * n - i;
+  const [r0,g0,b0] = PLASMA[i], [r1,g1,b1] = PLASMA[i+1];
+  return [r0+f*(r1-r0), g0+f*(g1-g0), b0+f*(b1-b0)];
+}
+
+// ── wireframe builder ─────────────────────────────────────────────────────────
+function buildWireframe(data) {
+  const group = new THREE.Group();
+  for (const { rgba, segments } of data) {
+    if (!segments.length) continue;
+    const [r, g, b, a = 1] = rgba;
+    // blend material colour toward the dark theme (same formula as matplotlib version)
+    const ec = new THREE.Color(r*0.55+0.08, g*0.55+0.10, b*0.55+0.15);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(segments, 3));
+    group.add(new THREE.LineSegments(geom,
+      new THREE.LineBasicMaterial({ color: ec, transparent: true,
+        opacity: Math.min(a * 0.70, 0.82) })));
+  }
+  return group;
+}
+
+// ── scan cloud (vertex-coloured Points) ───────────────────────────────────────
+const MAX_PTS = 1024;
+const sPosArr = new Float32Array(MAX_PTS * 3);
+const sColArr = new Float32Array(MAX_PTS * 3);
+const sGeom   = new THREE.BufferGeometry();
+sGeom.setAttribute('position', new THREE.BufferAttribute(sPosArr, 3));
+sGeom.setAttribute('color',    new THREE.BufferAttribute(sColArr, 3));
+sGeom.setDrawRange(0, 0);
+scene.add(new THREE.Points(sGeom,
+  new THREE.PointsMaterial({ size: 0.30, vertexColors: true, sizeAttenuation: true })));
+
+// ── scan rays (vertex-coloured LineSegments) ──────────────────────────────────
+const MAX_RAYS = 64;
+const rPosArr = new Float32Array(MAX_RAYS * 6);
+const rColArr = new Float32Array(MAX_RAYS * 6);
+const rGeom   = new THREE.BufferGeometry();
+rGeom.setAttribute('position', new THREE.BufferAttribute(rPosArr, 3));
+rGeom.setAttribute('color',    new THREE.BufferAttribute(rColArr, 3));
+rGeom.setDrawRange(0, 0);
+scene.add(new THREE.LineSegments(rGeom,
+  new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.30 })));
+
+// ── robot visual ──────────────────────────────────────────────────────────────
+const robotPivot = new THREE.Group();
+scene.add(robotPivot);
+// heading cone points in +X (local frame)
+const coneG = new THREE.ConeGeometry(0.22, 0.60, 10);
+coneG.rotateZ(-Math.PI / 2);
+robotPivot.add(new THREE.Mesh(coneG,
+  new THREE.MeshBasicMaterial({ color: 0x3b82f6 })));
+// body disc
+robotPivot.add(new THREE.Mesh(new THREE.CircleGeometry(0.22, 24),
+  new THREE.MeshBasicMaterial({ color: 0x1e3a5f, side: THREE.DoubleSide })));
+// ring outline
+robotPivot.add(new THREE.Mesh(new THREE.RingGeometry(0.19, 0.25, 24),
+  new THREE.MeshBasicMaterial({ color: 0x93c5fd, side: THREE.DoubleSide })));
+
+let robotWireGroup = null;
+
+// ── per-frame update helpers ──────────────────────────────────────────────────
+function updatePose(x, y, th) {
+  robotPivot.position.set(x, y, 0.30);
+  robotPivot.rotation.z = th;
+  if (robotWireGroup) {
+    robotWireGroup.position.set(x, y, 0);
+    robotWireGroup.rotation.z = th;
+  }
+}
+
+function updateScan({ ranges, angle_min, angle_increment, range_max }, x0, y0, th) {
+  const LZ = 0.30;
+  let nP = 0, nR = 0;
+  for (let i = 0; i < ranges.length; i++) {
+    const r = ranges[i];
+    if (r >= range_max * 0.999 || nP >= MAX_PTS) continue;
+    const a  = angle_min + i * angle_increment;
+    const hx = x0 + r * Math.cos(th + a);
+    const hy = y0 + r * Math.sin(th + a);
+    const [cr, cg, cb] = plasma(r / range_max);
+    sPosArr[nP*3]=hx; sPosArr[nP*3+1]=hy; sPosArr[nP*3+2]=LZ;
+    sColArr[nP*3]=cr; sColArr[nP*3+1]=cg; sColArr[nP*3+2]=cb;
+    nP++;
+    // every 6th hit: draw a ray from robot to hit
+    if (i % 6 === 0 && nR < MAX_RAYS) {
+      const k = nR * 6;
+      rPosArr[k]=x0;  rPosArr[k+1]=y0;  rPosArr[k+2]=LZ;
+      rPosArr[k+3]=hx; rPosArr[k+4]=hy; rPosArr[k+5]=LZ;
+      // gradient: dim at robot, full colour at hit
+      rColArr[k]=cr*0.2; rColArr[k+1]=cg*0.2; rColArr[k+2]=cb*0.2;
+      rColArr[k+3]=cr;   rColArr[k+4]=cg;     rColArr[k+5]=cb;
+      nR++;
+    }
+  }
+  sGeom.setDrawRange(0, nP);
+  sGeom.attributes.position.needsUpdate = true;
+  sGeom.attributes.color.needsUpdate    = true;
+  rGeom.setDrawRange(0, nR * 2);
+  rGeom.attributes.position.needsUpdate = true;
+  rGeom.attributes.color.needsUpdate    = true;
+}
+
+// ── load static geometry ──────────────────────────────────────────────────────
+async function initGeometry() {
+  const [wData, rData] = await Promise.all([
+    fetch('/world.json').then(r => r.json()).catch(() => []),
+    fetch('/robot.json').then(r => r.json()).catch(() => []),
+  ]);
+
+  if (wData.length) {
+    scene.add(buildWireframe(wData));
+    // auto-fit camera to world bounding box
+    let xlo=Infinity, xhi=-Infinity, ylo=Infinity, yhi=-Infinity, zhi=0;
+    for (const { segments: s } of wData)
+      for (let i = 0; i < s.length; i += 3) {
+        const [x, y, z] = [s[i], s[i+1], s[i+2]];
+        xlo=Math.min(xlo,x); xhi=Math.max(xhi,x);
+        ylo=Math.min(ylo,y); yhi=Math.max(yhi,y);
+        zhi=Math.max(zhi,z);
+      }
+    const cx=(xlo+xhi)/2, cy=(ylo+yhi)/2;
+    const d = Math.max(xhi-xlo, yhi-ylo, 1);
+    controls.target.set(cx, cy, zhi*0.4);
+    camera.position.set(cx-d*0.35, cy-d*0.55, zhi+d*0.45);
+    controls.update();
+    grid.position.set(cx, cy, -0.01);
+  }
+
+  if (rData.length) {
+    robotWireGroup = buildWireframe(rData);
+    scene.add(robotWireGroup);
+  }
+}
+initGeometry();
+
+// ── SSE sensor stream ─────────────────────────────────────────────────────────
+const hud = document.getElementById('hud');
+let posX=0, posY=0, posTh=0;
+let fCount=0, fLast=performance.now(), curFps='--';
+
+const es = new EventSource('/stream');
+es.onopen = () => {
+  hud.innerHTML = '<span class="dim">Connected — waiting for data…</span>';
+};
+es.onmessage = ({ data }) => {
+  const frame = JSON.parse(data);
+  if (frame.pose) { [posX, posY, posTh] = frame.pose; updatePose(posX, posY, posTh); }
+  if (frame.scan)  updateScan(frame.scan, posX, posY, posTh);
+  fCount++;
+  const now = performance.now();
+  if (now - fLast >= 1000) {
+    curFps = (fCount * 1000 / (now - fLast)).toFixed(1);
+    fCount = 0; fLast = now;
+  }
+  hud.innerHTML =
+    '<span class="hi">3D LiDAR</span> — shmbridge\\n' +
+    'x=<span class="val">' + posX.toFixed(3) + '</span>  ' +
+    'y=<span class="val">' + posY.toFixed(3) + '</span>  ' +
+    'θ=<span class="val">' + posTh.toFixed(3) + '</span>\\n' +
+    '<span class="dim">' + curFps + ' fps · drag:orbit  scroll:zoom  R:reset</span>';
+};
+es.onerror = () => {
+  hud.innerHTML = '<span style="color:#ef4444">Stream lost — is 06_irsim_bridge.py running?</span>';
+};
+
+// ── render loop ───────────────────────────────────────────────────────────────
+(function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# ── URDF → three.js wireframe JSON ───────────────────────────────────────────
+
+
+def _urdf_to_wireframe_json(robot) -> str:
+    """Return a JSON array of {rgba, segments} objects for three.js LineSegments.
+
+    Each element's geometry is pre-transformed into its world (or robot-local)
+    frame so the JS side needs no further matrix math per element.
+    """
+    from urdf_tools.geometry import box_wireframe, cylinder_wireframe, sphere_wireframe
+    from urdf_tools.viz import _link_world_blocks
+
+    result = []
+    for T, geom, rgba in _link_world_blocks(robot):
+        if geom.type == "box":
+            corners, edges = box_wireframe(geom.size)
+        elif geom.type == "cylinder":
+            corners, edges = cylinder_wireframe(geom.radius, geom.length)
+        elif geom.type == "sphere":
+            corners, edges = sphere_wireframe(geom.radius)
+        else:
+            continue
+        h = np.column_stack([corners, np.ones(len(corners))])
+        w = (T @ h.T).T[:, :3]
+        # Flat array [x0,y0,z0, x1,y1,z1, ...] — one pair per edge
+        segs: list[float] = []
+        for i, j in edges:
+            p0, p1 = w[i], w[j]
+            segs += [
+                round(float(p0[0]), 4),
+                round(float(p0[1]), 4),
+                round(float(p0[2]), 4),
+                round(float(p1[0]), 4),
+                round(float(p1[1]), 4),
+                round(float(p1[2]), 4),
+            ]
+        result.append(
+            {
+                "rgba": [round(float(c), 4) for c in rgba],
+                "segments": segs,
+            }
+        )
+    return _json.dumps(result)
+
+
+# ── 3D viewer — three.js web UI ───────────────────────────────────────────────
+
+
+def _free_port() -> int:
+    """Return an available TCP port on localhost."""
+    with _socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def live3d(
+    sub: SensorSubscriber,
+    world_robot=None,
+    overlay_robot=None,
+    port: int = 0,
+) -> None:
+    """Serve a three.js 3D viewer over localhost HTTP + SSE and open a browser.
+
+    The browser renders the warehouse wireframe and animates the robot + scan
+    cloud using WebGL via three.js. Sensor data is streamed from shmbridge
+    via Server-Sent Events (no extra dependencies required beyond stdlib).
+    """
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    _html = _HTML_VIEWER.encode()
+    _world_json = (
+        _urdf_to_wireframe_json(world_robot).encode() if world_robot else b"[]"
+    )
+    _robot_json = (
+        _urdf_to_wireframe_json(overlay_robot).encode() if overlay_robot else b"[]"
+    )
+
+    data_q: _queue.Queue = _queue.Queue(maxsize=4)
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            p = self.path.split("?")[0]
+            if p == "/":
+                self._reply(200, "text/html; charset=utf-8", _html)
+            elif p == "/world.json":
+                self._reply(200, "application/json", _world_json)
+            elif p == "/robot.json":
+                self._reply(200, "application/json", _robot_json)
+            elif p == "/stream":
+                self._sse()
+            else:
+                self._reply(404, "text/plain", b"Not found")
+
+        def _reply(self, code: int, ct: str, body: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _sse(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            while True:
+                try:
+                    payload = data_q.get(timeout=0.8)
+                    msg = ("data: " + _json.dumps(payload) + "\n\n").encode()
+                    self.wfile.write(msg)
+                    self.wfile.flush()
+                except _queue.Empty:
+                    try:  # keepalive comment
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        break
+                except Exception:
+                    break
+
+        def log_message(self, *_) -> None:  # suppress HTTP log spam
+            pass
+
+    if port == 0:
+        port = _free_port()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), _H)
+    t = _threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    url = f"http://127.0.0.1:{port}/"
+    print(f"[web3d] {url}  (Ctrl+C to stop)")
+    webbrowser.open(url)
+
+    pose = [0.0, 0.0, 0.0]
+    try:
+        while True:
+            scan = sub.read_scan()
+            odom = sub.read_odom()
+            if odom:
+                pose[:] = [odom.x, odom.y, odom.theta]
+
+            frame: dict = {
+                "pose": [round(pose[0], 4), round(pose[1], 4), round(pose[2], 4)]
+            }
+            if scan and scan.ranges:
+                frame["scan"] = {
+                    "ranges": [round(r, 3) for r in scan.ranges],
+                    "angle_min": round(scan.angle_min, 6),
+                    "angle_increment": round(scan.angle_increment, 7),
+                    "range_max": round(scan.range_max, 3),
+                }
+            try:
+                data_q.put_nowait(frame)
+            except _queue.Full:
+                pass  # drop frame — client is behind
+
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\n[web3d] stopped.")
+    finally:
+        srv.shutdown()
+
+
+# ── shared style helpers ───────────────────────────────────────────────────────
 
 
 def _style_fig(fig) -> None:
@@ -164,9 +607,6 @@ def _draw_urdf_3d_static(ax3, robot) -> list[np.ndarray]:
         h = np.column_stack([corners, np.ones(len(corners))])
         w = (T @ h.T).T[:, :3]
         all_pts.append(w)
-        # Blend material RGB toward the dark theme so each element type has a
-        # distinct but coherent tint: e.g. amber racks stay warm, steel columns
-        # stay cool-grey, walls stay neutral blue-grey.
         r, g, b = float(rgba[0]), float(rgba[1]), float(rgba[2])
         mat_a = float(rgba[3]) if len(rgba) > 3 else 1.0
         ec = (r * 0.55 + 0.08, g * 0.55 + 0.10, b * 0.55 + 0.15)
@@ -318,15 +758,17 @@ def live2d(
     plt.show()
 
 
-# ── 3D real-time viewer ────────────────────────────────────────────────────────
+# ── 3D matplotlib viewer (fallback) ───────────────────────────────────────────
 
 
-def live3d(
+def live3d_mpl(
     sub: SensorSubscriber,
     world_robot=None,
     overlay_robot=None,
 ) -> None:
-    """Real-time 3D viewer: world wireframe + animated robot + LiDAR scan cloud."""
+    """Fallback matplotlib 3D viewer (use --live3d-mpl).  Prefer live3d() for
+    the full-featured three.js web viewer (--live3d).
+    """
     import matplotlib.animation as animation
     import matplotlib.pyplot as plt
 
@@ -338,12 +780,10 @@ def live3d(
     _style_ax3d(ax3, "3D LiDAR — shmbridge")
     fig.tight_layout(pad=1.0)
 
-    # Static world wireframe
     world_pts: list[np.ndarray] = []
     if world_robot is not None:
         world_pts = _draw_urdf_3d_static(ax3, world_robot)
 
-    # Pre-build robot wireframe line objects (updated per-frame)
     robot_segs = _robot_wireframe_segments(overlay_robot) if overlay_robot else []
     robot_lines: list[tuple] = []
     for h, edges, ec in robot_segs:
@@ -353,17 +793,10 @@ def live3d(
             seg_lines.append((ln, h, i, j))
         robot_lines.append(seg_lines)
 
-    # Scan scatter + rays — mutable holders so both are removed and recreated each
-    # frame.  Mutating _offsets3d + set_facecolors on the same Axes3D scatter fails
-    # in FuncAnimation: matplotlib re-computes face colours from the stale _A array
-    # (set at init via c=[scalar]) and overrides whatever set_facecolors wrote.
-    # Fresh artists every frame carry only the colours we provide.
-    scan_holder: list = [None]  # current scatter artist or None
-    scan_rays: list = []  # current ray Line3D objects
+    scan_holder: list = [None]
+    scan_rays: list = []
     robot_dot = ax3.scatter([], [], [], s=90, c=[_ROBOT_C], zorder=6, marker="^")
 
-    # Axis limits — use per-axis tight bounds so the z-range tracks the actual
-    # warehouse height (~6 m) rather than being inflated to match XY extent.
     if world_pts:
         pts = np.vstack(world_pts)
         xmin, ymin, zmin = pts.min(0)
@@ -380,7 +813,7 @@ def live3d(
         ax3.set_zlim(-1, 8)
         ax3.view_init(elev=32, azim=-52)
 
-    scan_rmax = [12.0]  # mutable container for current range_max
+    scan_rmax = [12.0]
     state = {"pose": (0.0, 0.0, 0.0)}
 
     def update(_frame):
@@ -390,7 +823,6 @@ def live3d(
             state["pose"] = (odom.x, odom.y, odom.theta)
         x0, y0, th = state["pose"]
 
-        # Move robot wireframe
         root_T = _p2m([x0, y0, 0.0], [0.0, 0.0, th])
         for seg_lines in robot_lines:
             for ln, h, i, j in seg_lines:
@@ -398,10 +830,8 @@ def live3d(
                 ln.set_data_3d(
                     [w[i, 0], w[j, 0]], [w[i, 1], w[j, 1]], [w[i, 2], w[j, 2]]
                 )
-
         robot_dot._offsets3d = ([x0], [y0], [0.12])
 
-        # Remove previous scan scatter + rays before replacing them
         if scan_holder[0] is not None:
             try:
                 scan_holder[0].remove()
@@ -415,10 +845,6 @@ def live3d(
                 pass
         scan_rays.clear()
 
-        # Scan cloud in world frame — fresh scatter each frame avoids the
-        # matplotlib colormap-override bug on animated Axes3D scatter objects.
-        # Render at realistic lidar height (0.30 m) with larger dots and sparse
-        # rays so the cloud is clearly visible from any 3D viewing angle.
         if scan and scan.ranges:
             scan_rmax[0] = scan.range_max
             rng = np.asarray(scan.ranges, dtype=np.float32)
@@ -427,7 +853,7 @@ def live3d(
             if hit.any():
                 lx = x0 + rng[hit] * np.cos(th + a[hit])
                 ly = y0 + rng[hit] * np.sin(th + a[hit])
-                _LZ = 0.30  # lidar height above floor (m)
+                _LZ = 0.30
                 lz = np.full(hit.sum(), _LZ, dtype=np.float32)
                 norm_c = np.clip(rng[hit] / max(scan_rmax[0], 1e-6), 0.0, 1.0)
                 colors_rgba = plt.cm.plasma(norm_c)
@@ -442,8 +868,6 @@ def live3d(
                     depthshade=False,
                     zorder=5,
                 )
-                # Sparse rays every 8th hit — thin coloured lines from robot to
-                # each hit point make the cloud obvious at any elevation angle.
                 for _k in range(0, hit.sum(), 8):
                     _c = tuple(colors_rgba[_k, :3])
                     (_ray,) = ax3.plot(
@@ -521,12 +945,24 @@ def main() -> None:
         "--live",
         dest="live2d",
         action="store_true",
-        help="Open real-time 2D LiDAR viewer",
+        help="Open real-time 2D LiDAR viewer (matplotlib)",
     )
     ap.add_argument(
         "--live3d",
         action="store_true",
-        help="Open real-time 3D LiDAR viewer",
+        help="Open real-time 3D LiDAR viewer (three.js web UI, opens browser)",
+    )
+    ap.add_argument(
+        "--live3d-mpl",
+        dest="live3d_mpl",
+        action="store_true",
+        help="Open real-time 3D LiDAR viewer (matplotlib fallback)",
+    )
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Port for the three.js web server (0 = auto-select)",
     )
     ap.add_argument(
         "--world",
@@ -568,7 +1004,14 @@ def main() -> None:
 
     try:
         if args.live3d:
-            live3d(sub, world_robot=world_robot, overlay_robot=overlay_robot)
+            live3d(
+                sub,
+                world_robot=world_robot,
+                overlay_robot=overlay_robot,
+                port=args.port,
+            )
+        elif args.live3d_mpl:
+            live3d_mpl(sub, world_robot=world_robot, overlay_robot=overlay_robot)
         elif args.live2d:
             live2d(sub, world_robot=world_robot, overlay_robot=overlay_robot)
         else:
