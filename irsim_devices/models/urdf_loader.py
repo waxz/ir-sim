@@ -66,12 +66,12 @@ def _geom_to_trimesh(geom_elem, base_dir: str) -> trimesh.Trimesh | None:
     """Convert a URDF ``<geometry>`` element to a trimesh.Trimesh."""
     if geom_elem is None:
         return None
-    child = (
-        geom_elem.find("box")
-        or geom_elem.find("cylinder")
-        or geom_elem.find("sphere")
-        or geom_elem.find("mesh")
-    )
+    child = None
+    for _tag in ("box", "cylinder", "sphere", "mesh"):
+        _found = geom_elem.find(_tag)
+        if _found is not None:
+            child = _found
+            break
     if child is None:
         return None
 
