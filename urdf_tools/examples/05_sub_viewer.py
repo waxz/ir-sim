@@ -191,6 +191,17 @@ rGeom.setDrawRange(0, 0);
 scene.add(new THREE.LineSegments(rGeom,
   new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.30 })));
 
+// ── 3D lidar point cloud ──────────────────────────────────────────────────────
+const MAX_PTS3D = 2048;
+const p3PosArr = new Float32Array(MAX_PTS3D * 3);
+const p3ColArr = new Float32Array(MAX_PTS3D * 3);
+const p3Geom   = new THREE.BufferGeometry();
+p3Geom.setAttribute('position', new THREE.BufferAttribute(p3PosArr, 3));
+p3Geom.setAttribute('color',    new THREE.BufferAttribute(p3ColArr, 3));
+p3Geom.setDrawRange(0, 0);
+scene.add(new THREE.Points(p3Geom,
+  new THREE.PointsMaterial({ size: 3, vertexColors: true, sizeAttenuation: false })));
+
 // ── robot visual ──────────────────────────────────────────────────────────────
 const robotPivot = new THREE.Group();
 scene.add(robotPivot);
@@ -251,6 +262,24 @@ function updateScan({ ranges, angle_min, angle_increment, range_max }, x0, y0, t
   return nP;
 }
 
+function updateCloud3D({ pts, n, z_min, z_max }) {
+  const zLo = (z_min != null) ? z_min : 0.0;
+  const zHi = (z_max != null) ? z_max : 6.0;
+  const zRange = Math.max(zHi - zLo, 0.001);
+  const count = Math.min(n, MAX_PTS3D);
+  for (let i = 0; i < count; i++) {
+    p3PosArr[i*3]   = pts[i*3];
+    p3PosArr[i*3+1] = pts[i*3+1];
+    p3PosArr[i*3+2] = pts[i*3+2];
+    const t = (pts[i*3+2] - zLo) / zRange;
+    const [cr, cg, cb] = plasma(Math.max(0, Math.min(1, t)));
+    p3ColArr[i*3]=cr; p3ColArr[i*3+1]=cg; p3ColArr[i*3+2]=cb;
+  }
+  p3Geom.setDrawRange(0, count);
+  p3Geom.attributes.position.needsUpdate = true;
+  p3Geom.attributes.color.needsUpdate    = true;
+}
+
 // ── load static geometry ──────────────────────────────────────────────────────
 async function initGeometry() {
   const [wData, rData] = await Promise.all([
@@ -297,7 +326,8 @@ es.onopen = () => {
 es.onmessage = ({ data }) => {
   const frame = JSON.parse(data);
   if (frame.pose) { [posX, posY, posTh] = frame.pose; updatePose(posX, posY, posTh); }
-  if (frame.scan) { lastHitCount = updateScan(frame.scan, posX, posY, posTh); }
+  if (frame.scan)  { lastHitCount = updateScan(frame.scan, posX, posY, posTh); }
+  if (frame.cloud) { updateCloud3D(frame.cloud); }
   fCount++;
   const now = performance.now();
   if (now - fLast >= 1000) {
@@ -464,6 +494,12 @@ def live3d(
     print(f"[web3d] {url}  (Ctrl+C to stop)")
     webbrowser.open(url)
 
+    _has_3d = sub.try_attach_cloud3d(timeout_ms=2000)
+    if _has_3d:
+        print("[web3d] 3D cloud channel attached")
+    else:
+        print("[web3d] 3D cloud channel unavailable (no --world or EmbreeLidar3D)")
+
     pose = [0.0, 0.0, 0.0]
     try:
         while True:
@@ -482,6 +518,20 @@ def live3d(
                     "angle_increment": round(scan.angle_increment, 7),
                     "range_max": round(scan.range_max, 3),
                 }
+            if _has_3d:
+                pts3d = sub.read_cloud3d()
+                if pts3d is not None and len(pts3d):
+                    # subsample to MAX_PTS3D for SSE bandwidth
+                    step = max(1, len(pts3d) // 2048)
+                    pts3d = pts3d[::step][:2048]
+                    z_col = pts3d[:, 2]
+                    flat = [round(float(v), 3) for v in pts3d[:, :3].ravel()]
+                    frame["cloud"] = {
+                        "pts": flat,
+                        "n": len(pts3d),
+                        "z_min": round(float(z_col.min()), 3),
+                        "z_max": round(float(z_col.max()), 3),
+                    }
             try:
                 data_q.put_nowait(frame)
             except _queue.Full:

@@ -84,6 +84,7 @@ def main() -> None:
 
     # irsim_devices lidar (standalone, raycasts against URDF scene)
     dev_lidar = None
+    dev_lidar3d = None
     if args.world:
         from urdf_tools.irsim_compat import urdf_to_scene_2d
         from urdf_tools.parser import parse_urdf
@@ -108,6 +109,27 @@ def main() -> None:
             f"[bridge] irsim_devices lidar — {len(scene)} scene objects"
             f" from {args.world!r}  (lidar_height={args.lidar_height} m)"
         )
+
+        # 3D lidar — Embree BVH against the full URDF mesh
+        try:
+            from irsim_devices.models.urdf_loader import load_urdf
+            from irsim_devices.sensors.lidar3d_embree import EmbreeLidar3D
+
+            urdf_model = load_urdf(args.world, use_collision=False)
+            dev_lidar3d = EmbreeLidar3D(
+                state=np.array([x0, y0, th0], dtype=np.float64),
+                obj_id=-2,
+                profile="vlp16",
+                sensor_height=args.lidar_height,
+            )
+            dev_lidar3d.build_embree_scene(urdf_model.vertices, urdf_model.triangles)
+            print(
+                f"[bridge] EmbreeLidar3D vlp16 — {len(urdf_model.triangles)} tris"
+                f" ({len(urdf_model.vertices)} verts)"
+            )
+        except Exception as exc:
+            print(f"[warn] EmbreeLidar3D unavailable: {exc}", file=sys.stderr)
+            dev_lidar3d = None
 
     robot = env.robot_list[0]
     has_lidar = dev_lidar is not None or (
@@ -177,6 +199,13 @@ def main() -> None:
                                 ranges=rng.tolist(),
                             )
                         )
+
+                # --- 3D LiDAR cloud ---
+                if dev_lidar3d is not None:
+                    dev_lidar3d.step(np.array([x, y, theta], dtype=np.float64))
+                    pts3d = dev_lidar3d.scan
+                    if pts3d is not None and len(pts3d):
+                        pub.publish_cloud3d(pts3d, stamp=sim_time)
 
                 # --- IMU (simulated: gravity + yaw-rate) ---
                 pub.publish_imu(

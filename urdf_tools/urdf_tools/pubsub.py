@@ -1,9 +1,11 @@
 """Sensor pub/sub backed by shmbridge shared memory.
 
 Channel mapping (all in one ExtShmBridge segment):
-    scan  →  pointcloud channel  (N, 4) float32: [x, y, range, angle]
-    imu   →  imu channel
-    odom  →  state channel: x, y, heading, vx, vy, omega
+    scan   →  pointcloud channel  (N, 4) float32: [x, y, range, angle]
+    imu    →  imu channel
+    odom   →  state channel: x, y, heading, vx, vy, omega
+    cloud3d → secondary ExtShmBridge segment (shm_name + "_3d"):
+               pointcloud channel (N, 4) float32: [x, y, z, dist]
 
 Usage
 -----
@@ -12,12 +14,15 @@ Publisher (sensor simulator):
         pub.publish_scan(LaserScan(...))
         pub.publish_imu(Imu(...))
         pub.publish_odom(Odometry(...))
+        pub.publish_cloud3d(pts_nx4)   # float32 (N,4): x,y,z,dist
 
 Subscriber (visualizer / controller):
     with SensorSubscriber("/urdf_sensors") as sub:
-        scan = sub.read_scan()   # LaserScan or None
-        imu  = sub.read_imu()    # Imu or None
-        odom = sub.read_odom()   # Odometry or None
+        sub.try_attach_cloud3d()       # optional; enables read_cloud3d()
+        scan  = sub.read_scan()        # LaserScan or None
+        imu   = sub.read_imu()         # Imu or None
+        odom  = sub.read_odom()        # Odometry or None
+        cloud = sub.read_cloud3d()     # (N,4) float32 or None
 """
 
 from __future__ import annotations
@@ -74,6 +79,14 @@ class Odometry:
     omega: float = 0.0
 
 
+@dataclass
+class PointCloud3D:
+    frame_id: str = "lidar3d"
+    stamp: float = 0.0
+    # (N, 4) float32 array: x, y, z, dist  (world frame)
+    points: np.ndarray = field(default_factory=lambda: np.empty((0, 4), dtype=np.float32))
+
+
 # ── Publisher ─────────────────────────────────────────────────────────────────
 
 
@@ -89,14 +102,21 @@ class SensorPublisher:
             raise RuntimeError(
                 "shmbridge package not found — install it from ir-sim/shmbridge/"
             )
+        self._shm_name = shm_name
         self._ext = ExtShmBridge(shm_name)
+        self._ext3d = ExtShmBridge(shm_name + "_3d")
         self._step = 0
 
     def open(self) -> None:
         self._ext.open()
+        self._ext3d.open()
 
     def close(self) -> None:
         self._ext.close()
+        try:
+            self._ext3d.close()
+        except Exception:
+            pass
 
     def __enter__(self) -> SensorPublisher:
         self.open()
@@ -131,6 +151,23 @@ class SensorPublisher:
             gyro[2],
             ts=imu.stamp or time.time(),
         )
+
+    def publish_cloud3d(self, pts: np.ndarray, stamp: float = 0.0) -> None:
+        """Write 3D point cloud to secondary shm segment.
+
+        Args:
+            pts:   float32 ``(N, 4)`` array — columns x, y, z, dist (world frame).
+                   Also accepts ``(N, 3)``; a zero dist column is appended.
+            stamp: Sensor timestamp in seconds.
+        """
+        if pts is None or len(pts) == 0:
+            return
+        pts4 = np.asarray(pts, dtype=np.float32)
+        if pts4.ndim == 2 and pts4.shape[1] == 3:
+            pts4 = np.column_stack([pts4, np.zeros(len(pts4), dtype=np.float32)])
+        if pts4.ndim != 2 or pts4.shape[1] != 4:
+            return
+        self._ext3d.write_pointcloud(pts4, ts=stamp or time.time())
 
     def publish_odom(self, odom: Odometry) -> None:
         self._step += 1
@@ -168,18 +205,40 @@ class SensorSubscriber:
             raise RuntimeError(
                 "shmbridge package not found — install it from ir-sim/shmbridge/"
             )
+        self._shm_name = shm_name
         self._ext = ExtShmBridge(shm_name)
+        self._ext3d: ExtShmBridge | None = None
         self._timeout_ms = timeout_ms
 
     def attach(self) -> None:
         """Attach to the publisher's shm segment, blocking until ready."""
         self._ext.attach(timeout_ms=self._timeout_ms)
 
+    def try_attach_cloud3d(self, timeout_ms: float = 2000.0) -> bool:
+        """Attempt to attach to the 3D cloud shm segment.
+
+        Returns True on success, False if the segment is not available
+        (e.g. publisher not started or no 3D lidar configured).
+        """
+        try:
+            ext = ExtShmBridge(self._shm_name + "_3d")
+            ext.attach(timeout_ms=timeout_ms)
+            self._ext3d = ext
+            return True
+        except Exception:
+            self._ext3d = None
+            return False
+
     def detach(self) -> None:
         try:
             self._ext.detach()
         except Exception:
             pass
+        if self._ext3d is not None:
+            try:
+                self._ext3d.detach()
+            except Exception:
+                pass
 
     def __enter__(self) -> SensorSubscriber:
         self.attach()
@@ -238,6 +297,19 @@ class SensorSubscriber:
             vy=float(s.vy),
             omega=float(s.omega),
         )
+
+    def read_cloud3d(self) -> np.ndarray | None:
+        """Return latest 3D cloud as (N, 4) float32 [x, y, z, dist], or None.
+
+        Returns None when :meth:`try_attach_cloud3d` has not been called or
+        when no new data is available.
+        """
+        if self._ext3d is None:
+            return None
+        pts = self._ext3d.read_pointcloud()
+        if pts is None or len(pts) == 0:
+            return None
+        return np.asarray(pts, dtype=np.float32)
 
     def read_scan_points(self) -> np.ndarray | None:
         """Return (N, 4) float32 [x, y, range, angle], or None."""
