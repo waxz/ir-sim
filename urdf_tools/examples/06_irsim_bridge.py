@@ -9,15 +9,17 @@ Requires:
     pip install shmbridge   (or: cd ir-sim/shmbridge && pip install -e .)
 
 Usage:
-    # Terminal 1 — run the simulation bridge
+    # Basic — 10×10 m world with 4 yaml obstacles
     python 06_irsim_bridge.py
 
-    # Terminal 2 — 2D live scan viewer
-    python 05_sub_viewer.py --live
+    # Warehouse — lidar raycasts against warehouse URDF geometry
+    python 06_irsim_bridge.py \\
+        --yaml irsim_warehouse.yaml \\
+        --world models/warehouse_world.urdf
 
-    # Terminal 2 — 3D live viewer with world + robot wireframe
+    # Terminal 2 — 3D live web viewer
     python 05_sub_viewer.py --live3d \\
-        --world models/robot_diff.urdf \\
+        --world models/warehouse_world.urdf \\
         --robot models/robot_diff.urdf
 
     # Run headless for N steps then exit
@@ -60,11 +62,39 @@ def main() -> None:
     ap.add_argument("--shm", default=SHM_NAME, help="Shared memory segment name")
     ap.add_argument("--steps", type=int, default=0, help="Max steps (0 = infinite)")
     ap.add_argument("--no-render", action="store_true", help="Run headless")
+    ap.add_argument(
+        "--world",
+        default=None,
+        metavar="URDF",
+        help="World URDF — geometry injected as static obstacles for lidar raycasting",
+    )
+    ap.add_argument(
+        "--lidar-height",
+        type=float,
+        default=0.30,
+        metavar="M",
+        help="Scan-plane height for URDF Z filter (default 0.30 m)",
+    )
     args = ap.parse_args()
 
     import irsim
 
     env = irsim.make(args.yaml, headless=args.no_render)
+
+    if args.world:
+        from urdf_tools.irsim_compat import urdf_to_irsim_obstacles
+        from urdf_tools.parser import parse_urdf
+
+        world_robot = parse_urdf(args.world)
+        urdf_obs = urdf_to_irsim_obstacles(
+            world_robot, name_prefix="urdf", lidar_height=args.lidar_height
+        )
+        env.add_objects(urdf_obs)
+        print(
+            f"[bridge] loaded {len(urdf_obs)} URDF obstacles"
+            f" from {args.world!r}  (lidar_height={args.lidar_height} m)"
+        )
+
     robot = env.robot_list[0]
     has_lidar = hasattr(robot, "lidar") and robot.lidar is not None
 
