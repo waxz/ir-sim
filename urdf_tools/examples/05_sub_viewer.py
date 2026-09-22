@@ -178,7 +178,7 @@ sGeom.setAttribute('position', new THREE.BufferAttribute(sPosArr, 3));
 sGeom.setAttribute('color',    new THREE.BufferAttribute(sColArr, 3));
 sGeom.setDrawRange(0, 0);
 scene.add(new THREE.Points(sGeom,
-  new THREE.PointsMaterial({ size: 0.30, vertexColors: true, sizeAttenuation: true })));
+  new THREE.PointsMaterial({ size: 5, vertexColors: true, sizeAttenuation: false })));
 
 // ── scan rays (vertex-coloured LineSegments) ──────────────────────────────────
 const MAX_RAYS = 64;
@@ -232,7 +232,7 @@ function updateScan({ ranges, angle_min, angle_increment, range_max }, x0, y0, t
     sColArr[nP*3]=cr; sColArr[nP*3+1]=cg; sColArr[nP*3+2]=cb;
     nP++;
     // every 6th hit: draw a ray from robot to hit
-    if (i % 6 === 0 && nR < MAX_RAYS) {
+    if (nP % 6 === 0 && nR < MAX_RAYS) {
       const k = nR * 6;
       rPosArr[k]=x0;  rPosArr[k+1]=y0;  rPosArr[k+2]=LZ;
       rPosArr[k+3]=hx; rPosArr[k+4]=hy; rPosArr[k+5]=LZ;
@@ -248,6 +248,7 @@ function updateScan({ ranges, angle_min, angle_increment, range_max }, x0, y0, t
   rGeom.setDrawRange(0, nR * 2);
   rGeom.attributes.position.needsUpdate = true;
   rGeom.attributes.color.needsUpdate    = true;
+  return nP;
 }
 
 // ── load static geometry ──────────────────────────────────────────────────────
@@ -287,6 +288,7 @@ initGeometry();
 const hud = document.getElementById('hud');
 let posX=0, posY=0, posTh=0;
 let fCount=0, fLast=performance.now(), curFps='--';
+let lastHitCount=0;
 
 const es = new EventSource('/stream');
 es.onopen = () => {
@@ -295,7 +297,7 @@ es.onopen = () => {
 es.onmessage = ({ data }) => {
   const frame = JSON.parse(data);
   if (frame.pose) { [posX, posY, posTh] = frame.pose; updatePose(posX, posY, posTh); }
-  if (frame.scan)  updateScan(frame.scan, posX, posY, posTh);
+  if (frame.scan) { lastHitCount = updateScan(frame.scan, posX, posY, posTh); }
   fCount++;
   const now = performance.now();
   if (now - fLast >= 1000) {
@@ -307,6 +309,7 @@ es.onmessage = ({ data }) => {
     'x=<span class="val">' + posX.toFixed(3) + '</span>  ' +
     'y=<span class="val">' + posY.toFixed(3) + '</span>  ' +
     'θ=<span class="val">' + posTh.toFixed(3) + '</span>\\n' +
+    'hits=<span class="val">' + lastHitCount + '</span>\\n' +
     '<span class="dim">' + curFps + ' fps · drag:orbit  scroll:zoom  R:reset</span>';
 };
 es.onerror = () => {
