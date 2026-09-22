@@ -95,8 +95,9 @@ def main() -> None:
 
         robot_tmp = env.robot_list[0]
         irsim_lidar = getattr(robot_tmp, "lidar", None)
+        x0, y0, th0 = _robot_xytheta(robot_tmp)
         dev_lidar = DevLidar2D(
-            state=None,
+            state=np.array([x0, y0, th0], dtype=np.float64),
             range_min=irsim_lidar.range_min if irsim_lidar else 0.1,
             range_max=irsim_lidar.range_max if irsim_lidar else 20.0,
             angle_range=irsim_lidar.angle_range if irsim_lidar else 6.2832,
